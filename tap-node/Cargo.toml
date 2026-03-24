@@ -1,0 +1,18 @@
+[package]
+name = "tap-node"
+version = "0.1.0"
+edition = "2021"
+description = "High-level Taproot Assets node — wraps taproot-ldk for Rust app developers"
+
+[dependencies]
+tap-primitives = { path = "../tap-primitives" }
+tap-onchain = { path = "../tap-onchain" }
+tap-ldk = { path = "../tap-ldk" }
+tap-persist = { path = "../tap-persist" }
+tap-universe = { path = "../tap-universe" }
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
+bitcoin_hashes = { version = "0.14", default-features = false, features = ["std"] }
+
+[features]
+default = ["sqlite"]
+sqlite = ["tap-persist/sqlite"]

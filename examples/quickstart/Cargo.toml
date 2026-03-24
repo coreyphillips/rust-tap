@@ -1,0 +1,31 @@
+[package]
+name = "tap-quickstart"
+version = "0.1.0"
+edition = "2021"
+description = "Example: spin up a tap-node from a BIP39 mnemonic"
+
+[dependencies]
+tap-node = { path = "../../tap-node" }
+tap-primitives = { path = "../../tap-primitives" }
+tap-onchain = { path = "../../tap-onchain" }
+tap-ldk = { path = "../../tap-ldk" }
+tap-universe = { path = "../../tap-universe" }
+
+bitcoin = { version = "0.32", default-features = false, features = ["std", "secp-recovery"] }
+secp256k1 = { version = "0.29", default-features = false, features = ["std", "global-context"] }
+bitcoin_hashes = { version = "0.14", default-features = false, features = ["std"] }
+
+# BIP39 mnemonic support
+bip39 = { version = "2.1", default-features = false }
+
+# BDK wallet (Taproot, Esplora sync, file persistence)
+bdk_wallet = { version = "1.1", default-features = false, features = ["std", "file_store"] }
+bdk_esplora = { version = "0.20", default-features = false, features = ["blocking-https"] }
+
+# HTTP + serialization
+ureq = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Random number generation (for mnemonic)
+getrandom = { version = "0.2", features = ["std"] }

@@ -1,0 +1,13 @@
+[package]
+name = "tap-ldk"
+version = "0.1.0"
+edition = "2021"
+description = "LDK integration layer for Taproot Assets"
+
+[dependencies]
+tap-primitives = { path = "../tap-primitives" }
+tap-onchain = { path = "../tap-onchain" }
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
+bitcoin_hashes = { version = "0.14", default-features = false, features = ["std"] }
+lightning = { git = "https://github.com/coreyphillips/rust-lightning.git", branch = "main", default-features = false, features = ["std"] }
+getrandom = { version = "0.2", default-features = false, features = ["std"] }

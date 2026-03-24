@@ -1,0 +1,37 @@
+[package]
+name = "tap-primitives-fuzz"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tap-primitives = { path = ".." }
+
+[[bin]]
+name = "bigsize_decode"
+path = "fuzz_targets/bigsize_decode.rs"
+doc = false
+
+[[bin]]
+name = "tlv_stream_decode"
+path = "fuzz_targets/tlv_stream_decode.rs"
+doc = false
+
+[[bin]]
+name = "var_bytes_decode"
+path = "fuzz_targets/var_bytes_decode.rs"
+doc = false
+
+[[bin]]
+name = "proof_file_decode"
+path = "fuzz_targets/proof_file_decode.rs"
+doc = false
+
+[[bin]]
+name = "tapscript_control_block"
+path = "fuzz_targets/tapscript_control_block.rs"
+doc = false

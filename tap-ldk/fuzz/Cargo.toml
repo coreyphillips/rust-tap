@@ -1,0 +1,22 @@
+[package]
+name = "tap-ldk-fuzz"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tap-ldk = { path = ".." }
+
+[[bin]]
+name = "channel_blob_decode"
+path = "fuzz_targets/channel_blob_decode.rs"
+doc = false
+
+[[bin]]
+name = "aux_signatures_unpack"
+path = "fuzz_targets/aux_signatures_unpack.rs"
+doc = false

@@ -1,0 +1,16 @@
+[package]
+name = "tap-persist"
+version = "0.1.0"
+edition = "2021"
+description = "Persistence layer for Taproot Assets (in-memory and file-backed stores)"
+
+[dependencies]
+tap-primitives = { path = "../tap-primitives" }
+tap-onchain = { path = "../tap-onchain" }
+tap-universe = { path = "../tap-universe" }
+bitcoin_hashes = { version = "0.14", default-features = false, features = ["std"] }
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+
+[features]
+default = ["sqlite"]
+sqlite = ["rusqlite"]
