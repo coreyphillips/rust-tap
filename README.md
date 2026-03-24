@@ -219,4 +219,4 @@ cd tap-primitives/fuzz && cargo +nightly fuzz run proof_file_decode -- -max_tota
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT License](LICENSE-MIT), at your option.
+Licensed under the [MIT License](LICENSE).
