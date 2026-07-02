@@ -88,6 +88,30 @@ impl TapCommitment {
         })
     }
 
+    /// Creates a `TapCommitment` with an optional explicit version.
+    ///
+    /// When `version` is `None`, the commitment version is derived from
+    /// the maximum asset version among the commitments (V0 assets give
+    /// a V0 commitment, V1 assets a V1 commitment), matching Go's
+    /// `NewTapCommitment` (commitment/tap.go:106).
+    pub fn from_asset_commitments(
+        version: Option<TapCommitmentVersion>,
+        commitments: &[&AssetCommitment],
+    ) -> Result<Self, CommitmentError> {
+        let version = match version {
+            Some(v) => v,
+            None => {
+                let max_version = commitments
+                    .iter()
+                    .map(|ac| ac.version.to_u8())
+                    .max()
+                    .unwrap_or(0);
+                TapCommitmentVersion::from_u8(max_version)?
+            }
+        };
+        Self::new(version, commitments)
+    }
+
     /// Creates a `TapCommitment` from a known root (used when
     /// reconstructing from proofs).
     pub fn from_root(

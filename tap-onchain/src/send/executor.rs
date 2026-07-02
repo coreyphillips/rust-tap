@@ -24,6 +24,7 @@ use bitcoin::Amount;
 use bitcoin_hashes::Hash;
 
 use tap_primitives::asset::Genesis;
+use tap_primitives::commitment::TapCommitmentVersion;
 use tap_primitives::vm::InputSet;
 
 use super::allocation::{SelectedInput, TransferOutput};
@@ -62,8 +63,40 @@ pub fn execute_transfer(
     signer: &dyn VirtualSigner,
     internal_keys: &[XOnlyPublicKey],
 ) -> Result<TransferResult, SendError> {
+    execute_transfer_with_version(
+        inputs,
+        outputs,
+        genesis,
+        prev_assets,
+        signer,
+        internal_keys,
+        None,
+    )
+}
+
+/// Executes an end-to-end asset transfer with an explicit Taproot Asset
+/// commitment version for the created output commitments.
+///
+/// The version comes from the destination: V1 and V2 addresses (and V1
+/// virtual packets) require V2 commitments, while `None` derives the
+/// version from the asset versions. See
+/// [`tap_primitives::address::TapAddress::commitment_version`].
+pub fn execute_transfer_with_version(
+    inputs: &[SelectedInput],
+    outputs: &[TransferOutput],
+    genesis: &Genesis,
+    prev_assets: &InputSet,
+    signer: &dyn VirtualSigner,
+    internal_keys: &[XOnlyPublicKey],
+    commitment_version: Option<TapCommitmentVersion>,
+) -> Result<TransferResult, SendError> {
     // Step 1: Prepare outputs (allocations + split commitments).
-    let mut prepared = TransferBuilder::prepare_outputs(inputs, outputs, genesis)?;
+    let mut prepared = TransferBuilder::prepare_outputs_with_version(
+        inputs,
+        outputs,
+        genesis,
+        commitment_version,
+    )?;
 
     // Step 2: Populate split proofs if this is a split transfer.
     if prepared.is_split {

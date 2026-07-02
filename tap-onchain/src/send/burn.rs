@@ -86,8 +86,15 @@ pub fn prepare_burn(
     };
 
     // Reuse the normal output preparation, bypassing the burn-key guard
-    // that protects the regular send path.
-    TransferBuilder::prepare_outputs_inner(inputs, &[burn_output], genesis)
+    // that protects the regular send path. Burns always use V2 Taproot
+    // Asset commitments, matching Go's FundBurn which selects and funds
+    // with commitment.TapCommitmentV2 (tapfreighter/wallet.go).
+    TransferBuilder::prepare_outputs_inner(
+        inputs,
+        &[burn_output],
+        genesis,
+        Some(tap_primitives::commitment::TapCommitmentVersion::V2),
+    )
 }
 
 #[cfg(test)]
