@@ -90,7 +90,8 @@ pub fn execute_transfer_with_version(
     internal_keys: &[XOnlyPublicKey],
     commitment_version: Option<TapCommitmentVersion>,
 ) -> Result<TransferResult, SendError> {
-    // Step 1: Prepare outputs (allocations + split commitments).
+    // Step 1: Prepare outputs (allocations + split commitments). This
+    // fixes the split commitment root the signatures will commit to.
     let mut prepared = TransferBuilder::prepare_outputs_with_version(
         inputs,
         outputs,
@@ -98,15 +99,23 @@ pub fn execute_transfer_with_version(
         commitment_version,
     )?;
 
-    // Step 2: Populate split proofs if this is a split transfer.
+    // Step 2: Sign virtual transactions.
+    sign_transfer(&mut prepared, prev_assets, signer)?;
+
+    // Step 3: Populate split proofs if this is a split transfer. Done
+    // after signing so each split witness carries the signed root
+    // asset (the proofs themselves come from the unsigned split tree
+    // committed to in step 1).
     if prepared.is_split {
         populate_split_proofs(&mut prepared)?;
     }
 
-    // Step 3: Sign virtual transactions.
-    sign_transfer(&mut prepared, prev_assets, signer)?;
+    // Step 4: Rebuild the change output commitment from the signed
+    // root asset — its MS-SMT leaf changed when the witnesses were
+    // populated.
+    prepared.rebuild_root_commitment()?;
 
-    // Step 4: Build anchor transaction template.
+    // Step 5: Build anchor transaction template.
     let mut output_descriptors = Vec::new();
 
     // Change output (index 0) with the root asset's commitment.
@@ -115,7 +124,7 @@ pub fn execute_transfer_with_version(
     }
     output_descriptors.push(OutputDescriptor {
         internal_key: internal_keys[0],
-        commitment: prepared.change_commitment.clone(),
+        commitment: prepared.change_commitment.commitment().clone(),
         value: Amount::from_sat(330),
         sibling_script: None,
     });
@@ -125,7 +134,7 @@ pub fn execute_transfer_with_version(
         let key_idx = (i + 1).min(internal_keys.len() - 1);
         output_descriptors.push(OutputDescriptor {
             internal_key: internal_keys[key_idx],
-            commitment: commitment.clone(),
+            commitment: commitment.commitment().clone(),
             value: Amount::from_sat(330),
             sibling_script: None,
         });

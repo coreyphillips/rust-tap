@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use tap_primitives::asset::{Asset, OutPoint, SerializedKey};
-use tap_primitives::commitment::CommitmentProof;
+use tap_primitives::commitment::{CommitmentProof, TapCommitmentTree};
 use tap_primitives::proof::{
     self, AnchorTx, BlockHeader, TaprootProof, TransitionVersion,
 };
@@ -49,7 +49,12 @@ pub struct TransitionProofParams {
     pub prev_out: OutPoint,
     /// The new asset after the state transition.
     pub new_asset: Asset,
+    /// The tree-holding TAP commitment of the anchor output. When set,
+    /// the inclusion proof is derived from it directly and
+    /// `commitment_proof` may be left `None`.
+    pub commitment: Option<TapCommitmentTree>,
     /// The commitment proof linking the asset to the TAP commitment.
+    /// Only needed when `commitment` is not supplied.
     pub commitment_proof: Option<CommitmentProof>,
     /// Exclusion proofs for other P2TR outputs in the anchor tx.
     pub exclusion_proofs: Vec<TaprootProof>,
@@ -72,10 +77,24 @@ pub fn generate_transition_proof(
     )
     .ok_or_else(|| "failed to build tx merkle proof".to_string())?;
 
+    // Derive the commitment proof from the tree-holding commitment
+    // when one was not supplied directly.
+    let commitment_proof = match (params.commitment_proof, &params.commitment)
+    {
+        (Some(proof), _) => Some(proof),
+        (None, Some(commitment)) => Some(
+            super::generate::derive_inclusion_proof(
+                commitment,
+                &params.new_asset,
+            )?,
+        ),
+        (None, None) => None,
+    };
+
     let inclusion_proof = TaprootProof {
         output_index: params.base.output_index,
         internal_key: params.base.internal_key,
-        commitment_proof: params.commitment_proof,
+        commitment_proof,
         tapscript_proof: None,
         unknown_odd_types: BTreeMap::new(),
     };
@@ -243,6 +262,7 @@ mod tests {
             },
             prev_out: OutPoint { txid: [0xBB; 32], vout: 0 },
             new_asset,
+            commitment: None,
             commitment_proof: None,
             exclusion_proofs: vec![],
             split_root_proof: None,

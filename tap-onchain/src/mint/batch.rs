@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use tap_primitives::commitment::TapCommitment;
+use tap_primitives::commitment::TapCommitmentTree;
 
 use super::seedling::Seedling;
 use crate::chain::KeyDescriptor;
@@ -94,8 +94,10 @@ pub struct MintingBatch {
     pub seedlings: HashMap<String, Seedling>,
     /// Funded but unsigned genesis PSBT (set during Committed state).
     pub genesis_psbt: Option<Vec<u8>>,
-    /// The Taproot Asset commitment for this batch (set during Committed).
-    pub root_asset_commitment: Option<TapCommitment>,
+    /// The Taproot Asset commitment for this batch (set during
+    /// Committed). Retains its MS-SMT trees so genesis inclusion
+    /// proofs can be derived after confirmation.
+    pub root_asset_commitment: Option<TapCommitmentTree>,
     /// Signed genesis transaction bytes (set during Broadcast).
     pub signed_tx: Option<Vec<u8>>,
     /// The genesis outpoint after signing (set during Broadcast).

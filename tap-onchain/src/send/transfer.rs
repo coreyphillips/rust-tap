@@ -15,8 +15,8 @@ use tap_primitives::asset::{
     ScriptVersion, Witness, NUMS_KEY,
 };
 use tap_primitives::commitment::{
-    asset_leaf, AssetCommitment, SplitAsset, SplitLocator, TapCommitment,
-    TapCommitmentVersion,
+    asset_leaf, AssetCommitmentTree, SplitAsset, SplitLocator,
+    TapCommitmentTree, TapCommitmentVersion,
 };
 use tap_primitives::mssmt;
 
@@ -120,6 +120,10 @@ pub enum SendState {
 
 /// The result of preparing outputs — the assets and commitments ready
 /// for anchoring in a Bitcoin transaction.
+///
+/// The commitments retain their MS-SMT trees ([`TapCommitmentTree`]) so
+/// inclusion and exclusion proofs can be derived after the anchor
+/// transaction is built, without hand-assembling proof parts.
 #[derive(Clone, Debug)]
 pub struct PreparedTransfer {
     /// The root asset for the change/tombstone output.
@@ -127,11 +131,37 @@ pub struct PreparedTransfer {
     /// Recipient outputs (each becomes a split asset).
     pub recipient_assets: Vec<SplitAsset>,
     /// The TAP commitment for the change output.
-    pub change_commitment: TapCommitment,
+    pub change_commitment: TapCommitmentTree,
     /// Per-output TAP commitments for recipient outputs.
-    pub output_commitments: Vec<TapCommitment>,
+    pub output_commitments: Vec<TapCommitmentTree>,
     /// Whether a split was required (partial send).
     pub is_split: bool,
+}
+
+impl PreparedTransfer {
+    /// Rebuilds the change output commitment from the current root
+    /// asset. Must be called after signing: the root asset's leaf
+    /// changes once its witnesses are populated, so the commitment
+    /// created at preparation time no longer matches. For full-value
+    /// sends the single output commitment is refreshed as well.
+    pub fn rebuild_root_commitment(&mut self) -> Result<(), SendError> {
+        let version = self.change_commitment.commitment().version;
+        let ac = AssetCommitmentTree::new(&[&self.root_asset])
+            .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+        let tc = TapCommitmentTree::new(version, vec![ac])
+            .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+
+        if !self.is_split {
+            // Full send: the transfer asset itself is the root asset,
+            // and the single output commitment mirrors the change
+            // commitment.
+            if let Some(first) = self.output_commitments.first_mut() {
+                *first = tc.clone();
+            }
+        }
+        self.change_commitment = tc;
+        Ok(())
+    }
 }
 
 /// Builds asset transfers from inputs and output allocations.
@@ -266,11 +296,13 @@ impl TransferBuilder {
         };
 
         // Build the output commitment.
-        let ac = AssetCommitment::new(&[&new_asset])
+        let ac = AssetCommitmentTree::new(&[&new_asset])
             .map_err(|e| SendError::CommitmentError(e.to_string()))?;
-        let tc =
-            TapCommitment::from_asset_commitments(commitment_version, &[&ac])
-                .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+        let tc = TapCommitmentTree::from_asset_commitment_trees(
+            commitment_version,
+            vec![ac],
+        )
+        .map_err(|e| SendError::CommitmentError(e.to_string()))?;
 
         Ok(PreparedTransfer {
             root_asset: new_asset,
@@ -389,21 +421,21 @@ impl TransferBuilder {
             Some((tree_root.node_hash(), tree_root.node_sum()));
 
         // Build output commitments.
-        let root_ac = AssetCommitment::new(&[&root_asset])
+        let root_ac = AssetCommitmentTree::new(&[&root_asset])
             .map_err(|e| SendError::CommitmentError(e.to_string()))?;
-        let change_tc = TapCommitment::from_asset_commitments(
+        let change_tc = TapCommitmentTree::from_asset_commitment_trees(
             commitment_version,
-            &[&root_ac],
+            vec![root_ac],
         )
         .map_err(|e| SendError::CommitmentError(e.to_string()))?;
 
         let mut output_commitments = Vec::new();
         for split in &split_assets {
-            let ac = AssetCommitment::new(&[&split.asset])
+            let ac = AssetCommitmentTree::new(&[&split.asset])
                 .map_err(|e| SendError::CommitmentError(e.to_string()))?;
-            let tc = TapCommitment::from_asset_commitments(
+            let tc = TapCommitmentTree::from_asset_commitment_trees(
                 commitment_version,
-                &[&ac],
+                vec![ac],
             )
             .map_err(|e| SendError::CommitmentError(e.to_string()))?;
             output_commitments.push(tc);
@@ -498,8 +530,8 @@ mod tests {
         )
         .unwrap();
         for tc in &v2.output_commitments {
-            assert_eq!(tc.version, TapCommitmentVersion::V2);
-            let leaf = tc.tap_leaf();
+            assert_eq!(tc.commitment().version, TapCommitmentVersion::V2);
+            let leaf = tc.commitment().tap_leaf();
             // V2 leaves start with the 32-byte tag, not the version byte.
             assert_ne!(leaf[0], 2u8);
         }
@@ -515,8 +547,8 @@ mod tests {
         )
         .unwrap();
         for tc in &derived.output_commitments {
-            assert_eq!(tc.version, TapCommitmentVersion::V0);
-            assert_eq!(tc.tap_leaf()[0], 0u8);
+            assert_eq!(tc.commitment().version, TapCommitmentVersion::V0);
+            assert_eq!(tc.commitment().tap_leaf()[0], 0u8);
         }
     }
 

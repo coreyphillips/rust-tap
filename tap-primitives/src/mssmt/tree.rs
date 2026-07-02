@@ -126,6 +126,7 @@ where
 }
 
 /// A full (non-compacted) Merkle-Sum Sparse Merkle Tree.
+#[derive(Clone, Debug)]
 pub struct FullTree<S: TreeStoreUpdateTx> {
     pub store: S,
 }

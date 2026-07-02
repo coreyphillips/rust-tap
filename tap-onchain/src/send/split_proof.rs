@@ -24,9 +24,18 @@ use super::transfer::{PreparedTransfer, SendError};
 
 /// Populates split commitment proofs on each recipient split asset.
 ///
-/// Rebuilds the split tree and generates a Merkle proof for each split
-/// output, then sets `prev_witnesses[0].split_commitment` with the proof
-/// and the encoded root asset.
+/// Rebuilds the split tree exactly as it was committed to at
+/// preparation time — the root leaf is the root asset *without* its
+/// transaction witnesses and without the `split_commitment_root` field,
+/// and each split leaf is the split asset without its split commitment
+/// witness (mirroring Go's `NewSplitCommitment`, where the tree is
+/// built before signing and never rebuilt). This makes the function
+/// idempotent and safe to call after signing: the generated proofs
+/// always verify against the `split_commitment_root` that was set
+/// during preparation (and signed over).
+///
+/// Each recipient witness gets `prev_witnesses[0].split_commitment` set
+/// with its proof and the encoded *current* (signed) root asset.
 pub fn populate_split_proofs(
     prepared: &mut PreparedTransfer,
 ) -> Result<(), SendError> {
@@ -36,21 +45,28 @@ pub fn populate_split_proofs(
 
     let asset_id = prepared.root_asset.genesis.id();
 
-    // Build the split commitment tree.
+    // Build the split commitment tree from the preparation-time leaves.
     let mut tree = mssmt::FullTree::new(mssmt::DefaultStore::new());
 
-    // Insert root locator.
+    // Insert the root locator: the root asset as it was when the tree
+    // was first built (unsigned, no split commitment root).
     let root_locator = SplitLocator {
         output_index: 0,
         asset_id,
         script_key: *prepared.root_asset.script_key.serialized(),
         amount: prepared.root_asset.amount,
     };
-    let root_leaf = asset_leaf(&prepared.root_asset);
+    let mut unsigned_root = prepared.root_asset.clone();
+    unsigned_root.split_commitment_root = None;
+    for witness in &mut unsigned_root.prev_witnesses {
+        witness.tx_witness = vec![];
+        witness.split_commitment = None;
+    }
+    let root_leaf = asset_leaf(&unsigned_root);
     tree.insert(root_locator.hash(), root_leaf)
         .map_err(|e| SendError::SplitError(e.to_string()))?;
 
-    // Insert each split output.
+    // Insert each split output, without its split commitment witness.
     for split in &prepared.recipient_assets {
         let locator = SplitLocator {
             output_index: split.output_index,
@@ -58,12 +74,41 @@ pub fn populate_split_proofs(
             script_key: *split.asset.script_key.serialized(),
             amount: split.asset.amount,
         };
-        let leaf = asset_leaf(&split.asset);
+        let mut split_no_witness = split.asset.clone();
+        if let Some(witness) = split_no_witness.prev_witnesses.first_mut() {
+            witness.split_commitment = None;
+        }
+        let leaf = asset_leaf(&split_no_witness);
         tree.insert(locator.hash(), leaf)
             .map_err(|e| SendError::SplitError(e.to_string()))?;
     }
 
-    // Encode the root asset for inclusion in split commitment witnesses.
+    // The rebuilt tree must match the split commitment root committed
+    // to (and signed over) on the root asset.
+    let tree_root = tree
+        .root()
+        .map_err(|e| SendError::SplitError(e.to_string()))?;
+    match prepared.root_asset.split_commitment_root {
+        Some((hash, sum)) => {
+            if hash != tree_root.node_hash()
+                || sum != tree_root.node_sum()
+            {
+                return Err(SendError::SplitError(
+                    "rebuilt split tree does not match the committed \
+                     split commitment root"
+                        .into(),
+                ));
+            }
+        }
+        None => {
+            return Err(SendError::SplitError(
+                "root asset has no split commitment root".into(),
+            ));
+        }
+    }
+
+    // Encode the current (signed) root asset for inclusion in the split
+    // commitment witnesses.
     let root_asset_bytes = encode_asset(&prepared.root_asset, EncodeType::Normal);
 
     // Generate a proof for each split output and set the witness.
@@ -155,9 +200,9 @@ mod tests {
         // Root asset bytes should be non-empty.
         assert!(!sc.root_asset.is_empty());
 
-        // The proof should verify against a rebuilt split tree.
-        // We verify by rebuilding the tree with the original (pre-proof)
-        // assets and checking the proof is valid.
+        // The proof must verify against the split commitment root that
+        // was committed to on the root asset — the same invariant the
+        // VM checks (vm/mod.rs validate_split).
         let split = &prepared.recipient_assets[0];
         let locator = SplitLocator {
             output_index: split.output_index,
@@ -171,23 +216,17 @@ mod tests {
         asset_without_sc.prev_witnesses[0].split_commitment = None;
         let leaf = asset_leaf(&asset_without_sc);
 
-        // Verify against the tree root (as a Branch node from a real tree).
-        let mut verify_tree = mssmt::FullTree::new(mssmt::DefaultStore::new());
-        let root_loc = SplitLocator {
-            output_index: 0,
-            asset_id: genesis.id(),
-            script_key: *prepared.root_asset.script_key.serialized(),
-            amount: prepared.root_asset.amount,
-        };
-        verify_tree.insert(root_loc.hash(), asset_leaf(&prepared.root_asset)).unwrap();
-        verify_tree.insert(locator.hash(), leaf.clone()).unwrap();
-        let tree_root = verify_tree.root().unwrap();
+        let (root_hash, root_sum) =
+            prepared.root_asset.split_commitment_root.unwrap();
+        let root_node = mssmt::Node::Computed(mssmt::ComputedNode::new(
+            root_hash, root_sum,
+        ));
 
         assert!(verify_merkle_proof(
             locator.hash(),
             &leaf,
             &sc.proof,
-            &mssmt::Node::Branch(tree_root),
+            &root_node,
         ));
     }
 }

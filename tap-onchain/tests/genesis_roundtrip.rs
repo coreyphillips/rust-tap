@@ -4,8 +4,6 @@
 //! embedded block header). Also exercises the ownership (challenge)
 //! proof round trip on the generated proof.
 
-use std::collections::BTreeMap;
-
 use bitcoin::hashes::Hash as _;
 use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 
@@ -13,14 +11,11 @@ use tap_onchain::proof::generate::{
     generate_genesis_proof, GenesisProofParams,
 };
 use tap_primitives::asset::{
-    Asset, AssetType, AssetVersion, Genesis, OutPoint, ScriptKey,
-    SerializedKey,
+    Asset, AssetType, Genesis, OutPoint, ScriptKey, SerializedKey,
 };
 use tap_primitives::commitment::{
-    AssetCommitment, AssetProof, CommitmentProof, TapCommitment,
-    TapCommitmentVersion, TaprootAssetProof,
+    AssetCommitmentTree, TapCommitmentTree, TapCommitmentVersion,
 };
-use tap_primitives::mssmt::{DefaultStore, FullTree};
 use tap_primitives::proof::{
     decode_proof, encode_proof, prove_ownership, BlockHeader, ChainLookup,
     DefaultMerkleVerifier, GroupVerifier, HeaderVerifier, ProofError,
@@ -95,45 +90,12 @@ fn build_genesis_proof() -> tap_primitives::proof::Proof {
         ScriptKey::from_pub_key(script_key),
     );
 
-    // Commitment trees.
-    let ac = AssetCommitment::new(&[&asset]).unwrap();
-    let tc = TapCommitment::new(TapCommitmentVersion::V2, &[&ac]).unwrap();
-
-    // Inner (asset) proof.
-    let ack = tap_primitives::commitment::asset_commitment_key(
-        &asset.id(),
-        asset.script_key.serialized(),
-        asset.group_key.is_some(),
-    );
-    let mut inner_tree = FullTree::new(DefaultStore::new());
-    inner_tree
-        .insert(ack, tap_primitives::commitment::asset_leaf(&asset))
-        .unwrap();
-    let inner_proof = inner_tree.merkle_proof(ack).unwrap();
-
-    // Outer (tap) proof.
-    let mut outer_tree = FullTree::new(DefaultStore::new());
-    outer_tree
-        .insert(ac.tap_key, ac.tap_commitment_leaf())
-        .unwrap();
-    let outer_proof = outer_tree.merkle_proof(ac.tap_key).unwrap();
-
-    let commitment_proof = CommitmentProof {
-        asset_proof: Some(AssetProof {
-            proof: inner_proof,
-            version: AssetVersion::V0,
-            tap_key: ac.tap_key,
-            unknown_odd_types: BTreeMap::new(),
-        }),
-        taproot_asset_proof: TaprootAssetProof {
-            proof: outer_proof,
-            version: TapCommitmentVersion::V2,
-            unknown_odd_types: BTreeMap::new(),
-        },
-        tap_sibling_preimage: None,
-        stxo_proofs: BTreeMap::new(),
-        unknown_odd_types: BTreeMap::new(),
-    };
+    // Commitment trees. The tree-holding types keep their MS-SMTs, so
+    // the inclusion proof is derived internally by
+    // generate_genesis_proof — no hand-built proof parts.
+    let ac = AssetCommitmentTree::new(&[&asset]).unwrap();
+    let tc =
+        TapCommitmentTree::new(TapCommitmentVersion::V2, vec![ac]).unwrap();
 
     // Anchor transaction paying to the commitment output.
     let internal_x_only = bitcoin::secp256k1::XOnlyPublicKey::from_slice(
@@ -142,7 +104,7 @@ fn build_genesis_proof() -> tap_primitives::proof::Proof {
     .unwrap();
     let (anchor_script, _) = tap_onchain::psbt::create_tap_output_script(
         &internal_x_only,
-        &tc,
+        tc.commitment(),
         None,
     )
     .unwrap();
@@ -183,7 +145,8 @@ fn build_genesis_proof() -> tap_primitives::proof::Proof {
         asset,
         tap_output_index: 0,
         internal_key,
-        commitment_proof: Some(commitment_proof),
+        commitment: Some(tc),
+        commitment_proof: None,
         exclusion_proofs: vec![],
         genesis_reveal: genesis,
         meta_reveal: None,

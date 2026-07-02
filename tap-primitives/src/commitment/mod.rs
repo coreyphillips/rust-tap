@@ -26,6 +26,7 @@ pub mod asset_commitment;
 pub mod proof;
 pub mod split;
 pub mod tap_commitment;
+pub mod tree;
 
 pub use asset_commitment::{
     asset_commitment_key, asset_leaf, tap_commitment_key, AssetCommitment,
@@ -39,3 +40,4 @@ pub use tap_commitment::{
     is_similar_tap_commitment_version, TapCommitment, TapCommitmentVersion,
     TAPROOT_ASSETS_MARKER, TAPROOT_ASSETS_V2_TAG,
 };
+pub use tree::{AssetCommitmentTree, TapCommitmentTree};
