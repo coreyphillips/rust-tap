@@ -23,6 +23,7 @@ pub mod decode;
 pub mod encode;
 pub mod file;
 pub mod meta;
+pub mod ownership;
 pub mod tx_merkle;
 pub mod types;
 pub mod verify;
@@ -38,11 +39,16 @@ pub use encode::{
 };
 pub use file::{File, HashedProof, FILE_MAGIC_BYTES, PROOF_MAGIC_BYTES};
 pub use meta::{MetaReveal, MetaType};
+pub use ownership::{
+    create_ownership_proof_asset, gen_challenge_nums, prove_ownership,
+    verify_challenge_witness,
+};
 pub use tx_merkle::TxMerkleProof;
 pub use types::*;
 pub use verify::{
-    DefaultMerkleVerifier, GroupVerifier, HeaderVerifier, MerkleVerifier,
-    VerifierCtx,
+    tx_spends_prev_out, ChainLookup, DefaultMerkleVerifier,
+    FixedHeightChainLookup, GroupVerifier, HeaderVerifier, MerkleVerifier,
+    ProofVerificationOptions, VerifierCtx,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use verify::{TrustAllGroups, TrustAllHeaders};

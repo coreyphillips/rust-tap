@@ -44,17 +44,82 @@ impl TapscriptLeaf {
     ///
     /// `SHA256(SHA256("TapLeaf") || SHA256("TapLeaf") || leaf_version || compact_size(script) || script)`
     pub fn leaf_hash(&self) -> [u8; 32] {
-        let tag_hash = sha256::Hash::hash(b"TapLeaf");
-        let mut engine = sha256::HashEngine::default();
-        engine.input(tag_hash.as_ref());
-        engine.input(tag_hash.as_ref());
-        engine.input(&[self.version.to_consensus()]);
-        // Compact size encoding of script length.
-        let script_bytes = self.script.as_bytes();
-        encode_compact_size(&mut engine, script_bytes.len());
-        engine.input(script_bytes);
-        sha256::Hash::from_engine(engine).to_byte_array()
+        tap_leaf_hash(self.version.to_consensus(), self.script.as_bytes())
     }
+}
+
+/// Computes the BIP-341 tagged `TapLeaf` hash for an arbitrary leaf
+/// version and script.
+///
+/// `SHA256(SHA256("TapLeaf") || SHA256("TapLeaf") || leaf_version ||
+/// compact_size(script) || script)`
+pub fn tap_leaf_hash(leaf_version: u8, script: &[u8]) -> [u8; 32] {
+    let tag_hash = sha256::Hash::hash(b"TapLeaf");
+    let mut engine = sha256::HashEngine::default();
+    engine.input(tag_hash.as_ref());
+    engine.input(tag_hash.as_ref());
+    engine.input(&[leaf_version]);
+    encode_compact_size(&mut engine, script.len());
+    engine.input(script);
+    sha256::Hash::from_engine(engine).to_byte_array()
+}
+
+/// Computes the taproot output key (x-only) for the given internal key
+/// and tapscript merkle root, matching Go's
+/// `txscript.ComputeTaprootOutputKey`. An empty `merkle_root` matches
+/// BIP-86 (key-spend only) semantics.
+pub fn taproot_output_key(
+    internal_key: &crate::asset::SerializedKey,
+    merkle_root: &[u8],
+) -> Result<[u8; 32], String> {
+    use bitcoin::secp256k1::{Scalar, Secp256k1};
+
+    let x_only = XOnlyPublicKey::from_slice(internal_key.schnorr_bytes())
+        .map_err(|e| format!("invalid internal key: {}", e))?;
+
+    // BIP-341 tagged TapTweak hash over the x-only internal key and the
+    // (possibly empty) merkle root.
+    let tag_hash = sha256::Hash::hash(b"TapTweak").to_byte_array();
+    let mut engine = sha256::HashEngine::default();
+    engine.input(&tag_hash);
+    engine.input(&tag_hash);
+    engine.input(&x_only.serialize());
+    engine.input(merkle_root);
+    let tweak = sha256::Hash::from_engine(engine).to_byte_array();
+
+    let secp = Secp256k1::new();
+    let scalar = Scalar::from_be_bytes(tweak)
+        .map_err(|e| format!("invalid tap tweak: {}", e))?;
+    let (tweaked, _parity) = x_only
+        .add_tweak(&secp, &scalar)
+        .map_err(|e| format!("tweak failed: {}", e))?;
+
+    Ok(tweaked.serialize())
+}
+
+/// Creates a P2TR output script committing to a Taproot Asset
+/// commitment, with an optional sibling tapscript leaf. Returns the
+/// 34-byte output script and the tweaked (x-only) output key.
+///
+/// This is the anchor-output construction used by both proof
+/// generation (tap-onchain) and proof verification: the commitment's
+/// tap leaf is hashed (optionally branched with the sibling leaf's
+/// hash) into the tapscript root, which tweaks the internal key.
+pub fn create_tap_output_script(
+    internal_key: &crate::asset::SerializedKey,
+    tap_commitment: &crate::commitment::TapCommitment,
+    sibling_script: Option<&[u8]>,
+) -> Result<(Vec<u8>, [u8; 32]), String> {
+    let sibling_hash = sibling_script.map(|s| tap_leaf_hash(0xc0, s));
+    let root = tap_commitment.tapscript_root(sibling_hash.as_ref());
+    let output_key = taproot_output_key(internal_key, &root)?;
+
+    let mut script = Vec::with_capacity(34);
+    script.push(0x51); // OP_1 (witness v1)
+    script.push(0x20); // OP_PUSHBYTES_32
+    script.extend_from_slice(&output_key);
+
+    Ok((script, output_key))
 }
 
 /// Encodes a compact size (Bitcoin varint) into a hash engine.

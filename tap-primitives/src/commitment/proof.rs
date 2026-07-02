@@ -68,6 +68,113 @@ impl TapscriptPreimage {
             sibling_preimage: data[1..].to_vec(),
         })
     }
+
+    /// Computes the tap hash of this preimage according to its type,
+    /// mirroring Go's `TapscriptPreimage.TapHash`
+    /// (commitment/taproot.go:241).
+    ///
+    /// - Leaf preimages (type 0) carry `leaf_version(1) ||
+    ///   varbytes(script)` (Go's `NewLeafFromPreimage`); the script must
+    ///   not itself be a Taproot Asset commitment script.
+    /// - Branch preimages (type 1) carry the two 32-byte child hashes.
+    pub fn tap_hash(&self) -> Result<[u8; 32], CommitmentError> {
+        if self.is_empty() {
+            return Err(CommitmentError::InvalidProof(
+                "empty tapscript preimage".into(),
+            ));
+        }
+
+        match self.sibling_type {
+            // Leaf preimage: version byte + varbyte-prefixed script,
+            // Go's NewLeafFromPreimage (commitment/taproot.go).
+            0 => {
+                let raw = &self.sibling_preimage;
+                if raw.len() < 2 {
+                    return Err(CommitmentError::InvalidProof(
+                        "invalid tapscript preimage length".into(),
+                    ));
+                }
+                let version = raw[0];
+                let (script, consumed) = read_var_bytes(&raw[1..])?;
+                if 1 + consumed != raw.len() {
+                    return Err(CommitmentError::InvalidProof(
+                        "trailing bytes in leaf preimage".into(),
+                    ));
+                }
+                if super::tap_commitment::TapCommitment::is_tap_commitment_script(
+                    script,
+                ) {
+                    return Err(CommitmentError::InvalidProof(
+                        "preimage is a Taproot Asset commitment".into(),
+                    ));
+                }
+                Ok(crate::crypto::tapscript::tap_leaf_hash(version, script))
+            }
+
+            // Branch preimage: left(32) || right(32), hashed via
+            // asset.NewTapBranchHash (which sorts the two children).
+            1 => {
+                if self.sibling_preimage.len() != 64 {
+                    return Err(CommitmentError::InvalidProof(
+                        "invalid tapscript preimage length".into(),
+                    ));
+                }
+                let left: [u8; 32] =
+                    self.sibling_preimage[..32].try_into().expect("32 bytes");
+                let right: [u8; 32] =
+                    self.sibling_preimage[32..].try_into().expect("32 bytes");
+                Ok(crate::crypto::tapscript::tap_branch_hash(&left, &right))
+            }
+
+            other => Err(CommitmentError::InvalidProof(format!(
+                "invalid tapscript preimage type: {}",
+                other
+            ))),
+        }
+    }
+}
+
+/// Reads a Bitcoin var-bytes (compact size length prefix + data) from
+/// `data`, returning the payload and the total bytes consumed.
+fn read_var_bytes(data: &[u8]) -> Result<(&[u8], usize), CommitmentError> {
+    let err = || CommitmentError::InvalidProof("invalid var bytes".into());
+    if data.is_empty() {
+        return Err(err());
+    }
+    let (len, prefix) = match data[0] {
+        n if n < 253 => (n as usize, 1usize),
+        253 => {
+            if data.len() < 3 {
+                return Err(err());
+            }
+            (
+                u16::from_le_bytes(data[1..3].try_into().expect("2")) as usize,
+                3,
+            )
+        }
+        254 => {
+            if data.len() < 5 {
+                return Err(err());
+            }
+            (
+                u32::from_le_bytes(data[1..5].try_into().expect("4")) as usize,
+                5,
+            )
+        }
+        _ => {
+            if data.len() < 9 {
+                return Err(err());
+            }
+            (
+                u64::from_le_bytes(data[1..9].try_into().expect("8")) as usize,
+                9,
+            )
+        }
+    };
+    if data.len() < prefix + len {
+        return Err(err());
+    }
+    Ok((&data[prefix..prefix + len], prefix + len))
 }
 
 /// Proof of an asset's inclusion or exclusion in an `AssetCommitment`.

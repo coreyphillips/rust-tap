@@ -290,9 +290,16 @@ where
                 prev_out: genesis_point,
                 block_header: tap_primitives::proof::types::BlockHeader([0; 80]),
                 block_height: 0,
-                anchor_tx: tap_primitives::proof::types::AnchorTx(
-                    signed_tx_bytes.clone(),
-                ),
+                anchor_tx:
+                    tap_primitives::proof::types::AnchorTx::from_bytes(
+                        &signed_tx_bytes,
+                    )
+                    .map_err(|e| {
+                        TapNodeError::Storage(format!(
+                            "anchor tx parse: {}",
+                            e
+                        ))
+                    })?,
                 tx_merkle_proof: tap_primitives::proof::tx_merkle::TxMerkleProof {
                     nodes: vec![],
                     bits: vec![],

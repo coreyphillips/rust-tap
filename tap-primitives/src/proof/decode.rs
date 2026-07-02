@@ -116,7 +116,7 @@ pub fn decode_proof(data: &[u8]) -> Result<Proof, ProofError> {
         },
         block_header: BlockHeader::default(),
         block_height: 0,
-        anchor_tx: AnchorTx(Vec::new()),
+        anchor_tx: AnchorTx::default(),
         tx_merkle_proof: TxMerkleProof {
             nodes: vec![],
             bits: vec![],
@@ -153,7 +153,7 @@ pub fn decode_proof(data: &[u8]) -> Result<Proof, ProofError> {
                 proof.block_header = BlockHeader(header);
             }
             tlv_types::ANCHOR_TX => {
-                proof.anchor_tx = AnchorTx(record.value.clone());
+                proof.anchor_tx = AnchorTx::from_bytes(&record.value)?;
             }
             tlv_types::TX_MERKLE_PROOF => {
                 proof.tx_merkle_proof =

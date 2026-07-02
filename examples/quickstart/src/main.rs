@@ -674,7 +674,8 @@ fn build_and_register_proof(
         prev_out,
         block_header: header,
         block_height,
-        anchor_tx: AnchorTx(raw_tx),
+        anchor_tx: AnchorTx::from_bytes(&raw_tx)
+            .map_err(|e| format!("anchor tx parse: {}", e))?,
         tx_merkle_proof: merkle_proof,
         asset: asset.clone(),
         inclusion_proof: TaprootProof {

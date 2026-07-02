@@ -14,10 +14,10 @@
 //! the final P2TR output script.
 
 use bitcoin::script::ScriptBuf;
-use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
-use bitcoin::taproot::TaprootBuilder;
+use bitcoin::secp256k1::XOnlyPublicKey;
 use bitcoin::{Address, Network};
 
+use tap_primitives::asset::SerializedKey;
 use tap_primitives::commitment::TapCommitment;
 
 /// Error from PSBT commitment operations.
@@ -70,32 +70,24 @@ pub fn create_tap_output_script(
     tap_commitment: &TapCommitment,
     sibling_script: Option<&[u8]>,
 ) -> Result<(ScriptBuf, XOnlyPublicKey), PsbtError> {
-    let secp = Secp256k1::new();
-    let tap_leaf_data = tap_commitment.tap_leaf();
+    // Delegate to the shared implementation in tap-primitives (also
+    // used by the proof verifier).
+    let mut internal = [0u8; 33];
+    internal[0] = 0x02;
+    internal[1..].copy_from_slice(&internal_key.serialize());
 
-    // Build the tapscript tree.
-    let builder = if let Some(sibling) = sibling_script {
-        // Two leaves: TAP commitment and sibling script.
-        TaprootBuilder::new()
-            .add_leaf(1, ScriptBuf::from_bytes(tap_leaf_data))
-            .map_err(|e| PsbtError::TaprootBuildError(e.to_string()))?
-            .add_leaf(1, ScriptBuf::from_bytes(sibling.to_vec()))
-            .map_err(|e| PsbtError::TaprootBuildError(e.to_string()))?
-    } else {
-        // Single leaf: just the TAP commitment.
-        TaprootBuilder::new()
-            .add_leaf(0, ScriptBuf::from_bytes(tap_leaf_data))
-            .map_err(|e| PsbtError::TaprootBuildError(e.to_string()))?
-    };
+    let (script, output_key) =
+        tap_primitives::crypto::tapscript::create_tap_output_script(
+            &SerializedKey(internal),
+            tap_commitment,
+            sibling_script,
+        )
+        .map_err(PsbtError::TaprootBuildError)?;
 
-    let spend_info = builder
-        .finalize(&secp, *internal_key)
-        .map_err(|e| PsbtError::TaprootBuildError(format!("{:?}", e)))?;
+    let output_key = XOnlyPublicKey::from_slice(&output_key)
+        .map_err(|e| PsbtError::InvalidKey(e.to_string()))?;
 
-    let output_key = spend_info.output_key();
-    let script = ScriptBuf::new_p2tr_tweaked(output_key);
-
-    Ok((script, output_key.into()))
+    Ok((ScriptBuf::from_bytes(script), output_key))
 }
 
 /// Creates a P2TR address for a TAP commitment.
@@ -104,18 +96,13 @@ pub fn create_tap_address(
     tap_commitment: &TapCommitment,
     network: Network,
 ) -> Result<Address, PsbtError> {
-    let secp = Secp256k1::new();
-    let tap_leaf_data = tap_commitment.tap_leaf();
+    let (_, output_key) =
+        create_tap_output_script(internal_key, tap_commitment, None)?;
 
-    let builder = TaprootBuilder::new()
-        .add_leaf(0, ScriptBuf::from_bytes(tap_leaf_data))
-        .map_err(|e| PsbtError::TaprootBuildError(e.to_string()))?;
-
-    let spend_info = builder
-        .finalize(&secp, *internal_key)
-        .map_err(|e| PsbtError::TaprootBuildError(format!("{:?}", e)))?;
-
-    let address = Address::p2tr_tweaked(spend_info.output_key(), network);
+    let address = Address::p2tr_tweaked(
+        bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(output_key),
+        network,
+    );
     Ok(address)
 }
 
@@ -134,7 +121,7 @@ pub fn verify_tap_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::secp256k1::{Keypair, SecretKey};
+    use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
     use tap_primitives::asset::*;
     use tap_primitives::commitment::{
         AssetCommitment, TapCommitment, TapCommitmentVersion,

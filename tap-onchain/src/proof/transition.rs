@@ -85,7 +85,8 @@ pub fn generate_transition_proof(
         prev_out: params.prev_out,
         block_header: BlockHeader(params.base.block_header),
         block_height: params.base.block_height,
-        anchor_tx: AnchorTx(params.base.anchor_tx_bytes),
+        anchor_tx: AnchorTx::from_bytes(&params.base.anchor_tx_bytes)
+            .map_err(|e| e.to_string())?,
         tx_merkle_proof,
         asset: params.new_asset,
         inclusion_proof,
@@ -142,7 +143,7 @@ fn encode_proof(proof: &proof::Proof) -> Vec<u8> {
     stream.push(TlvRecord::varint(3, proof.block_height as u64));
 
     // Type 4: Anchor transaction.
-    stream.push(TlvRecord::bytes(4, &proof.anchor_tx.0));
+    stream.push(TlvRecord::bytes(4, &proof.anchor_tx.to_bytes()));
 
     // Type 5: Tx merkle proof (nodes + direction bits).
     let mut merkle_bytes = Vec::new();
@@ -225,7 +226,16 @@ mod tests {
             base: BaseProofParams {
                 block_header: [0u8; 80],
                 block_height: 800_001,
-                anchor_tx_bytes: vec![0x02, 0x00],
+                // A minimal valid transaction (one default input,
+                // no outputs).
+                anchor_tx_bytes: bitcoin::consensus::encode::serialize(
+                    &bitcoin::Transaction {
+                        version: bitcoin::transaction::Version(2),
+                        lock_time: bitcoin::absolute::LockTime::ZERO,
+                        input: vec![bitcoin::TxIn::default()],
+                        output: vec![],
+                    },
+                ),
                 tx_index: 1,
                 block_tx_hashes: vec![[0xCC; 32], [0xDD; 32]],
                 output_index: 0,

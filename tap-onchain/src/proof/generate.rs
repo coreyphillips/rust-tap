@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use tap_primitives::asset::{
     Asset, Genesis, GroupKeyReveal, SerializedKey,
 };
+use tap_primitives::commitment::CommitmentProof;
 use tap_primitives::proof::{
     self, AnchorTx, BlockHeader, MetaReveal, TaprootProof, TransitionVersion,
 };
@@ -40,6 +41,12 @@ pub struct GenesisProofParams {
     pub tap_output_index: u32,
     /// Internal key for the TAP output.
     pub internal_key: SerializedKey,
+    /// The commitment (inclusion) proof linking the minted asset to the
+    /// anchor output's TAP commitment. Required for the proof to pass
+    /// full verification.
+    pub commitment_proof: Option<CommitmentProof>,
+    /// Exclusion proofs for the other P2TR outputs of the anchor tx.
+    pub exclusion_proofs: Vec<TaprootProof>,
     /// The genesis reveal.
     pub genesis_reveal: Genesis,
     /// Optional metadata reveal.
@@ -66,8 +73,7 @@ pub fn generate_genesis_proof(
     let inclusion_proof = TaprootProof {
         output_index: params.tap_output_index,
         internal_key: params.internal_key,
-        commitment_proof: None, // For genesis, the commitment proof can
-        // be derived from the asset and commitment structure.
+        commitment_proof: params.commitment_proof,
         tapscript_proof: None,
         unknown_odd_types: BTreeMap::new(),
     };
@@ -77,11 +83,12 @@ pub fn generate_genesis_proof(
         prev_out: params.prev_out,
         block_header: BlockHeader(params.block_header),
         block_height: params.block_height,
-        anchor_tx: AnchorTx(params.anchor_tx_bytes),
+        anchor_tx: AnchorTx::from_bytes(&params.anchor_tx_bytes)
+            .map_err(|e| e.to_string())?,
         tx_merkle_proof,
         asset: params.asset,
         inclusion_proof,
-        exclusion_proofs: vec![],
+        exclusion_proofs: params.exclusion_proofs,
         split_root_proof: None,
         meta_reveal: params.meta_reveal,
         additional_inputs: vec![],
@@ -119,8 +126,18 @@ mod tests {
 
         let tx_hash = [0xAA; 32];
 
+        // A minimal valid transaction (one default input, no
+        // outputs).
+        let anchor_tx_bytes =
+            bitcoin::consensus::encode::serialize(&bitcoin::Transaction {
+                version: bitcoin::transaction::Version(2),
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![bitcoin::TxIn::default()],
+                output: vec![],
+            });
+
         let params = GenesisProofParams {
-            anchor_tx_bytes: vec![0x01, 0x00], // minimal
+            anchor_tx_bytes,
             block_header: [0u8; 80],
             block_height: 800_000,
             tx_index: 0,
@@ -132,6 +149,8 @@ mod tests {
             asset,
             tap_output_index: 0,
             internal_key: SerializedKey([0x02; 33]),
+            commitment_proof: None,
+            exclusion_proofs: vec![],
             genesis_reveal: genesis,
             meta_reveal: None,
             group_key_reveal: None,

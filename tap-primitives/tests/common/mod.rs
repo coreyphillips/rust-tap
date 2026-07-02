@@ -825,7 +825,12 @@ pub fn build_proof(tp: &TestProof) -> Result<Proof, String> {
             .map(|h| h.to_block_header())
             .unwrap_or_default(),
         block_height: tp.block_height,
-        anchor_tx: AnchorTx(parse_hex(&tp.anchor_tx)),
+        anchor_tx: if tp.anchor_tx.is_empty() {
+            AnchorTx::default()
+        } else {
+            AnchorTx::from_bytes(&parse_hex(&tp.anchor_tx))
+                .map_err(|e| e.to_string())?
+        },
         tx_merkle_proof: tp
             .tx_merkle_proof
             .as_ref()

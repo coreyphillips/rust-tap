@@ -155,6 +155,77 @@ impl Asset {
             unknown_odd_types: BTreeMap::new(),
         }
     }
+
+    /// Creates a minimal alt-leaf asset, mirroring Go's
+    /// `asset.NewAltLeaf` (asset/asset.go:2325): version V0, empty
+    /// genesis, zero amount, no witnesses, no group key.
+    pub fn new_alt_leaf(
+        script_key: ScriptKey,
+        script_version: ScriptVersion,
+    ) -> Self {
+        Asset {
+            version: AssetVersion::V0,
+            genesis: Genesis::empty(),
+            amount: 0,
+            lock_time: 0,
+            relative_lock_time: 0,
+            prev_witnesses: vec![],
+            split_commitment_root: None,
+            script_version,
+            script_key,
+            group_key: None,
+            unknown_odd_types: BTreeMap::new(),
+        }
+    }
+
+    /// Copies this asset for spending in a dependent transaction,
+    /// mirroring Go's `Asset.CopySpendTemplate` (asset/asset.go:1949):
+    /// the split commitment root and both lock time fields are cleared.
+    pub fn copy_spend_template(&self) -> Asset {
+        let mut copy = self.clone();
+        copy.split_commitment_root = None;
+        copy.relative_lock_time = 0;
+        copy.lock_time = 0;
+        copy
+    }
+}
+
+/// Creates a minimal spent-asset marker from a witness' `PrevId`,
+/// mirroring Go's `asset.MakeSpentAsset` (asset/asset.go:2523). The
+/// marker is an alt leaf whose script key is the burn key derived from
+/// the prev ID.
+pub fn make_spent_asset(witness: &Witness) -> Result<Asset, AssetError> {
+    let prev_id = witness.prev_id.as_ref().ok_or_else(|| {
+        AssetError::EncodingError("witness has no prevID".into())
+    })?;
+
+    let prev_id_key = derive_burn_key(prev_id);
+    let script_key = ScriptKey::from_pub_key(prev_id_key);
+
+    Ok(Asset::new_alt_leaf(script_key, ScriptVersion::V0))
+}
+
+/// Returns the assets spent by the given output asset in the form of
+/// minimal spent-asset markers usable for STXO commitments, mirroring
+/// Go's `asset.CollectSTXO` (asset/asset.go:2492).
+///
+/// Genesis assets and split leaves have an empty STXO set.
+pub fn collect_stxo(out_asset: &Asset) -> Result<Vec<Asset>, AssetError> {
+    if !out_asset.is_transfer_root() {
+        return Ok(vec![]);
+    }
+
+    if out_asset.prev_witnesses.is_empty() {
+        return Err(AssetError::EncodingError(
+            "asset has no witnesses".into(),
+        ));
+    }
+
+    out_asset
+        .prev_witnesses
+        .iter()
+        .map(make_spent_asset)
+        .collect()
 }
 
 /// TLV type numbers for asset encoding (must match Go implementation).

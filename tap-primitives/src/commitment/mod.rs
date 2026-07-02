@@ -36,6 +36,6 @@ pub use proof::{
 };
 pub use split::{SplitAsset, SplitCommitment, SplitLocator};
 pub use tap_commitment::{
-    TapCommitment, TapCommitmentVersion, TAPROOT_ASSETS_MARKER,
-    TAPROOT_ASSETS_V2_TAG,
+    is_similar_tap_commitment_version, TapCommitment, TapCommitmentVersion,
+    TAPROOT_ASSETS_MARKER, TAPROOT_ASSETS_V2_TAG,
 };
