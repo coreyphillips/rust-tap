@@ -860,10 +860,11 @@ impl Proof {
     /// Verifies that the group key reveal derives the asset's group
     /// key, mirroring Go's `Proof.verifyGroupKeyReveal`
     /// (proof/verifier.go:824). For V0 reveals the full derivation is
-    /// checked; for V1 reveals the taproot tweak of the internal key
-    /// with the revealed tapscript root is checked (the Go-side
-    /// tapscript tree validation needs data not present in the current
-    /// reveal struct).
+    /// checked; for V1 reveals the full Go derivation is mirrored:
+    /// the reveal's tapscript tree is structurally validated against
+    /// the asset ID (asset/group_key.go, `GroupPubKeyV1` ->
+    /// `GroupKeyRevealTapscript.Validate`) before the taproot tweak
+    /// of the internal key with the tapscript root is checked.
     fn verify_group_key_reveal(&self) -> Result<(), ProofError> {
         use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1};
 
@@ -923,19 +924,16 @@ impl Proof {
             }
 
             // V1 (Go's GroupKeyRevealV1.GroupPubKey,
-            // asset/group_key.go:838): the group key is the taproot
-            // tweak of the internal key with the revealed root.
+            // asset/group_key.go:838): validates the reveal's
+            // tapscript tree against the asset ID, then applies the
+            // taproot tweak of the internal key with the root.
             asset::GroupKeyReveal::V1(v1) => {
-                if v1.tapscript.root.len() != 32 {
-                    return Err(verify_err(
-                        "group key reveal tapscript root invalid",
-                    ));
-                }
-                full_taproot_output_key(
-                    &secp,
-                    &v1.internal_key,
-                    &v1.tapscript.root,
-                )?
+                v1.group_pub_key(&asset_id).map_err(|e| {
+                    verify_err(format!(
+                        "group key reveal invalid: {}",
+                        e
+                    ))
+                })?
             }
         };
 

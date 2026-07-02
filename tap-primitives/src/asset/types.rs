@@ -194,6 +194,12 @@ pub enum AssetError {
     TagTooLong(usize),
     InvalidKey(String),
     EncodingError(String),
+    /// An asset does not satisfy the alt leaf constraints (Go's
+    /// `Asset.ValidateAltLeaf`).
+    InvalidAltLeaf(String),
+    /// Two alt leaves share the same asset commitment key (Go's
+    /// `asset.ErrDuplicateAltLeafKey`).
+    DuplicateAltLeafKey([u8; 32]),
 }
 
 impl std::fmt::Display for AssetError {
@@ -223,6 +229,16 @@ impl std::fmt::Display for AssetError {
             }
             AssetError::EncodingError(msg) => {
                 write!(f, "encoding error: {}", msg)
+            }
+            AssetError::InvalidAltLeaf(msg) => {
+                write!(f, "invalid alt leaf: {}", msg)
+            }
+            AssetError::DuplicateAltLeafKey(key) => {
+                write!(
+                    f,
+                    "duplicate alt leaf key: {}",
+                    crate::hex::encode(key)
+                )
             }
         }
     }

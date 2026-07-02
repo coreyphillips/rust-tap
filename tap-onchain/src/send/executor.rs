@@ -42,6 +42,24 @@ pub struct TransferResult {
     pub template: TransferTemplate,
 }
 
+/// Options for the transfer pipeline, the Rust analogue of Go's
+/// `tapsend.OutputCommitmentOption` set.
+#[derive(Clone, Debug, Default)]
+pub struct TransferOptions {
+    /// Explicit Taproot Asset commitment version for the created
+    /// output commitments. `None` derives the version from the asset
+    /// versions. V1 and V2 addresses (and V1 virtual packets) require
+    /// V2 commitments.
+    pub commitment_version: Option<TapCommitmentVersion>,
+    /// Skips merging STXO spent-asset markers (alt leaves) into the
+    /// transfer root output commitment, mirroring Go's
+    /// `tapsend.WithNoSTXOProofs`. Should only be used for asset
+    /// channels to preserve backward compatibility with older peers;
+    /// the default (false) matches Go, which merges STXO alt leaves
+    /// for every regular send.
+    pub no_stxo_proofs: bool,
+}
+
 /// Executes an end-to-end asset transfer.
 ///
 /// This is the main entry point for creating asset transfers. It:
@@ -90,13 +108,44 @@ pub fn execute_transfer_with_version(
     internal_keys: &[XOnlyPublicKey],
     commitment_version: Option<TapCommitmentVersion>,
 ) -> Result<TransferResult, SendError> {
+    execute_transfer_with_options(
+        inputs,
+        outputs,
+        genesis,
+        prev_assets,
+        signer,
+        internal_keys,
+        &TransferOptions {
+            commitment_version,
+            ..TransferOptions::default()
+        },
+    )
+}
+
+/// Executes an end-to-end asset transfer with explicit
+/// [`TransferOptions`].
+///
+/// By default (like Go's `tapsend.CreateOutputCommitments`), STXO
+/// spent-asset markers for the transfer inputs are merged into the
+/// transfer root output commitment before the anchor output scripts
+/// are computed; set [`TransferOptions::no_stxo_proofs`] to opt out
+/// (Go's `tapsend.WithNoSTXOProofs`, used for asset channels).
+pub fn execute_transfer_with_options(
+    inputs: &[SelectedInput],
+    outputs: &[TransferOutput],
+    genesis: &Genesis,
+    prev_assets: &InputSet,
+    signer: &dyn VirtualSigner,
+    internal_keys: &[XOnlyPublicKey],
+    options: &TransferOptions,
+) -> Result<TransferResult, SendError> {
     // Step 1: Prepare outputs (allocations + split commitments). This
     // fixes the split commitment root the signatures will commit to.
     let mut prepared = TransferBuilder::prepare_outputs_with_version(
         inputs,
         outputs,
         genesis,
-        commitment_version,
+        options.commitment_version,
     )?;
 
     // Step 2: Sign virtual transactions.
@@ -112,8 +161,10 @@ pub fn execute_transfer_with_version(
 
     // Step 4: Rebuild the change output commitment from the signed
     // root asset — its MS-SMT leaf changed when the witnesses were
-    // populated.
-    prepared.rebuild_root_commitment()?;
+    // populated. Unless opted out, this also merges the STXO alt
+    // leaves for the spent inputs into the commitment.
+    prepared
+        .rebuild_root_commitment_with_options(options.no_stxo_proofs)?;
 
     // Step 5: Build anchor transaction template.
     let mut output_descriptors = Vec::new();

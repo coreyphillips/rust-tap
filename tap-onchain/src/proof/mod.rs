@@ -27,8 +27,9 @@ pub use exclusion::{generate_exclusion_proofs, AnchorOutputInfo};
 pub use generate::generate_genesis_proof;
 pub use merkle::build_tx_merkle_proof;
 pub use suffix::{
-    create_proof_suffix, update_proof_chain_data, Bip86Output,
-    OutputProofInfo,
+    create_proof_suffix, create_proof_suffix_with_options,
+    update_proof_chain_data, Bip86Output, OutputProofInfo,
+    ProofSuffixOptions,
 };
 pub use transition::{
     append_transition, generate_transition_proof, BaseProofParams,

@@ -11,8 +11,8 @@
 
 
 use tap_primitives::asset::{
-    derive_burn_key, Asset, AssetVersion, Genesis, PrevId, ScriptKey,
-    ScriptVersion, Witness, NUMS_KEY,
+    collect_stxo, derive_burn_key, Asset, AssetVersion, Genesis, PrevId,
+    ScriptKey, ScriptVersion, Witness, NUMS_KEY,
 };
 use tap_primitives::commitment::{
     asset_leaf, AssetCommitmentTree, SplitAsset, SplitLocator,
@@ -144,12 +144,45 @@ impl PreparedTransfer {
     /// changes once its witnesses are populated, so the commitment
     /// created at preparation time no longer matches. For full-value
     /// sends the single output commitment is refreshed as well.
+    ///
+    /// STXO alt leaves for the spent inputs are merged into the
+    /// commitment, mirroring Go's default behavior in
+    /// `tapsend.CreateOutputCommitments`. Use
+    /// [`Self::rebuild_root_commitment_with_options`] to opt out (Go's
+    /// `tapsend.WithNoSTXOProofs`, used for asset channels).
     pub fn rebuild_root_commitment(&mut self) -> Result<(), SendError> {
+        self.rebuild_root_commitment_with_options(false)
+    }
+
+    /// Rebuilds the change output commitment, optionally skipping the
+    /// STXO alt leaf merge (`no_stxo_proofs`, mirroring Go's
+    /// `tapsend.WithNoSTXOProofs`).
+    ///
+    /// When STXO proofs are enabled and the root asset is a transfer
+    /// root, the spent inputs are collected into minimal spent-asset
+    /// markers ([`tap_primitives::asset::collect_stxo`]) and merged
+    /// into the commitment at `EMPTY_GENESIS_ID` BEFORE the anchor
+    /// output script is computed, mirroring Go's
+    /// `tapsend.CreateOutputCommitments` (tapsend/send.go:1038).
+    pub fn rebuild_root_commitment_with_options(
+        &mut self,
+        no_stxo_proofs: bool,
+    ) -> Result<(), SendError> {
         let version = self.change_commitment.commitment().version;
         let ac = AssetCommitmentTree::new(&[&self.root_asset])
             .map_err(|e| SendError::CommitmentError(e.to_string()))?;
-        let tc = TapCommitmentTree::new(version, vec![ac])
+        let mut tc = TapCommitmentTree::new(version, vec![ac])
             .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+
+        // Merge the STXO spent-asset markers into the commitment of
+        // the output carrying the transfer root asset. Genesis assets
+        // and split leaves produce no markers.
+        if !no_stxo_proofs {
+            let stxo_leaves = collect_stxo(&self.root_asset)
+                .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+            tc.merge_alt_leaves(&stxo_leaves)
+                .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+        }
 
         if !self.is_split {
             // Full send: the transfer asset itself is the root asset,

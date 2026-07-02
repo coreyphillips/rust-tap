@@ -11,9 +11,11 @@
 //!
 //! - [`keys`]: Key derivation, taproot tweaking, group key computation
 //! - [`schnorr`]: BIP-340 Schnorr signature verification for asset witnesses
+//! - [`pedersen`]: Pedersen commitments and NUMS xpub helpers
 
 pub mod derivation;
 pub mod keys;
+pub mod pedersen;
 pub mod schnorr;
 pub mod tapscript;
 pub mod virtual_tx;
@@ -21,6 +23,10 @@ pub mod virtual_tx;
 pub use keys::{
     compute_group_key, compute_taproot_output_key, parse_pub_key,
     serialize_pub_key, tweak_pub_key,
+};
+pub use pedersen::{
+    new_commitment, nums_xpub, taproot_nums_key, tweaked_nums_key,
+    verify_commitment, CryptoError, Opening, TAPROOT_NUMS_BYTES,
 };
 pub use schnorr::SchnorrWitnessValidator;
 pub use tapscript::{

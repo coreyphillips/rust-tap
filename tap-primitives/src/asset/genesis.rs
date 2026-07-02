@@ -10,8 +10,16 @@
 //! Asset genesis and ID computation.
 
 use bitcoin_hashes::{sha256, Hash, HashEngine};
+use std::sync::LazyLock;
 
 use super::types::*;
+
+/// The asset ID of the empty (zero-valued) genesis, mirroring Go's
+/// `asset.EmptyGenesisID` (asset/asset.go:264). This ID is the reserved
+/// tap commitment key under which alt leaves (e.g. STXO spent-asset
+/// markers) are committed.
+pub static EMPTY_GENESIS_ID: LazyLock<AssetId> =
+    LazyLock::new(|| Genesis::empty().id());
 
 /// A 32-byte asset identifier derived from the genesis metadata.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -129,6 +137,13 @@ impl Genesis {
         }
     }
 
+    /// Returns true if this is the empty genesis (all fields
+    /// zero-valued), matching a comparison against Go's
+    /// `asset.EmptyGenesis`.
+    pub fn is_empty(&self) -> bool {
+        *self == Genesis::empty()
+    }
+
     /// Validates the genesis fields.
     pub fn validate(&self) -> Result<(), AssetError> {
         if self.tag.len() > MAX_ASSET_NAME_LENGTH {
@@ -138,9 +153,26 @@ impl Genesis {
     }
 }
 
+impl Default for Genesis {
+    /// The zero-valued genesis, matching Go's `asset.EmptyGenesis`.
+    fn default() -> Self {
+        Genesis::empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_empty_genesis_id_matches_go() {
+        // Computed from Go v0.8.99: asset.EmptyGenesisID.
+        let expected =
+            "c2e9e9c378d76e4a15b98b9658436444995a76affe04ffe4331ff029e0de1e69";
+        assert_eq!(crate::hex::encode(EMPTY_GENESIS_ID.as_bytes()), expected);
+        assert_eq!(Genesis::default().id(), *EMPTY_GENESIS_ID);
+        assert!(Genesis::empty().is_empty());
+    }
 
     #[test]
     fn test_asset_id_deterministic() {
