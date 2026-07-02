@@ -31,6 +31,9 @@ use crate::vm::InputSet;
 pub enum VirtualTxError {
     /// An input witness references a PrevId not found in the input set.
     MissingInput(String),
+    /// The witnesses consumed a different set of inputs than the
+    /// provided previous assets (duplicate or omitted inputs).
+    InputMismatch,
     /// The tree operation failed.
     TreeError(String),
     /// The sighash computation failed.
@@ -43,6 +46,10 @@ impl std::fmt::Display for VirtualTxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VirtualTxError::MissingInput(msg) => write!(f, "missing input: {}", msg),
+            VirtualTxError::InputMismatch => write!(
+                f,
+                "the set of consumed inputs does not match the previous assets"
+            ),
             VirtualTxError::TreeError(msg) => write!(f, "tree error: {}", msg),
             VirtualTxError::SighashError(msg) => write!(f, "sighash error: {}", msg),
             VirtualTxError::InvalidKey(msg) => write!(f, "invalid key: {}", msg),
@@ -75,16 +82,14 @@ pub fn virtual_tx_in(
     prev_assets: &InputSet,
 ) -> Result<(TxIn, NodeHash, u64), VirtualTxError> {
     let mut tree = FullTree::new(DefaultStore::new());
+    let mut inputs_consumed =
+        std::collections::HashSet::with_capacity(prev_assets.len());
 
     for witness in &new_asset.prev_witnesses {
         let prev_id = witness
             .prev_id
             .as_ref()
             .ok_or_else(|| VirtualTxError::MissingInput("witness has no prev_id".into()))?;
-
-        if prev_id.is_zero() {
-            continue;
-        }
 
         let prev_asset = prev_assets
             .get(prev_id)
@@ -97,7 +102,56 @@ pub fn virtual_tx_in(
 
         tree.insert(key, leaf)
             .map_err(|e| VirtualTxError::TreeError(e.to_string()))?;
+
+        inputs_consumed.insert(prev_id.clone());
     }
+
+    // The set of referenced inputs must match the set of previous
+    // assets, guarding against duplicate or omitted inputs. Mirrors
+    // Go's ErrInputMismatch check in tapscript/tx.go.
+    if inputs_consumed.len() != prev_assets.len() {
+        return Err(VirtualTxError::InputMismatch);
+    }
+
+    let root = tree.root().map_err(|e| VirtualTxError::TreeError(e.to_string()))?;
+    let root_hash = root.node_hash();
+    let root_sum = root.node_sum();
+    let prevout = virtual_tx_in_prevout(&root_hash, root_sum);
+
+    let txin = TxIn {
+        previous_output: prevout,
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::ZERO,
+        witness: BtcWitness::new(),
+    };
+
+    Ok((txin, root_hash, root_sum))
+}
+
+/// Builds the virtual transaction input for a grouped asset genesis.
+///
+/// The input tree commits to only the (witnessless) genesis asset,
+/// inserted at the zero PrevId's hash. Matches Go's
+/// `asset.VirtualGenesisTxIn`.
+pub fn virtual_genesis_tx_in(
+    new_asset: &Asset,
+) -> Result<(TxIn, NodeHash, u64), VirtualTxError> {
+    use crate::asset::PrevId;
+
+    // Strip any group witness if present.
+    let mut copy_no_witness = new_asset.clone();
+    if copy_no_witness.has_genesis_witness_for_group() {
+        copy_no_witness.prev_witnesses[0].tx_witness = vec![];
+    }
+
+    // Genesis grouped assets always use the zero PrevId as the MS-SMT
+    // key since the asset has no real PrevId.
+    let key = PrevId::ZERO.hash();
+    let leaf = asset_to_leaf(&copy_no_witness);
+
+    let mut tree = FullTree::new(DefaultStore::new());
+    tree.insert(key, leaf)
+        .map_err(|e| VirtualTxError::TreeError(e.to_string()))?;
 
     let root = tree.root().map_err(|e| VirtualTxError::TreeError(e.to_string()))?;
     let root_hash = root.node_hash();
@@ -192,7 +246,17 @@ pub fn virtual_tx(
     new_asset: &Asset,
     prev_assets: &InputSet,
 ) -> Result<(Transaction, NodeHash, u64), VirtualTxError> {
-    let (txin, root_hash, root_sum) = virtual_tx_in(new_asset, prev_assets)?;
+    // Grouped asset geneses commit to only the genesis asset itself;
+    // everything else maps its inputs into an MS-SMT. Mirrors the
+    // branch in Go's tapscript.VirtualTx.
+    let (txin, root_hash, root_sum) = if new_asset
+        .needs_genesis_witness_for_group()
+        || new_asset.has_genesis_witness_for_group()
+    {
+        virtual_genesis_tx_in(new_asset)?
+    } else {
+        virtual_tx_in(new_asset, prev_assets)?
+    };
     let txout = virtual_tx_out(new_asset)?;
 
     let tx = Transaction {

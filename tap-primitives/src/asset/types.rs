@@ -15,11 +15,9 @@
 pub enum AssetVersion {
     /// Initial version.
     V0 = 0,
-    /// Version 1 — supports segwit-style encoding (witness can be omitted
-    /// for MS-SMT leaf encoding).
+    /// Version 1 - supports segwit-style encoding (the raw TxWitness
+    /// sub-records are omitted from the MS-SMT leaf encoding).
     V1 = 1,
-    /// Version 2.
-    V2 = 2,
 }
 
 impl AssetVersion {
@@ -27,7 +25,6 @@ impl AssetVersion {
         match v {
             0 => Ok(AssetVersion::V0),
             1 => Ok(AssetVersion::V1),
-            2 => Ok(AssetVersion::V2),
             _ => Err(AssetError::UnknownVersion(v)),
         }
     }
@@ -39,10 +36,8 @@ impl AssetVersion {
 pub enum AssetType {
     /// A normal (fungible) asset that can be divided.
     Normal = 0,
-    /// A collectible (NFT) — amount is always 1.
+    /// A collectible (NFT) - amount is always 1.
     Collectible = 1,
-    /// A grouped collectible.
-    GroupedCollectible = 2,
 }
 
 impl AssetType {
@@ -50,7 +45,6 @@ impl AssetType {
         match v {
             0 => Ok(AssetType::Normal),
             1 => Ok(AssetType::Collectible),
-            2 => Ok(AssetType::GroupedCollectible),
             _ => Err(AssetError::UnknownType(v)),
         }
     }

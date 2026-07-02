@@ -50,6 +50,7 @@ pub enum ProofError {
     InvalidMetaType(u8),
     MetaTooLarge(usize),
     InvalidDecimalDisplay(u32),
+    InvalidMetaReveal(String),
     GenesisMismatch,
     GenesisPrevOutMismatch,
     MetaHashMismatch,
@@ -85,6 +86,9 @@ impl std::fmt::Display for ProofError {
             }
             ProofError::InvalidDecimalDisplay(v) => {
                 write!(f, "invalid decimal display: {}", v)
+            }
+            ProofError::InvalidMetaReveal(msg) => {
+                write!(f, "invalid meta reveal: {}", msg)
             }
             ProofError::GenesisMismatch => {
                 write!(f, "genesis reveal doesn't match asset")

@@ -230,9 +230,7 @@ pub fn encode_asset(asset: &Asset, encode_type: EncodeType) -> Vec<u8> {
 pub fn encode_asset_leaf(asset: &Asset) -> Vec<u8> {
     match asset.version {
         AssetVersion::V0 => encode_asset(asset, EncodeType::Normal),
-        AssetVersion::V1 | AssetVersion::V2 => {
-            encode_asset(asset, EncodeType::Segwit)
-        }
+        AssetVersion::V1 => encode_asset(asset, EncodeType::Segwit),
     }
 }
 

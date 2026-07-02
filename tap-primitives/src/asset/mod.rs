@@ -94,6 +94,13 @@ impl Asset {
             && self.group_key.is_some()
     }
 
+    /// Returns true if this is a grouped genesis asset whose group
+    /// witness has not been attached yet. Matches Go's
+    /// `Asset.NeedsGenesisWitnessForGroup`.
+    pub fn needs_genesis_witness_for_group(&self) -> bool {
+        self.has_genesis_witness() && self.group_key.is_some()
+    }
+
     /// Returns true if this asset has a split commitment witness.
     pub fn has_split_commitment_witness(&self) -> bool {
         self.prev_witnesses.len() == 1

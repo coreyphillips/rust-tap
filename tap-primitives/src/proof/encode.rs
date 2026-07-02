@@ -292,13 +292,7 @@ pub fn encode_commitment_proof(cp: &CommitmentProof) -> Vec<u8> {
 
 /// Encodes a `MetaReveal` to TLV bytes.
 pub fn encode_meta_reveal(meta: &MetaReveal) -> Vec<u8> {
-    let mut stream = TlvStream::new();
-    stream.push(TlvRecord::u8(0, meta.meta_type as u8));
-    stream.push(TlvRecord::bytes(2, &meta.data));
-    if let Some(dd) = meta.decimal_display {
-        stream.push(TlvRecord::varint(4, dd as u64));
-    }
-    stream.encode()
+    meta.encode()
 }
 
 /// Encodes a `GroupKeyReveal` to bytes.
