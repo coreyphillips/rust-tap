@@ -32,12 +32,18 @@ fn proof_type_str(pt: &ProofType) -> &'static str {
     match pt {
         ProofType::Issuance => "issuance",
         ProofType::Transfer => "transfer",
+        ProofType::Ignore => "ignore",
+        ProofType::Burn => "burn",
+        ProofType::MintSupply => "mint_supply",
     }
 }
 
 fn proof_type_from_str(s: &str) -> ProofType {
     match s {
         "transfer" => ProofType::Transfer,
+        "ignore" => ProofType::Ignore,
+        "burn" => ProofType::Burn,
+        "mint_supply" => ProofType::MintSupply,
         _ => ProofType::Issuance,
     }
 }

@@ -16,8 +16,57 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use tap_primitives::address::AUTH_MAILBOX_UNI_RPC_COURIER_TYPE;
 use tap_primitives::asset::{AssetId, OutPoint, SerializedKey};
 use tap_primitives::proof;
+
+/// The known proof courier kinds, identified by the courier URL scheme.
+/// Mirrors Go's courier type constants in proof/courier.go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CourierKind {
+    /// The hashmail courier (Go: `HashmailCourierType`, "hashmail").
+    Hashmail,
+    /// The universe RPC courier (Go: `UniverseRpcCourierType`,
+    /// "universerpc").
+    UniverseRpc,
+    /// The authmailbox plus universe RPC courier required by V2
+    /// addresses (Go: `AuthMailboxUniRpcCourierType`,
+    /// "authmailbox+universerpc"). A single connection serves both the
+    /// universe proof push/pull and the auth mailbox send-fragment
+    /// delivery: V2 deliveries route the encrypted [`SendFragment`]
+    /// through the mailbox (see
+    /// [`crate::proof::mailbox::deliver_send_manifest`]) while the
+    /// transfer proofs themselves are pushed to / fetched from the
+    /// universe half, which the existing [`Courier`] trait models.
+    ///
+    /// [`SendFragment`]: tap_primitives::proof::SendFragment
+    AuthMailboxUniRpc,
+}
+
+impl CourierKind {
+    /// Parses the courier kind from a courier URL (e.g.
+    /// `authmailbox+universerpc://host:port`). Returns `None` for
+    /// unknown schemes, mirroring Go's scheme switch in
+    /// `proof.NewCourier`.
+    pub fn from_url(url: &str) -> Option<Self> {
+        let (scheme, _) = url.split_once("://")?;
+        match scheme {
+            "hashmail" => Some(CourierKind::Hashmail),
+            "universerpc" => Some(CourierKind::UniverseRpc),
+            s if s == AUTH_MAILBOX_UNI_RPC_COURIER_TYPE => {
+                Some(CourierKind::AuthMailboxUniRpc)
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns true if this courier kind supports transporting V2
+    /// address send manifests (auth mailbox messages). Mirrors the
+    /// scheme check in Go's `UniverseRpcCourier.deliverFragment`.
+    pub fn supports_send_manifests(&self) -> bool {
+        matches!(self, CourierKind::AuthMailboxUniRpc)
+    }
+}
 
 /// Identifies a proof for courier delivery/retrieval.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -272,6 +321,33 @@ mod tests {
         };
 
         deliver_transfer_proofs(&courier, &[(r1, p1), (r2, p2)]).unwrap();
+    }
+
+    #[test]
+    fn test_courier_kind_from_url() {
+        assert_eq!(
+            CourierKind::from_url("hashmail://foo.bar:10029"),
+            Some(CourierKind::Hashmail)
+        );
+        assert_eq!(
+            CourierKind::from_url("universerpc://foo.bar:10029"),
+            Some(CourierKind::UniverseRpc)
+        );
+        assert_eq!(
+            CourierKind::from_url(
+                "authmailbox+universerpc://foo.bar:10029"
+            ),
+            Some(CourierKind::AuthMailboxUniRpc)
+        );
+        assert_eq!(CourierKind::from_url("http://foo.bar"), None);
+        assert_eq!(CourierKind::from_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn test_courier_kind_send_manifest_support() {
+        assert!(CourierKind::AuthMailboxUniRpc.supports_send_manifests());
+        assert!(!CourierKind::Hashmail.supports_send_manifests());
+        assert!(!CourierKind::UniverseRpc.supports_send_manifests());
     }
 
     #[test]

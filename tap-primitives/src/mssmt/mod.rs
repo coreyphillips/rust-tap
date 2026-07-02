@@ -34,5 +34,8 @@ pub use node::{
     LAST_BIT_INDEX, MAX_TREE_LEVELS,
 };
 pub use proof::{CompressedProof, Proof};
-pub use store::{DefaultStore, StoreError, TreeStoreUpdateTx, TreeStoreViewTx};
+pub use store::{
+    copy_tree_store, DefaultStore, StoreError, TreeStoreUpdateTx,
+    TreeStoreViewTx,
+};
 pub use tree::{verify_merkle_proof, FullTree, TreeError};

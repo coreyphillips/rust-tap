@@ -94,19 +94,89 @@ impl ChainLookup for FixedHeightChainLookup {
     }
 }
 
+/// Checks whether an asset point (the [`PrevId`] a verified proof
+/// produces) is known to be invalid, mirroring Go's
+/// `proof.IgnoreChecker` (proof/verifier.go:48).
+///
+/// This acts as a rejection cache: once an outpoint + asset ID +
+/// script key triple has been marked ignored (e.g. via a signed ignore
+/// tuple in a universe supply commitment), any proof producing that
+/// asset point fails verification.
+pub trait IgnoreChecker {
+    /// Returns true if the given asset point is known to be invalid.
+    /// A false value could mean the asset point is valid, or that it is
+    /// unknown to the checker.
+    fn is_ignored(&self, prev_id: &PrevId) -> Result<bool, ProofError>;
+}
+
+/// An [`IgnoreChecker`] that never ignores anything. Used as the
+/// default type parameter of [`VerifierCtx`] so contexts built without
+/// an ignore checker keep working unchanged.
+pub struct NoIgnoreChecker;
+
+impl IgnoreChecker for NoIgnoreChecker {
+    fn is_ignored(&self, _prev_id: &PrevId) -> Result<bool, ProofError> {
+        Ok(false)
+    }
+}
+
 /// Context for proof verification, bundling all external verifiers.
 /// Mirrors Go's `proof.VerifierCtx`.
-pub struct VerifierCtx<H, M, G, C>
+///
+/// The optional `ignore_checker` mirrors Go's
+/// `VerifierCtx.IgnoreChecker` (an `lfn.Option`): when present, proofs
+/// whose resulting asset point is ignored fail verification.
+pub struct VerifierCtx<H, M, G, C, I = NoIgnoreChecker>
+where
+    H: HeaderVerifier,
+    M: MerkleVerifier,
+    G: GroupVerifier,
+    C: ChainLookup,
+    I: IgnoreChecker,
+{
+    pub header_verifier: H,
+    pub merkle_verifier: M,
+    pub group_verifier: G,
+    pub chain_lookup: C,
+    pub ignore_checker: Option<I>,
+}
+
+impl<H, M, G, C> VerifierCtx<H, M, G, C, NoIgnoreChecker>
 where
     H: HeaderVerifier,
     M: MerkleVerifier,
     G: GroupVerifier,
     C: ChainLookup,
 {
-    pub header_verifier: H,
-    pub merkle_verifier: M,
-    pub group_verifier: G,
-    pub chain_lookup: C,
+    /// Creates a verifier context without an ignore checker.
+    pub fn new(
+        header_verifier: H,
+        merkle_verifier: M,
+        group_verifier: G,
+        chain_lookup: C,
+    ) -> Self {
+        VerifierCtx {
+            header_verifier,
+            merkle_verifier,
+            group_verifier,
+            chain_lookup,
+            ignore_checker: None,
+        }
+    }
+
+    /// Attaches an ignore checker to this context.
+    pub fn with_ignore_checker<I: IgnoreChecker>(
+        self,
+        ignore_checker: I,
+    ) -> VerifierCtx<H, M, G, C, I> {
+        VerifierCtx {
+            header_verifier: self.header_verifier,
+            merkle_verifier: self.merkle_verifier,
+            group_verifier: self.group_verifier,
+            chain_lookup: self.chain_lookup,
+            ignore_checker: Some(ignore_checker),
+        }
+    }
 }
 
 /// Options controlling single-proof verification, mirroring Go's
@@ -1135,9 +1205,9 @@ impl Proof {
     /// verification process), mirroring Go's
     /// `Proof.VerifyProofIntegrity` (proof/verifier.go:1063). Returns
     /// the anchored Taproot Asset commitment.
-    pub fn verify_integrity<H, M, G, C>(
+    pub fn verify_integrity<H, M, G, C, I>(
         &self,
-        ctx: &VerifierCtx<H, M, G, C>,
+        ctx: &VerifierCtx<H, M, G, C, I>,
         opts: &ProofVerificationOptions,
     ) -> Result<TapCommitment, ProofError>
     where
@@ -1145,6 +1215,7 @@ impl Proof {
         M: MerkleVerifier,
         G: GroupVerifier,
         C: ChainLookup,
+        I: IgnoreChecker,
     {
         // 0. The proof version is checked during decoding (the
         // TransitionVersion enum has no unknown variant).
@@ -1152,6 +1223,26 @@ impl Proof {
         // Ensure the proof asset is valid (Go's Asset.Validate only
         // checks the asset name).
         validate_asset_name(&self.asset.genesis.tag)?;
+
+        // Before any other per-proof validation, check if this proof is
+        // already known to be invalid via the optional ignore checker.
+        // This is a rejection caching mechanism, mirroring Go's
+        // `VerifyProofIntegrity` (proof/verifier.go:1088-1105): the
+        // asset point produced by this proof (outpoint, asset ID,
+        // script key) is checked against the set of ignored points.
+        if let Some(checker) = &ctx.ignore_checker {
+            let asset_point = PrevId {
+                out_point: self.out_point(),
+                id: self.asset.id(),
+                script_key: *self.asset.script_key.serialized(),
+            };
+            if checker.is_ignored(&asset_point)? {
+                return Err(ProofError::VerificationFailed(format!(
+                    "invalid proof: asset point {:?} is ignored",
+                    asset_point
+                )));
+            }
+        }
 
         // 1. A transaction that spends the previous asset output has a
         // valid merkle proof within a block in the chain.
@@ -1252,10 +1343,10 @@ impl Proof {
     /// Verifies an asset state transition, mirroring Go's
     /// `Proof.verifyAssetStateTransition` (proof/verifier.go:601).
     /// Returns true if this state transition represents an asset split.
-    fn verify_asset_state_transition<H, M, G, C>(
+    fn verify_asset_state_transition<H, M, G, C, I>(
         &self,
         prev: Option<&AssetSnapshot>,
-        ctx: &VerifierCtx<H, M, G, C>,
+        ctx: &VerifierCtx<H, M, G, C, I>,
         opts: &ProofVerificationOptions,
     ) -> Result<bool, ProofError>
     where
@@ -1263,6 +1354,7 @@ impl Proof {
         M: MerkleVerifier,
         G: GroupVerifier,
         C: ChainLookup,
+        I: IgnoreChecker,
     {
         // Determine whether we have an asset split based on the
         // resulting asset's witness. If so, the VM runs on the root
@@ -1351,10 +1443,10 @@ impl Proof {
     /// 5.-7. Genesis reveal / group key reveal checks.
     /// 8. Either a set of asset inputs with valid witnesses satisfying
     ///    the state transition, or a valid ownership challenge witness.
-    pub fn verify<H, M, G, C>(
+    pub fn verify<H, M, G, C, I>(
         &self,
         prev: Option<&AssetSnapshot>,
-        ctx: &VerifierCtx<H, M, G, C>,
+        ctx: &VerifierCtx<H, M, G, C, I>,
         opts: &ProofVerificationOptions,
     ) -> Result<AssetSnapshot, ProofError>
     where
@@ -1362,6 +1454,7 @@ impl Proof {
         M: MerkleVerifier,
         G: GroupVerifier,
         C: ChainLookup,
+        I: IgnoreChecker,
     {
         // Steps 0 to 7 (excluding step 1b that needs the previous asset
         // snapshot).
@@ -1416,9 +1509,9 @@ impl super::file::File {
     /// are verified sequentially, with each proof's `prev_out` required
     /// to spend the previous proof's outpoint. Returns the snapshot of
     /// the final state transition.
-    pub fn verify<H, M, G, C>(
+    pub fn verify<H, M, G, C, I>(
         &self,
-        ctx: &VerifierCtx<H, M, G, C>,
+        ctx: &VerifierCtx<H, M, G, C, I>,
         opts: &ProofVerificationOptions,
     ) -> Result<AssetSnapshot, ProofError>
     where
@@ -1426,6 +1519,7 @@ impl super::file::File {
         M: MerkleVerifier,
         G: GroupVerifier,
         C: ChainLookup,
+        I: IgnoreChecker,
     {
         if self.version != super::file::FILE_VERSION_V0 {
             return Err(verify_err(format!(
@@ -1646,5 +1740,71 @@ mod tests {
             verify_proof_structure(&proof),
             Err(ProofError::GenesisPrevOutMismatch)
         ));
+    }
+
+    /// An ignore checker that ignores a single asset point.
+    struct SinglePointChecker(PrevId);
+
+    impl IgnoreChecker for SinglePointChecker {
+        fn is_ignored(&self, prev_id: &PrevId) -> Result<bool, ProofError> {
+            Ok(*prev_id == self.0)
+        }
+    }
+
+    /// A proof whose produced asset point is ignored fails verification
+    /// immediately, mirroring Go's rejection cache in
+    /// `VerifyProofIntegrity` (proof/verifier.go:1088-1105).
+    #[test]
+    fn test_ignored_asset_point_rejected() {
+        let proof = dummy_proof();
+        let asset_point = PrevId {
+            out_point: proof.out_point(),
+            id: proof.asset.id(),
+            script_key: *proof.asset.script_key.serialized(),
+        };
+
+        let ctx = VerifierCtx::new(
+            TrustAllHeaders,
+            DefaultMerkleVerifier,
+            TrustAllGroups,
+            FixedHeightChainLookup(100),
+        )
+        .with_ignore_checker(SinglePointChecker(asset_point));
+
+        let err = proof
+            .verify_integrity(&ctx, &ProofVerificationOptions::default())
+            .expect_err("ignored proof must fail");
+        assert!(
+            err.to_string().contains("is ignored"),
+            "unexpected error: {}",
+            err
+        );
+
+        // A checker that ignores a different point does not trigger on
+        // this proof (verification proceeds and fails later for other
+        // reasons).
+        let other_point = PrevId {
+            out_point: OutPoint {
+                txid: [0xEE; 32],
+                vout: 1,
+            },
+            id: proof.asset.id(),
+            script_key: *proof.asset.script_key.serialized(),
+        };
+        let ctx = VerifierCtx::new(
+            TrustAllHeaders,
+            DefaultMerkleVerifier,
+            TrustAllGroups,
+            FixedHeightChainLookup(100),
+        )
+        .with_ignore_checker(SinglePointChecker(other_point));
+        let err = proof
+            .verify_integrity(&ctx, &ProofVerificationOptions::default())
+            .expect_err("dummy proof still fails downstream");
+        assert!(
+            !err.to_string().contains("is ignored"),
+            "unexpected ignore error: {}",
+            err
+        );
     }
 }

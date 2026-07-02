@@ -64,6 +64,73 @@ pub trait TreeStoreUpdateTx: TreeStoreViewTx {
     fn delete_all_nodes(&mut self);
 }
 
+/// Copies the full node structure of a tree from a source store into a
+/// target store, mirroring Go's `mssmt.Tree.Copy` as used by tapdb's
+/// `FetchSubTree`/`FetchRootSupplyTree`.
+///
+/// The copied tree produces an identical root (hash and sum). Empty
+/// subtrees are skipped.
+pub fn copy_tree_store<V, T>(source: &V, target: &mut T) -> Result<(), StoreError>
+where
+    V: TreeStoreViewTx,
+    T: TreeStoreUpdateTx,
+{
+    let root = source.root_node()?;
+    let empty = empty_tree();
+    if root.node_hash() == empty[0].node_hash() {
+        return Ok(());
+    }
+
+    fn copy_node<V, T>(
+        source: &V,
+        target: &mut T,
+        height: usize,
+        node: &Node,
+    ) -> Result<(), StoreError>
+    where
+        V: TreeStoreViewTx,
+        T: TreeStoreUpdateTx,
+    {
+        let empty = empty_tree();
+        if node.node_hash() == empty[height].node_hash() {
+            return Ok(());
+        }
+        match node {
+            Node::Branch(branch) => {
+                target.insert_branch(branch);
+                let (left, right) =
+                    source.get_children(height, &branch.node_hash())?;
+                copy_node(source, target, height + 1, &left)?;
+                copy_node(source, target, height + 1, &right)?;
+            }
+            Node::Leaf(leaf) => {
+                if !leaf.is_empty() {
+                    target.insert_leaf(leaf);
+                }
+            }
+            Node::Compacted(cl) => {
+                target.insert_compacted_leaf(cl);
+            }
+            Node::Computed(_) => {
+                // Computed nodes carry no structure to copy; stores
+                // are expected to materialize branches/leaves.
+                return Err(StoreError::Other(
+                    "cannot copy computed node".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    copy_node(source, target, 0, &root)?;
+
+    if let Node::Branch(branch) = &root {
+        target.update_root(branch);
+    }
+
+    Ok(())
+}
+
 /// An in-memory tree store backed by `HashMap`s.
 ///
 /// This mirrors the Go `DefaultStore` and is suitable for testing and

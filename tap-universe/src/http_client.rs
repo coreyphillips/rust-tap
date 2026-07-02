@@ -110,6 +110,15 @@ impl HttpUniverseClient {
         let proof_type_str = match proof_type {
             ProofType::Issuance => "PROOF_TYPE_ISSUANCE",
             ProofType::Transfer => "PROOF_TYPE_TRANSFER",
+            // The universe RPC only serves issuance/transfer trees;
+            // supply-commitment trees (ignore/burn/mint_supply) are
+            // synced via supply commitments instead.
+            ProofType::Ignore | ProofType::Burn | ProofType::MintSupply => {
+                return Err(UniverseError::SyncError(format!(
+                    "proof type {} not supported over universe RPC",
+                    proof_type.as_str()
+                )))
+            }
         };
 
         let txid_hex = hex_encode(&outpoint.txid);

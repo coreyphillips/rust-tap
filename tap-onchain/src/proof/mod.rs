@@ -15,13 +15,20 @@ pub mod exclusion;
 #[cfg(feature = "http-courier")]
 pub mod http_courier;
 pub mod generate;
+pub mod mailbox;
 pub mod merkle;
 pub mod suffix;
 pub mod transition;
 
 pub use courier::{
-    AnnotatedProof, Courier, CourierError, CourierLocator, MockCourier,
-    Recipient, deliver_transfer_proofs,
+    AnnotatedProof, Courier, CourierError, CourierKind, CourierLocator,
+    MockCourier, Recipient, deliver_transfer_proofs,
+};
+pub use mailbox::{
+    build_send_fragment, build_tx_proof, decrypt_send_fragment,
+    deliver_send_manifest, remove_message_challenge, MailboxError,
+    MailboxMessage, MailboxSigner, MailboxTransport, MessageFilter,
+    MockTransport, SendManifest, SoftMailboxSigner, MSG_MAX_SIZE,
 };
 pub use exclusion::{generate_exclusion_proofs, AnchorOutputInfo};
 pub use generate::generate_genesis_proof;

@@ -17,8 +17,10 @@ use tap_ldk::rfq::PriceOracle;
 use tap_onchain::chain::{AssetSigner, ChainBridge, KeyRing, WalletAnchor};
 use tap_onchain::mint::Planter;
 use tap_onchain::proof::courier::Courier;
+use tap_onchain::proof::mailbox::{MailboxSigner, MailboxTransport};
 use tap_persist::asset_store::AssetStore;
 use tap_persist::batch_store::BatchStore;
+use tap_persist::mailbox_store::MailboxStore;
 use tap_persist::proof_store::ProofStore;
 use tap_primitives::address::TapAddress;
 use tap_primitives::asset::{AssetId, OutPoint, SerializedKey};
@@ -80,6 +82,14 @@ where
 
     // Proof courier.
     pub(crate) courier: Box<dyn Courier + Send + Sync>,
+
+    // Auth mailbox (V2 address receives). `None` means mailbox
+    // polling is a no-op.
+    pub(crate) mailbox_transport:
+        Option<Box<dyn MailboxTransport + Send + Sync>>,
+    pub(crate) mailbox_signer:
+        Option<Box<dyn MailboxSigner + Send + Sync>>,
+    pub(crate) mailbox_store: Mutex<Box<dyn MailboxStore + Send>>,
 
     // Universe sync.
     pub(crate) universe_backend:
@@ -181,6 +191,27 @@ where
         amount: u64,
     ) -> Result<TapAddress, TapNodeError> {
         crate::receive::new_address(self, asset_id, amount)
+    }
+
+    /// Generates a new V2 (authmailbox) address for receiving an
+    /// asset, identified either by asset ID or by group key (grouped
+    /// assets; the asset ID is dropped in that case). The configured
+    /// courier URL must use the `authmailbox+universerpc` scheme.
+    pub fn new_address_v2(
+        &self,
+        params: crate::receive::V2AddressParams,
+    ) -> Result<TapAddress, TapNodeError> {
+        crate::receive::new_address_v2(self, params)
+    }
+
+    /// Polls the configured auth mailbox for incoming V2 address
+    /// sends, importing any completed transfers into the asset store.
+    /// Returns the imported assets. A no-op returning an empty vec if
+    /// no mailbox transport is configured.
+    pub fn poll_mailbox(
+        &self,
+    ) -> Result<Vec<crate::receive::ReceivedAsset>, TapNodeError> {
+        crate::receive::poll_mailbox(self)
     }
 
     // -- Transfers (delegates to crate::send) --

@@ -22,7 +22,7 @@ pub static EMPTY_GENESIS_ID: LazyLock<AssetId> =
     LazyLock::new(|| Genesis::empty().id());
 
 /// A 32-byte asset identifier derived from the genesis metadata.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 pub struct AssetId(pub [u8; 32]);
 
 impl AssetId {
