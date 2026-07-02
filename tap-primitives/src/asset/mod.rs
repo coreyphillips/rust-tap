@@ -16,6 +16,7 @@
 //! - [`GroupKey`]: Links multiple issuances into a fungible group
 //! - [`Witness`] / [`PrevId`]: State transition proofs
 
+pub mod burn;
 pub mod genesis;
 pub mod group_key;
 pub mod script_key;
@@ -24,6 +25,7 @@ pub mod witness;
 
 use std::collections::BTreeMap;
 
+pub use burn::{derive_burn_key, is_burn_key};
 pub use genesis::{AssetId, Genesis, OutPoint};
 pub use group_key::{
     GroupKey, GroupKeyReveal, GroupKeyRevealV0, GroupKeyRevealV1,

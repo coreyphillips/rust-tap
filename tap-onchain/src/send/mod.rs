@@ -20,12 +20,14 @@
 //! - [`TransferBuilder`]: Constructs transfers from allocations
 
 mod allocation;
+mod burn;
 pub mod executor;
 pub mod sign;
 pub mod split_proof;
 mod transfer;
 
 pub use allocation::{FundingDescriptor, SelectedInput, TransferOutput};
+pub use burn::{prepare_burn, BurnParams};
 pub use executor::{execute_transfer, TransferResult};
 pub use sign::{sign_transfer, VirtualSigner};
 pub use split_proof::populate_split_proofs;

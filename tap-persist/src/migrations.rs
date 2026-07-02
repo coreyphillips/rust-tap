@@ -15,6 +15,7 @@ use rusqlite::Connection;
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/001_initial.up.sql")),
     (2, include_str!("../migrations/002_universe.up.sql")),
+    (3, include_str!("../migrations/003_burns.up.sql")),
 ];
 
 /// Runs all pending migrations against the given connection.
@@ -77,7 +78,7 @@ mod tests {
     fn test_run_migrations_fresh_db() {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 2);
+        assert_eq!(current_version(&conn).unwrap(), 3);
     }
 
     #[test]
@@ -86,7 +87,7 @@ mod tests {
         run_migrations(&conn).unwrap();
         // Running again should not fail.
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 2);
+        assert_eq!(current_version(&conn).unwrap(), 3);
     }
 
     #[test]
@@ -111,6 +112,7 @@ mod tests {
         assert!(tables.contains(&"universe_roots".to_string()));
         assert!(tables.contains(&"universe_leaves".to_string()));
         assert!(tables.contains(&"universe_servers".to_string()));
+        assert!(tables.contains(&"asset_burns".to_string()));
     }
 
     #[test]

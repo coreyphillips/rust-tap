@@ -11,7 +11,7 @@
 
 
 use tap_primitives::asset::{
-    Asset, AssetVersion, Genesis, PrevId, ScriptKey,
+    derive_burn_key, Asset, AssetVersion, Genesis, PrevId, ScriptKey,
     ScriptVersion, Witness, NUMS_KEY,
 };
 use tap_primitives::commitment::{
@@ -44,6 +44,8 @@ pub enum SendError {
     SplitError(String),
     /// Invalid state transition.
     InvalidState(String),
+    /// Burn preparation or validation error.
+    BurnError(String),
 }
 
 impl std::fmt::Display for SendError {
@@ -74,6 +76,9 @@ impl std::fmt::Display for SendError {
             }
             SendError::InvalidState(msg) => {
                 write!(f, "invalid state: {}", msg)
+            }
+            SendError::BurnError(msg) => {
+                write!(f, "burn error: {}", msg)
             }
         }
     }
@@ -141,6 +146,33 @@ impl TransferBuilder {
     /// 2. **Partial send** (input amount > output amount): creates a split
     ///    commitment with a tombstone root and recipient splits.
     pub fn prepare_outputs(
+        inputs: &[SelectedInput],
+        outputs: &[TransferOutput],
+        genesis: &Genesis,
+    ) -> Result<PreparedTransfer, SendError> {
+        // Burn keys can only be funded through `prepare_burn`; a normal
+        // transfer must never pay to a key that provably burns the assets.
+        // Mirrors Go, which only derives burn script keys inside FundBurn.
+        for output in outputs {
+            let is_burn = inputs.iter().any(|input| {
+                output.script_key.serialized().schnorr_bytes()
+                    == derive_burn_key(&input.prev_id).schnorr_bytes()
+            });
+            if is_burn {
+                return Err(SendError::BurnError(
+                    "cannot send to a burn key; use prepare_burn instead"
+                        .into(),
+                ));
+            }
+        }
+
+        Self::prepare_outputs_inner(inputs, outputs, genesis)
+    }
+
+    /// Prepares output assets without the burn-key guard. Used by both
+    /// [`Self::prepare_outputs`] and the burn path, which intentionally
+    /// pays to a burn key.
+    pub(crate) fn prepare_outputs_inner(
         inputs: &[SelectedInput],
         outputs: &[TransferOutput],
         genesis: &Genesis,

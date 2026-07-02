@@ -359,7 +359,7 @@ pub struct TestAddress {
 pub fn build_address(
     ta: &TestAddress,
 ) -> Result<tap_primitives::address::TapAddress, String> {
-    use tap_primitives::address::{TapAddress, TapNetwork};
+    use tap_primitives::address::{AddressVersion, TapAddress, TapNetwork};
 
     if ta.chain_params_hrp.is_empty() {
         return Err("missing chain params HRP".into());
@@ -410,7 +410,8 @@ pub fn build_address(
     };
 
     Ok(TapAddress {
-        version: ta.version,
+        version: AddressVersion::from_u8(ta.version)
+            .map_err(|e| e.to_string())?,
         asset_version: ta.asset_version,
         asset_id,
         script_key: SerializedKey(parse_hex33(&ta.script_key)),
@@ -888,4 +889,367 @@ pub fn load_hex_file(name: &str) -> Vec<u8> {
     let data = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e));
     parse_hex(data.trim())
+}
+
+// ---------------------------------------------------------------------
+// vPSBT vectors (tappsbt/mock.go)
+// ---------------------------------------------------------------------
+
+use tap_primitives::vpsbt::{
+    Anchor as VAnchor, Bip32Derivation, KeyDescriptor, OutputScriptKey,
+    TaprootBip32Derivation, TweakedScriptKeyDesc, VInput, VOutput,
+    VOutputType, VPacket, VPacketVersion,
+};
+
+#[derive(Debug, Deserialize)]
+pub struct VPsbtVectorFile {
+    pub valid_test_cases: Option<Vec<VPsbtValidCase>>,
+    pub error_test_cases: Option<Vec<VPsbtErrorCase>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VPsbtValidCase {
+    pub packet: TestVPacket,
+    pub expected: String,
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VPsbtErrorCase {
+    pub packet: TestVPacket,
+    pub error: String,
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct TestVPacket {
+    pub inputs: Option<Vec<TestVInput>>,
+    pub outputs: Option<Vec<TestVOutput>>,
+    pub version: u8,
+    pub chain_params_hrp: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct TestVInput {
+    pub bip32_derivation: Option<Vec<TestBip32Derivation>>,
+    pub tr_bip32_derivation: Option<Vec<TestTrBip32Derivation>>,
+    pub tr_internal_key: String,
+    pub tr_merkle_root: String,
+    pub prev_id: Option<TestPrevId>,
+    pub anchor: Option<TestVAnchor>,
+    pub asset: Option<TestAsset>,
+    pub proof: Option<TestProof>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct TestVAnchor {
+    pub value: i64,
+    pub pk_script: String,
+    pub sig_hash_type: u32,
+    pub internal_key: String,
+    pub merkle_root: String,
+    pub tapscript_sibling: String,
+    pub bip32_derivation: Option<Vec<TestBip32Derivation>>,
+    pub tr_bip32_derivation: Option<Vec<TestTrBip32Derivation>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct TestBip32Derivation {
+    pub pub_key: String,
+    pub fingerprint: u32,
+    pub bip32_path: Vec<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct TestTrBip32Derivation {
+    /// The x-only public key (the JSON field is named `pub_key`).
+    pub pub_key: String,
+    pub leaf_hashes: Option<Vec<String>>,
+    pub fingerprint: u32,
+    pub bip32_path: Vec<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct TestVOutput {
+    pub amount: u64,
+    #[serde(rename = "type")]
+    pub output_type: u8,
+    pub asset_version: u32,
+    pub interactive: bool,
+    pub anchor_output_index: u32,
+    pub anchor_output_internal_key: String,
+    pub anchor_output_bip32_derivation: Option<Vec<TestBip32Derivation>>,
+    pub anchor_output_tr_bip32_derivation:
+        Option<Vec<TestTrBip32Derivation>>,
+    pub anchor_output_tapscript_sibling: String,
+    pub asset: Option<TestAsset>,
+    pub split_asset: Option<TestAsset>,
+    pub pk_script: String,
+    pub bip32_derivation: Option<Vec<TestBip32Derivation>>,
+    pub tr_bip32_derivation: Option<Vec<TestTrBip32Derivation>>,
+    pub tr_internal_key: String,
+    pub tr_merkle_root: String,
+    pub proof_delivery_address: String,
+    pub proof_suffix: Option<TestProof>,
+    pub relative_lock_time: u64,
+    pub lock_time: u64,
+    pub alt_leaves: Option<Vec<TestAsset>>,
+    pub address: Option<TestAddress>,
+}
+
+pub fn build_bip32_derivation(
+    td: &TestBip32Derivation,
+) -> Bip32Derivation {
+    Bip32Derivation {
+        pub_key: parse_hex(&td.pub_key),
+        master_key_fingerprint: td.fingerprint,
+        bip32_path: td.bip32_path.clone(),
+    }
+}
+
+pub fn build_tr_bip32_derivation(
+    td: &TestTrBip32Derivation,
+) -> TaprootBip32Derivation {
+    TaprootBip32Derivation {
+        x_only_pub_key: parse_hex(&td.pub_key),
+        leaf_hashes: td
+            .leaf_hashes
+            .iter()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .map(|s| parse_hex(s))
+            .collect(),
+        master_key_fingerprint: td.fingerprint,
+        bip32_path: td.bip32_path.clone(),
+    }
+}
+
+pub fn build_vanchor(ta: &TestVAnchor) -> Result<VAnchor, String> {
+    Ok(VAnchor {
+        value: ta.value as u64,
+        pk_script: parse_hex(&ta.pk_script),
+        sig_hash_type: ta.sig_hash_type,
+        internal_key: if ta.internal_key.is_empty() {
+            None
+        } else {
+            Some(SerializedKey(parse_hex33(&ta.internal_key)))
+        },
+        merkle_root: parse_hex(&ta.merkle_root),
+        tapscript_sibling: parse_hex(&ta.tapscript_sibling),
+        bip32_derivation: ta
+            .bip32_derivation
+            .iter()
+            .flatten()
+            .map(build_bip32_derivation)
+            .collect(),
+        taproot_bip32_derivation: ta
+            .tr_bip32_derivation
+            .iter()
+            .flatten()
+            .map(build_tr_bip32_derivation)
+            .collect(),
+    })
+}
+
+pub fn build_vinput(ti: &TestVInput) -> Result<VInput, String> {
+    let prev_id = ti.prev_id.as_ref().ok_or("missing prev ID")?;
+    let anchor = ti.anchor.as_ref().ok_or("missing anchor")?;
+
+    let asset = match ti.asset {
+        Some(ref ta) => Some(build_asset(ta)?),
+        None => None,
+    };
+    let proof = match ti.proof {
+        Some(ref tp) => Some(build_proof(tp)?),
+        None => None,
+    };
+
+    Ok(VInput {
+        bip32_derivation: ti
+            .bip32_derivation
+            .iter()
+            .flatten()
+            .map(build_bip32_derivation)
+            .collect(),
+        taproot_bip32_derivation: ti
+            .tr_bip32_derivation
+            .iter()
+            .flatten()
+            .map(build_tr_bip32_derivation)
+            .collect(),
+        taproot_internal_key: parse_hex(&ti.tr_internal_key),
+        taproot_merkle_root: parse_hex(&ti.tr_merkle_root),
+        sighash_type: 0,
+        prev_id: PrevId {
+            out_point: parse_out_point(&prev_id.out_point),
+            id: AssetId(parse_hex32(&prev_id.asset_id)),
+            script_key: SerializedKey(parse_hex33(&prev_id.script_key)),
+        },
+        anchor: build_vanchor(anchor)?,
+        asset,
+        proof,
+    })
+}
+
+/// Hex length of an encoded P2TR output script (34 bytes), matching
+/// Go's `test.HexTaprootPkScript`.
+const HEX_TAPROOT_PK_SCRIPT_LEN: usize = 68;
+
+pub fn build_voutput(to: &TestVOutput) -> Result<VOutput, String> {
+    if to.pk_script.is_empty() {
+        return Err("missing output pk script".into());
+    }
+    if to.pk_script.len() != HEX_TAPROOT_PK_SCRIPT_LEN {
+        return Err("invalid output pk script length".into());
+    }
+
+    // The script key is the x-only key of the P2TR pkScript, restored
+    // to a compressed key with even-y parity like Go's
+    // `schnorr.ParsePubKey` + `SerializeCompressed`.
+    let pk_script = parse_hex(&to.pk_script);
+    let mut script_key_bytes = [0u8; 33];
+    script_key_bytes[0] = 0x02;
+    script_key_bytes[1..].copy_from_slice(&pk_script[2..34]);
+
+    // The script key derivation info comes from the standard PSBT
+    // fields, mirroring Go's `TestVOutput.ToVOutput`.
+    let tweaked = match (&to.bip32_derivation, to.tr_internal_key.as_str())
+    {
+        (Some(derivations), key) if !derivations.is_empty() && !key.is_empty() => {
+            let derivation = &derivations[0];
+            let path = &derivation.bip32_path;
+            if path.len() != 5 {
+                return Err(format!(
+                    "invalid bip32 derivation path length: {}",
+                    path.len()
+                ));
+            }
+            const HARDENED: u32 = 0x8000_0000;
+            if path[0] != 1017 + HARDENED {
+                return Err("invalid purpose".into());
+            }
+            if path[2] < HARDENED {
+                return Err("key family must be hardened".into());
+            }
+            Some(TweakedScriptKeyDesc {
+                raw_key: KeyDescriptor {
+                    pub_key: SerializedKey(parse_hex33(
+                        &derivation.pub_key,
+                    )),
+                    family: path[2] - HARDENED,
+                    index: path[4],
+                },
+                tweak: parse_hex(&to.tr_merkle_root),
+            })
+        }
+        _ => None,
+    };
+
+    let asset = match to.asset {
+        Some(ref ta) => Some(build_asset(ta)?),
+        None => None,
+    };
+    let split_asset = match to.split_asset {
+        Some(ref ta) => Some(build_asset(ta)?),
+        None => None,
+    };
+    let proof_suffix = match to.proof_suffix {
+        Some(ref tp) => Some(build_proof(tp)?),
+        None => None,
+    };
+    let mut alt_leaves = Vec::new();
+    for leaf in to.alt_leaves.iter().flatten() {
+        alt_leaves.push(build_asset(leaf)?);
+    }
+    let address = match to.address {
+        Some(ref ta) => Some(build_address(ta)?),
+        None => None,
+    };
+
+    Ok(VOutput {
+        amount: to.amount,
+        asset_version: to.asset_version as u8,
+        output_type: VOutputType(to.output_type),
+        interactive: to.interactive,
+        anchor_output_index: to.anchor_output_index,
+        anchor_output_internal_key: if to
+            .anchor_output_internal_key
+            .is_empty()
+        {
+            None
+        } else {
+            Some(SerializedKey(parse_hex33(
+                &to.anchor_output_internal_key,
+            )))
+        },
+        anchor_output_bip32_derivation: to
+            .anchor_output_bip32_derivation
+            .iter()
+            .flatten()
+            .map(build_bip32_derivation)
+            .collect(),
+        anchor_output_taproot_bip32_derivation: to
+            .anchor_output_tr_bip32_derivation
+            .iter()
+            .flatten()
+            .map(build_tr_bip32_derivation)
+            .collect(),
+        anchor_output_tapscript_sibling: parse_tapscript_sibling(
+            &to.anchor_output_tapscript_sibling,
+        ),
+        asset,
+        split_asset,
+        script_key: OutputScriptKey {
+            pub_key: SerializedKey(script_key_bytes),
+            tweaked,
+        },
+        relative_lock_time: to.relative_lock_time,
+        lock_time: to.lock_time,
+        proof_delivery_address: if to.proof_delivery_address.is_empty() {
+            None
+        } else {
+            Some(to.proof_delivery_address.clone())
+        },
+        proof_suffix,
+        alt_leaves,
+        address,
+    })
+}
+
+/// Builds a [`VPacket`] from its JSON test representation, applying
+/// the same validation (and error strings) as Go's
+/// `TestVPacket.ToVPacket`.
+pub fn build_vpacket(tp: &TestVPacket) -> Result<VPacket, String> {
+    use tap_primitives::address::TapNetwork;
+
+    if tp.chain_params_hrp.is_empty() {
+        return Err("missing chain params HRP".into());
+    }
+    let chain_params = TapNetwork::from_hrp(&tp.chain_params_hrp)
+        .map_err(|_| "invalid chain params HRP".to_string())?;
+
+    let version =
+        VPacketVersion::from_u8(tp.version).map_err(|e| e.to_string())?;
+
+    let mut inputs = Vec::new();
+    for ti in tp.inputs.iter().flatten() {
+        inputs.push(build_vinput(ti)?);
+    }
+    let mut outputs = Vec::new();
+    for to in tp.outputs.iter().flatten() {
+        outputs.push(build_voutput(to)?);
+    }
+
+    Ok(VPacket {
+        inputs,
+        outputs,
+        chain_params,
+        version,
+    })
 }
