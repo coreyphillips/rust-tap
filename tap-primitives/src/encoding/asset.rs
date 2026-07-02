@@ -60,11 +60,16 @@ fn encode_tx_witness(witness: &[Vec<u8>]) -> Vec<u8> {
 
 /// Encodes a single Witness into wire format using TLV sub-records.
 ///
-/// Sub-record types (matching Go's witness encoding):
-/// - Type 1: PrevID (101 bytes)
-/// - Type 3: TxWitness
-/// - Type 5: SplitCommitment (compressed proof + root asset)
-fn encode_witness(witness: &Witness) -> Vec<u8> {
+/// Sub-record types (matching Go's `Witness.encodeRecords`):
+/// - Type 1: PrevID (101 bytes), emitted whenever present
+/// - Type 3: TxWitness, emitted when non-empty AND encoding is Normal
+/// - Type 5: SplitCommitment (compressed proof + root asset), emitted
+///   whenever present
+///
+/// The three records are independent: a witness carrying both a TxWitness
+/// and a SplitCommitment emits both records. Segwit encoding strips only
+/// the TxWitness record; PrevID and SplitCommitment are always kept.
+fn encode_witness(witness: &Witness, encode_type: EncodeType) -> Vec<u8> {
     use crate::asset::tlv_types;
 
     let mut stream = TlvStream::new();
@@ -83,8 +88,16 @@ fn encode_witness(witness: &Witness) -> Vec<u8> {
         ));
     }
 
-    // Type 3: TxWitness (if present and no split commitment).
-    // Type 5: SplitCommitment (if present).
+    // Type 3: TxWitness (only for Normal encoding; Segwit strips it).
+    if !witness.tx_witness.is_empty() && encode_type == EncodeType::Normal {
+        let witness_bytes = encode_tx_witness(&witness.tx_witness);
+        stream.push(TlvRecord::bytes(
+            tlv_types::WITNESS_TX_WITNESS,
+            &witness_bytes,
+        ));
+    }
+
+    // Type 5: SplitCommitment (whenever present, regardless of encoding).
     if let Some(ref split) = witness.split_commitment {
         let mut split_bytes = Vec::new();
         let proof_bytes = split.proof.compress().encode();
@@ -94,12 +107,6 @@ fn encode_witness(witness: &Witness) -> Vec<u8> {
             tlv_types::WITNESS_SPLIT_COMMITMENT,
             &split_bytes,
         ));
-    } else if !witness.tx_witness.is_empty() {
-        let witness_bytes = encode_tx_witness(&witness.tx_witness);
-        stream.push(TlvRecord::bytes(
-            tlv_types::WITNESS_TX_WITNESS,
-            &witness_bytes,
-        ));
     }
 
     stream.encode()
@@ -108,11 +115,14 @@ fn encode_witness(witness: &Witness) -> Vec<u8> {
 /// Encodes the PrevWitnesses array for TLV.
 ///
 /// Format: `BigSize(count) [BigSize(witness_len) witness_bytes]...`
-fn encode_prev_witnesses(witnesses: &[Witness]) -> Vec<u8> {
+fn encode_prev_witnesses(
+    witnesses: &[Witness],
+    encode_type: EncodeType,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     encode_bigsize(&mut buf, witnesses.len() as u64);
     for w in witnesses {
-        let witness_bytes = encode_witness(w);
+        let witness_bytes = encode_witness(w, encode_type);
         encode_var_bytes(&mut buf, &witness_bytes);
     }
     buf
@@ -122,9 +132,11 @@ fn encode_prev_witnesses(witnesses: &[Witness]) -> Vec<u8> {
 ///
 /// This matches Go's `Asset.encodeRecords()` / `Asset.Encode()`.
 ///
-/// When `encode_type` is `Segwit`, the witness field (type 11) is omitted.
-/// This is used for V1 assets when computing the MS-SMT leaf (the leaf
-/// does not include witnesses to save space).
+/// The PrevWitnesses record (type 11) is emitted whenever the asset has
+/// any previous witnesses, for both encoding types. When `encode_type` is
+/// `Segwit`, only the raw TxWitness sub-record inside each witness is
+/// stripped (signatures are excluded from V1 MS-SMT leaves), while the
+/// PrevID and SplitCommitment sub-records are always kept.
 pub fn encode_asset(asset: &Asset, encode_type: EncodeType) -> Vec<u8> {
     let mut stream = TlvStream::new();
 
@@ -162,11 +174,12 @@ pub fn encode_asset(asset: &Asset, encode_type: EncodeType) -> Vec<u8> {
         ));
     }
 
-    // Type 11: PrevWitnesses (only if non-empty AND not segwit encoding).
-    if !asset.prev_witnesses.is_empty() && encode_type == EncodeType::Normal {
+    // Type 11: PrevWitnesses (whenever non-empty, for both encoding
+    // types; the encode type only controls the inner TxWitness records).
+    if !asset.prev_witnesses.is_empty() {
         stream.push(TlvRecord::bytes(
             tlv_types::LEAF_PREV_WITNESS,
-            &encode_prev_witnesses(&asset.prev_witnesses),
+            &encode_prev_witnesses(&asset.prev_witnesses, encode_type),
         ));
     }
 
@@ -292,18 +305,86 @@ mod tests {
         assert!(stream.get(16).is_some(), "missing script_key");
     }
 
+    /// Decodes the type-11 PrevWitnesses record value into the inner
+    /// per-witness TLV streams.
+    fn decode_witness_streams(
+        prev_witness_value: &[u8],
+    ) -> Vec<super::super::tlv::TlvStream> {
+        use crate::encoding::bigsize::decode_bigsize;
+
+        let (count, mut offset) =
+            decode_bigsize(prev_witness_value).unwrap();
+        let mut streams = Vec::new();
+        for _ in 0..count {
+            let (len, consumed) =
+                decode_bigsize(&prev_witness_value[offset..]).unwrap();
+            offset += consumed;
+            let end = offset + len as usize;
+            let stream = super::super::tlv::TlvStream::decode(
+                &prev_witness_value[offset..end],
+            )
+            .unwrap();
+            streams.push(stream);
+            offset = end;
+        }
+        streams
+    }
+
     #[test]
-    fn test_asset_encoding_segwit_omits_witnesses() {
-        let asset = test_asset();
+    fn test_asset_encoding_segwit_keeps_prev_witness_record() {
+        let mut asset = test_asset();
+        asset.prev_witnesses[0].tx_witness = vec![vec![0xab; 64]];
         let encoded = encode_asset(&asset, EncodeType::Segwit);
         let stream = super::super::tlv::TlvStream::decode(&encoded).unwrap();
 
-        // Segwit encoding should NOT have witnesses (type 11).
-        assert!(stream.get(11).is_none(), "segwit should omit witnesses");
-        // But should still have everything else.
+        // Segwit encoding keeps the type-11 record (matching Go); only
+        // the inner TxWitness sub-record (type 3) is stripped.
+        let pw = stream
+            .get(11)
+            .expect("segwit must keep the prev witness record");
+        let witnesses = decode_witness_streams(&pw.value);
+        assert_eq!(witnesses.len(), 1);
+        assert!(witnesses[0].get(1).is_some(), "PrevID must be kept");
+        assert!(
+            witnesses[0].get(3).is_none(),
+            "TxWitness must be stripped for segwit"
+        );
+        // And should still have everything else.
         assert!(stream.get(0).is_some());
         assert!(stream.get(6).is_some());
         assert!(stream.get(16).is_some());
+    }
+
+    #[test]
+    fn test_witness_tx_and_split_commitment_both_encoded() {
+        use crate::asset::SplitCommitmentWitness;
+        use crate::mssmt;
+
+        let mut asset = test_asset();
+        asset.prev_witnesses[0].tx_witness = vec![vec![0xab; 64]];
+        asset.prev_witnesses[0].split_commitment =
+            Some(SplitCommitmentWitness {
+                proof: mssmt::Proof::new(vec![
+                    mssmt::Node::Computed(
+                        mssmt::ComputedNode::new(
+                            mssmt::NodeHash::EMPTY,
+                            0
+                        )
+                    );
+                    mssmt::MAX_TREE_LEVELS
+                ]),
+                root_asset: vec![0x01, 0x02, 0x03],
+            });
+
+        let encoded = encode_asset(&asset, EncodeType::Normal);
+        let stream = super::super::tlv::TlvStream::decode(&encoded).unwrap();
+        let pw = stream.get(11).unwrap();
+        let witnesses = decode_witness_streams(&pw.value);
+        assert_eq!(witnesses.len(), 1);
+        // Both TxWitness (3) and SplitCommitment (5) must be present
+        // when both are set (matching Go, which emits both records).
+        assert!(witnesses[0].get(3).is_some(), "TxWitness missing");
+        assert!(witnesses[0].get(5).is_some(), "SplitCommitment missing");
     }
 
     #[test]
@@ -343,13 +424,21 @@ mod tests {
     }
 
     #[test]
-    fn test_asset_leaf_v1_omits_witnesses() {
+    fn test_asset_leaf_v1_strips_only_tx_witness() {
         let mut asset = test_asset();
         asset.version = AssetVersion::V1;
+        asset.prev_witnesses[0].tx_witness = vec![vec![0xcd; 64]];
         let leaf = asset_to_leaf(&asset);
         let stream =
             super::super::tlv::TlvStream::decode(&leaf.value).unwrap();
-        assert!(stream.get(11).is_none());
+        // V1 leaves keep the type-11 record (matching Go); only the raw
+        // TxWitness sub-record is stripped so signatures do not affect
+        // the leaf hash.
+        let pw = stream.get(11).expect("V1 leaf must keep prev witnesses");
+        let witnesses = decode_witness_streams(&pw.value);
+        assert_eq!(witnesses.len(), 1);
+        assert!(witnesses[0].get(1).is_some(), "PrevID must be kept");
+        assert!(witnesses[0].get(3).is_none(), "TxWitness must be stripped");
     }
 
     #[test]
