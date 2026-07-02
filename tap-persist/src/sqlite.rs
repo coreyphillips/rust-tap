@@ -282,8 +282,8 @@ impl BatchStore for SqliteBatchStore<'_> {
                 params![
                     batch_id,
                     &seedling.asset_name,
-                    seedling.asset_version as u8,
-                    seedling.asset_type as u8,
+                    seedling.asset_version.to_u8(),
+                    seedling.asset_type.to_u8(),
                     seedling.amount as i64,
                     seedling.enable_emission as i32,
                 ],

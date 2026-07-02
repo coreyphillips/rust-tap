@@ -94,6 +94,25 @@ impl Default for DefaultStore {
     }
 }
 
+/// Returns a shallow copy of a branch whose children are replaced by
+/// computed nodes (hash + sum only).
+///
+/// Stored branches never need their full child subtrees: all consumers
+/// resolve children by hash via `get_children`. Storing deep child
+/// chains would make every store clone O(subtree size), which blows up
+/// insert and proof generation on large trees.
+fn shallow_branch(node: &BranchNode) -> BranchNode {
+    let left = Node::Computed(ComputedNode::new(
+        node.left.node_hash(),
+        node.left.node_sum(),
+    ));
+    let right = Node::Computed(ComputedNode::new(
+        node.right.node_hash(),
+        node.right.node_sum(),
+    ));
+    BranchNode::new(left, right)
+}
+
 impl DefaultStore {
     /// Look up a node by hash at the given height.
     fn get_node(&self, height: usize, hash: &NodeHash) -> Node {
@@ -166,11 +185,11 @@ impl TreeStoreViewTx for DefaultStore {
 
 impl TreeStoreUpdateTx for DefaultStore {
     fn update_root(&mut self, node: &BranchNode) {
-        self.root = Some(node.clone());
+        self.root = Some(shallow_branch(node));
     }
 
     fn insert_branch(&mut self, node: &BranchNode) {
-        self.branches.insert(node.node_hash(), node.clone());
+        self.branches.insert(node.node_hash(), shallow_branch(node));
     }
 
     fn insert_leaf(&mut self, node: &LeafNode) {

@@ -31,7 +31,9 @@ pub use asset_commitment::{
     asset_commitment_key, asset_leaf, tap_commitment_key, AssetCommitment,
     CommitmentError,
 };
-pub use proof::{AssetProof, CommitmentProof, TaprootAssetProof};
+pub use proof::{
+    AssetProof, CommitmentProof, TaprootAssetProof, TapscriptPreimage,
+};
 pub use split::{SplitAsset, SplitCommitment, SplitLocator};
 pub use tap_commitment::{
     TapCommitment, TapCommitmentVersion, TAPROOT_ASSETS_MARKER,

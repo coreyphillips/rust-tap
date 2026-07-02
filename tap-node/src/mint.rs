@@ -306,14 +306,17 @@ where
                     output_index: 0,
                     internal_key: internal_key_desc.pub_key,
                     commitment_proof: None,
+                    tapscript_proof: None,
                     unknown_odd_types: std::collections::BTreeMap::new(),
                 },
                 exclusion_proofs: vec![],
                 split_root_proof: None,
                 meta_reveal: None,
                 additional_inputs: vec![],
+                challenge_witness: None,
                 genesis_reveal: Some(genesis),
                 group_key_reveal: None,
+                alt_leaves: vec![],
                 unknown_odd_types: std::collections::BTreeMap::new(),
             };
             let proof_bytes =

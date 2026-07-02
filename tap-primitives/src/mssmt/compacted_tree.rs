@@ -109,10 +109,16 @@ impl<S: TreeStoreUpdateTx> CompactedTree<S> {
 
             match &next {
                 Node::Compacted(compacted) => {
-                    // Expand the compacted leaf and continue walking
-                    // through the extracted subtree.
-                    let extracted_next = compacted.extract(i + 1);
-                    next = extracted_next;
+                    // Expand the compacted leaf into its virtual
+                    // subtree rooted at level i + 1 and continue the
+                    // walk in memory. The extracted subtree only
+                    // materializes branches along the compacted leaf's
+                    // own key path; every sibling in it is an empty
+                    // tree node. If the query key diverges from the
+                    // compacted key at some level, the walk continues
+                    // through empty tree nodes down to the (empty)
+                    // leaf, which yields a correct non-inclusion proof.
+                    next = compacted.extract(i + 1);
 
                     if let Node::Compacted(cs) = &sibling {
                         sibling = cs.extract(i + 1);
@@ -120,66 +126,19 @@ impl<S: TreeStoreUpdateTx> CompactedTree<S> {
 
                     // Call iter for level i (the outer loop level).
                     iter(i, &next, &sibling, &current);
-                    current = next.clone();
+                    current = next;
 
-                    // Now navigate into current (branch at level i+1)
-                    // to get the next/sibling for level i+2.
-                    if i < LAST_BIT_INDEX {
-                        if let Node::Branch(branch) = &current {
-                            let (n, s) = step_order(
-                                i + 1,
-                                key,
-                                *branch.left.clone(),
-                                *branch.right.clone(),
-                            );
-                            next = n;
-                            sibling = s;
-                        }
-                    }
-
-                    // The compacted node sits at level i+1 (it's a
-                    // child of the current node at level i). We've
-                    // already called iter for level i via the outer
-                    // loop's step. Now walk from i+1 through the
-                    // extracted subtree.
+                    // Walk the in-memory subtree from level i+1 down
+                    // to the leaf level.
                     for j in (i + 1)..=LAST_BIT_INDEX {
-                        iter(j, &next, &sibling, &current);
-                        current = next.clone();
-
-                        if j < LAST_BIT_INDEX {
-                            match &current {
-                                Node::Branch(branch) => {
-                                    let (n, s) = step_order(
-                                        j + 1,
-                                        key,
-                                        *branch.left.clone(),
-                                        *branch.right.clone(),
-                                    );
-                                    next = n;
-                                    sibling = s;
-                                }
-                                _ => break,
-                            }
-                        }
+                        let (left, right) = in_memory_children(j, &current);
+                        let (n, s) = step_order(j, key, left, right);
+                        iter(j, &n, &s, &current);
+                        current = n;
                     }
 
-                    // After the inner loop, current should be a branch
-                    // at the last level. Its child (determined by the
-                    // key bit) is the leaf.
-                    return match &current {
-                        Node::Branch(branch) => {
-                            let (leaf_node, _) = step_order(
-                                LAST_BIT_INDEX,
-                                key,
-                                *branch.left.clone(),
-                                *branch.right.clone(),
-                            );
-                            match leaf_node {
-                                Node::Leaf(leaf) => Ok(leaf),
-                                _ => Ok(LeafNode::empty()),
-                            }
-                        }
-                        Node::Leaf(leaf) => Ok(leaf.clone()),
+                    return match current {
+                        Node::Leaf(leaf) => Ok(leaf),
                         _ => Ok(LeafNode::empty()),
                     };
                 }
@@ -362,6 +321,22 @@ impl<S: TreeStoreUpdateTx> CompactedTree<S> {
         }
 
         Ok(parent)
+    }
+}
+
+/// Returns the children (living at `level + 1`) of an in-memory node at
+/// `level` inside an extracted compacted subtree.
+///
+/// Branches yield their actual children. Any other node kind here is by
+/// construction an empty tree node (extract uses empty tree nodes for
+/// all siblings, and the empty tree stores its children as computed
+/// nodes), so its children are the empty nodes one level deeper.
+fn in_memory_children(level: usize, node: &Node) -> (Node, Node) {
+    if let Node::Branch(branch) = node {
+        (*branch.left.clone(), *branch.right.clone())
+    } else {
+        let child = empty_tree()[level + 1].clone();
+        (child.clone(), child)
     }
 }
 

@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use crate::asset::{self, Asset, Genesis, OutPoint, SerializedKey};
-use crate::commitment::CommitmentProof;
+use crate::commitment::{CommitmentProof, TapscriptPreimage};
 
 use super::meta::MetaReveal;
 use super::tx_merkle::TxMerkleProof;
@@ -70,8 +70,32 @@ impl Default for BlockHeader {
     }
 }
 
+/// A proof that a Taproot output does NOT contain a Taproot Asset
+/// commitment.
+///
+/// Taproot Asset commitments must exist at a leaf of depth 0 or 1, so
+/// non-inclusion is shown by revealing the preimage of one node at
+/// depth 0 or two nodes at depth 1 (or the BIP-86 flag for outputs with
+/// no script tree at all). Matches Go's `proof.TapscriptProof`.
+#[derive(Clone, Debug)]
+pub struct TapscriptProof {
+    /// Preimage for a tap node at depth 0 or 1 (TLV type 1).
+    pub tap_preimage_1: Option<TapscriptPreimage>,
+    /// Pair preimage for `tap_preimage_1` at depth 1 (TLV type 3).
+    pub tap_preimage_2: Option<TapscriptPreimage>,
+    /// True for a plain BIP-0086 key-spend output that commits to no
+    /// script root at all (TLV type 4).
+    pub bip86: bool,
+    /// Unknown odd TLV types for forward compatibility.
+    pub unknown_odd_types: BTreeMap<u64, Vec<u8>>,
+}
+
 /// A proof that a Taproot Asset output is committed in a specific
 /// Taproot output of the anchor transaction.
+///
+/// A TaprootProof carries either a `commitment_proof` (the output holds
+/// a Taproot Asset commitment that includes/excludes the asset) or a
+/// `tapscript_proof` (the output holds no commitment at all).
 #[derive(Clone, Debug)]
 pub struct TaprootProof {
     /// Index of the output in the anchor transaction.
@@ -80,6 +104,10 @@ pub struct TaprootProof {
     pub internal_key: SerializedKey,
     /// Commitment proof (for inclusion or exclusion in the TAP tree).
     pub commitment_proof: Option<CommitmentProof>,
+    /// Tapscript proof showing the output commits to no Taproot Asset
+    /// commitment (TLV type 5). Mutually exclusive with
+    /// `commitment_proof`.
+    pub tapscript_proof: Option<TapscriptProof>,
     /// Unknown odd TLV types for forward compatibility.
     pub unknown_odd_types: BTreeMap<u64, Vec<u8>>,
 }
@@ -132,10 +160,19 @@ pub struct Proof {
     pub meta_reveal: Option<MetaReveal>,
     /// Proofs for additional inputs (multi-input transfers).
     pub additional_inputs: Vec<super::file::File>,
+    /// Ownership challenge witness (TLV type 21): a signed virtual
+    /// transaction witness proving the prover can spend the asset.
+    /// Encoded as a Bitcoin-style witness stack, Go's
+    /// `ChallengeWitnessRecord`.
+    pub challenge_witness: Option<Vec<Vec<u8>>>,
     /// Genesis reveal (present for minting proofs).
     pub genesis_reveal: Option<Genesis>,
     /// Group key reveal (present for grouped asset genesis).
     pub group_key_reveal: Option<asset::GroupKeyReveal>,
+    /// Alt leaves carried in the anchor commitment (TLV type 27). Each
+    /// alt leaf is an Asset that only encodes its previous witnesses,
+    /// script version, and script key (Go's `AltLeavesRecord`).
+    pub alt_leaves: Vec<Asset>,
     /// Unknown odd TLV types for forward compatibility.
     pub unknown_odd_types: BTreeMap<u64, Vec<u8>>,
 }

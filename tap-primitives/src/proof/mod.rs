@@ -19,6 +19,7 @@
 //! Proofs are chained into [`File`]s — each proof's hash depends on the
 //! previous proof, forming a provenance chain from genesis to current state.
 
+pub mod decode;
 pub mod encode;
 pub mod file;
 pub mod meta;
@@ -26,6 +27,15 @@ pub mod tx_merkle;
 pub mod types;
 pub mod verify;
 
+pub use decode::{
+    decode_commitment_proof, decode_group_key_reveal, decode_meta_reveal,
+    decode_proof, decode_taproot_proof, decode_tapscript_proof,
+    decode_tx_merkle_proof,
+};
+pub use encode::{
+    encode_commitment_proof, encode_group_key_reveal, encode_proof,
+    encode_taproot_proof, encode_tapscript_proof,
+};
 pub use file::{File, HashedProof, FILE_MAGIC_BYTES, PROOF_MAGIC_BYTES};
 pub use meta::{MetaReveal, MetaType};
 pub use tx_merkle::TxMerkleProof;
@@ -51,6 +61,7 @@ pub enum ProofError {
     MetaTooLarge(usize),
     InvalidDecimalDisplay(u32),
     InvalidMetaReveal(String),
+    DecodingError(String),
     GenesisMismatch,
     GenesisPrevOutMismatch,
     MetaHashMismatch,
@@ -89,6 +100,9 @@ impl std::fmt::Display for ProofError {
             }
             ProofError::InvalidMetaReveal(msg) => {
                 write!(f, "invalid meta reveal: {}", msg)
+            }
+            ProofError::DecodingError(msg) => {
+                write!(f, "proof decoding error: {}", msg)
             }
             ProofError::GenesisMismatch => {
                 write!(f, "genesis reveal doesn't match asset")

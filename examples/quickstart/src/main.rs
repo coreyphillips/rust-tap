@@ -610,6 +610,8 @@ fn build_and_register_proof(
             version: TapCommitmentVersion::V2,
             unknown_odd_types: std::collections::BTreeMap::new(),
         },
+        tap_sibling_preimage: None,
+        stxo_proofs: std::collections::BTreeMap::new(),
         unknown_odd_types: std::collections::BTreeMap::new(),
     };
     println!("done.");
@@ -679,6 +681,7 @@ fn build_and_register_proof(
             output_index: tap_output_index,
             internal_key,
             commitment_proof: Some(commitment_proof),
+            tapscript_proof: None,
             unknown_odd_types: std::collections::BTreeMap::new(),
         },
         exclusion_proofs: build_exclusion_proofs(
@@ -689,8 +692,10 @@ fn build_and_register_proof(
         split_root_proof: None,
         meta_reveal: None,
         additional_inputs: vec![],
+        challenge_witness: None,
         genesis_reveal: Some(genesis),
         group_key_reveal: None,
+        alt_leaves: vec![],
         unknown_odd_types: std::collections::BTreeMap::new(),
     };
 
@@ -997,18 +1002,19 @@ fn build_exclusion_proofs(
         };
 
         // Build TapscriptProof { Bip86: true } at TLV type 5.
-        let mut ts_stream = tap_primitives::encoding::tlv::TlvStream::new();
-        ts_stream.push(tap_primitives::encoding::tlv::TlvRecord::u8(4, 1));
-        let ts_bytes = ts_stream.encode();
-
-        let mut odd_types = std::collections::BTreeMap::new();
-        odd_types.insert(5u64, ts_bytes);
-
         exclusion_proofs.push(tap_primitives::proof::types::TaprootProof {
             output_index: i as u32,
             internal_key,
             commitment_proof: None,
-            unknown_odd_types: odd_types,
+            tapscript_proof: Some(
+                tap_primitives::proof::types::TapscriptProof {
+                    tap_preimage_1: None,
+                    tap_preimage_2: None,
+                    bip86: true,
+                    unknown_odd_types: std::collections::BTreeMap::new(),
+                },
+            ),
+            unknown_odd_types: std::collections::BTreeMap::new(),
         });
     }
 

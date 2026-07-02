@@ -18,12 +18,57 @@
 //! Together they link an individual asset to the tapscript leaf embedded in
 //! a Bitcoin Taproot output.
 
-use crate::asset::AssetVersion;
+use crate::asset::{AssetVersion, SerializedKey};
 use crate::mssmt::{self, LeafNode, Node};
 use std::collections::BTreeMap;
 
 use super::asset_commitment::CommitmentError;
 use super::tap_commitment::TapCommitmentVersion;
+
+/// A preimage of a tapscript tree node, used to compute a sibling hash
+/// next to a Taproot Asset commitment leaf.
+///
+/// Wire format (Go's `TapscriptPreimageEncoder` in
+/// `commitment/encoding.go`): 1 byte sibling type (0 = leaf, 1 =
+/// branch) followed by the raw preimage bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TapscriptPreimage {
+    /// The type of the sibling preimage (0 = leaf, 1 = branch).
+    pub sibling_type: u8,
+    /// The raw preimage bytes.
+    pub sibling_preimage: Vec<u8>,
+}
+
+impl TapscriptPreimage {
+    /// Returns true if the preimage is empty, matching Go's
+    /// `TapscriptPreimage.IsEmpty`.
+    pub fn is_empty(&self) -> bool {
+        self.sibling_preimage.is_empty()
+    }
+
+    /// Encodes to wire format: `type(1) || preimage`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + self.sibling_preimage.len());
+        buf.push(self.sibling_type);
+        buf.extend_from_slice(&self.sibling_preimage);
+        buf
+    }
+
+    /// Decodes from wire format. A zero-length input is rejected,
+    /// matching Go's `TapscriptPreimageDecoder`
+    /// (`ErrInvalidTapscriptPreimageLen`).
+    pub fn decode(data: &[u8]) -> Result<Self, CommitmentError> {
+        if data.is_empty() {
+            return Err(CommitmentError::InvalidProof(
+                "empty tapscript preimage".into(),
+            ));
+        }
+        Ok(TapscriptPreimage {
+            sibling_type: data[0],
+            sibling_preimage: data[1..].to_vec(),
+        })
+    }
+}
 
 /// Proof of an asset's inclusion or exclusion in an `AssetCommitment`.
 #[derive(Clone, Debug)]
@@ -50,6 +95,12 @@ pub struct TaprootAssetProof {
 }
 
 /// A complete commitment proof linking an asset to a Bitcoin output.
+///
+/// This corresponds to Go's `proof.CommitmentProof` (which embeds
+/// `commitment.Proof` and adds the sibling preimage and STXO proofs).
+/// When used as an STXO map entry only `asset_proof` and
+/// `taproot_asset_proof` are populated, matching Go's bare
+/// `commitment.Proof`.
 #[derive(Clone, Debug)]
 pub struct CommitmentProof {
     /// Proof within the inner `AssetCommitment` tree.
@@ -58,6 +109,16 @@ pub struct CommitmentProof {
     pub asset_proof: Option<AssetProof>,
     /// Proof within the outer `TapCommitment` tree.
     pub taproot_asset_proof: TaprootAssetProof,
+    /// Optional preimage of a tap node hashed together with the Taproot
+    /// Asset commitment leaf to arrive at the tapscript root of the
+    /// output (TLV type 5, Go's
+    /// `CommitmentProofTapSiblingPreimageType`).
+    pub tap_sibling_preimage: Option<TapscriptPreimage>,
+    /// STXO proofs proving spend (inclusion) or non-spend (exclusion) of
+    /// the inputs referenced by the asset's previous witnesses (TLV type
+    /// 7, Go's `CommitmentProofSTXOProofsType`). Encode/decode only;
+    /// verification is implemented separately.
+    pub stxo_proofs: BTreeMap<SerializedKey, CommitmentProof>,
     /// Unknown odd TLV types for forward compatibility.
     pub unknown_odd_types: BTreeMap<u64, Vec<u8>>,
 }
@@ -187,7 +248,7 @@ fn build_asset_commitment_leaf(
 
     // Build the 41-byte leaf value.
     let mut value = Vec::with_capacity(41);
-    value.push(version as u8);
+    value.push(version.to_u8());
     value.extend_from_slice(&root_hash);
     value.extend_from_slice(&sum.to_be_bytes());
 
@@ -208,6 +269,10 @@ pub mod tlv_types {
     // CommitmentProof TLV types.
     pub const PROOF_ASSET_PROOF: u64 = 0x01;
     pub const PROOF_TAP_PROOF: u64 = 0x02;
+    // Proof-level extensions (Go proof/records.go): the tap sibling
+    // preimage and STXO proofs continue the numbering.
+    pub const PROOF_TAP_SIBLING_PREIMAGE: u64 = 0x05;
+    pub const PROOF_STXO_PROOFS: u64 = 0x07;
 }
 
 #[cfg(test)]
@@ -283,6 +348,8 @@ mod tests {
                 version: TapCommitmentVersion::V0,
                 unknown_odd_types: BTreeMap::new(),
             },
+            tap_sibling_preimage: None,
+            stxo_proofs: BTreeMap::new(),
             unknown_odd_types: BTreeMap::new(),
         };
 

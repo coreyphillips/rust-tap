@@ -17,10 +17,15 @@
 //! ## File format
 //!
 //! ```text
-//! [4B magic "TAPF"] [4B version BE] [varint proof_count]
+//! [4B magic "TAPF"] [4B version BE] [BigSize proof_count]
 //! For each proof:
-//!   [varint proof_len] [proof_bytes...] [32B hash]
+//!   [BigSize proof_len] [proof_bytes...] [32B hash]
 //! ```
+//!
+//! The count and length prefixes use lightning-style BigSize varints
+//! (big-endian), matching Go's `File.Encode` which calls
+//! `tlv.WriteVarInt` (proof/file.go), NOT Bitcoin compact-size varints
+//! (which are little-endian for multi-byte values).
 //!
 //! The hash for proof `i` is: `SHA256(hash_{i-1} || proof_bytes_i)`
 //! where `hash_0 = [0u8; 32]`.
@@ -28,6 +33,7 @@
 use bitcoin_hashes::{sha256, Hash, HashEngine};
 
 use super::ProofError;
+use crate::encoding::bigsize::{decode_bigsize, encode_bigsize};
 
 /// Magic bytes for a proof file: "TAPF" (Taproot Assets Protocol File).
 pub const FILE_MAGIC_BYTES: [u8; 4] = [0x54, 0x41, 0x50, 0x46];
@@ -103,7 +109,7 @@ impl File {
     /// Encodes the proof file to bytes.
     ///
     /// Format:
-    /// `[4B magic] [4B version BE] [varint count] [for each: varint len, bytes, 32B hash]`
+    /// `[4B magic] [4B version BE] [BigSize count] [for each: BigSize len, bytes, 32B hash]`
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
 
@@ -113,12 +119,13 @@ impl File {
         // Version (big-endian u32).
         buf.extend_from_slice(&self.version.to_be_bytes());
 
-        // Number of proofs (varint).
-        encode_varint(&mut buf, self.proofs.len() as u64);
+        // Number of proofs (BigSize varint, matching Go's
+        // tlv.WriteVarInt in proof/file.go).
+        encode_bigsize(&mut buf, self.proofs.len() as u64);
 
         // Each proof.
         for hashed in &self.proofs {
-            encode_varint(&mut buf, hashed.proof_bytes.len() as u64);
+            encode_bigsize(&mut buf, hashed.proof_bytes.len() as u64);
             buf.extend_from_slice(&hashed.proof_bytes);
             buf.extend_from_slice(&hashed.hash);
         }
@@ -148,8 +155,9 @@ impl File {
         );
         offset += 4;
 
-        // Number of proofs.
-        let (count, bytes_read) = decode_varint(&data[offset..])?;
+        // Number of proofs (BigSize varint).
+        let (count, bytes_read) = decode_bigsize(&data[offset..])
+            .map_err(|_| ProofError::FileTooShort)?;
         offset += bytes_read;
         let count = count as usize;
 
@@ -162,8 +170,9 @@ impl File {
         let mut prev_hash = [0u8; 32];
 
         for _ in 0..count {
-            // Proof length.
-            let (proof_len, bytes_read) = decode_varint(&data[offset..])?;
+            // Proof length (BigSize varint).
+            let (proof_len, bytes_read) = decode_bigsize(&data[offset..])
+                .map_err(|_| ProofError::FileTooShort)?;
             offset += bytes_read;
             let proof_len = proof_len as usize;
 
@@ -224,66 +233,6 @@ fn compute_proof_hash(prev_hash: &[u8; 32], proof_bytes: &[u8]) -> [u8; 32] {
     engine.input(prev_hash);
     engine.input(proof_bytes);
     sha256::Hash::from_engine(engine).to_byte_array()
-}
-
-/// Encodes a u64 as a Bitcoin-style compact size (varint).
-fn encode_varint(buf: &mut Vec<u8>, val: u64) {
-    match val {
-        0..=0xFC => buf.push(val as u8),
-        0xFD..=0xFFFF => {
-            buf.push(0xFD);
-            buf.extend_from_slice(&(val as u16).to_le_bytes());
-        }
-        0x10000..=0xFFFFFFFF => {
-            buf.push(0xFE);
-            buf.extend_from_slice(&(val as u32).to_le_bytes());
-        }
-        _ => {
-            buf.push(0xFF);
-            buf.extend_from_slice(&val.to_le_bytes());
-        }
-    }
-}
-
-/// Decodes a Bitcoin-style compact size (varint). Returns (value, bytes_consumed).
-fn decode_varint(data: &[u8]) -> Result<(u64, usize), ProofError> {
-    if data.is_empty() {
-        return Err(ProofError::FileTooShort);
-    }
-    match data[0] {
-        0..=0xFC => Ok((data[0] as u64, 1)),
-        0xFD => {
-            if data.len() < 3 {
-                return Err(ProofError::FileTooShort);
-            }
-            Ok((
-                u16::from_le_bytes([data[1], data[2]]) as u64,
-                3,
-            ))
-        }
-        0xFE => {
-            if data.len() < 5 {
-                return Err(ProofError::FileTooShort);
-            }
-            Ok((
-                u32::from_le_bytes(
-                    data[1..5].try_into().unwrap(),
-                ) as u64,
-                5,
-            ))
-        }
-        0xFF => {
-            if data.len() < 9 {
-                return Err(ProofError::FileTooShort);
-            }
-            Ok((
-                u64::from_le_bytes(
-                    data[1..9].try_into().unwrap(),
-                ),
-                9,
-            ))
-        }
-    }
 }
 
 #[cfg(test)]
@@ -357,13 +306,21 @@ mod tests {
     }
 
     #[test]
-    fn test_varint_roundtrip() {
-        for val in [0u64, 1, 252, 253, 0xFFFF, 0x10000, 0xFFFFFFFF, u64::MAX]
-        {
-            let mut buf = Vec::new();
-            encode_varint(&mut buf, val);
-            let (decoded, _) = decode_varint(&buf).unwrap();
-            assert_eq!(decoded, val, "varint roundtrip failed for {}", val);
-        }
+    fn test_multibyte_length_uses_bigsize() {
+        // A proof longer than 252 bytes exercises the multi-byte
+        // BigSize length prefix, which is big-endian (0xFD + BE u16),
+        // unlike Bitcoin compact size (LE). Matches Go's
+        // tlv.WriteVarInt usage in proof/file.go.
+        let mut file = File::new();
+        file.append_proof(vec![0xAA; 300]);
+        let encoded = file.encode();
+
+        // magic(4) + version(4) + count(1) = 9; the length prefix
+        // follows.
+        assert_eq!(encoded[9], 0xFD);
+        assert_eq!(&encoded[10..12], &300u16.to_be_bytes());
+
+        let decoded = File::decode(&encoded).unwrap();
+        assert_eq!(decoded.proofs[0].proof_bytes.len(), 300);
     }
 }

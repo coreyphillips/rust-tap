@@ -55,6 +55,8 @@ pub fn generate_exclusion_proofs(
                     version: tap_primitives::commitment::TapCommitmentVersion::V2,
                     unknown_odd_types: BTreeMap::new(),
                 },
+                tap_sibling_preimage: None,
+                stxo_proofs: BTreeMap::new(),
                 unknown_odd_types: BTreeMap::new(),
             }
         });
@@ -63,6 +65,7 @@ pub fn generate_exclusion_proofs(
             output_index,
             internal_key: *internal_key,
             commitment_proof,
+            tapscript_proof: None,
             unknown_odd_types: BTreeMap::new(),
         });
     }
