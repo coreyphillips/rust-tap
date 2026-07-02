@@ -20,3 +20,5 @@ doc = false
 name = "aux_signatures_unpack"
 path = "fuzz_targets/aux_signatures_unpack.rs"
 doc = false
+
+[workspace]

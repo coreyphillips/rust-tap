@@ -478,8 +478,11 @@ impl LdkChannelOps for StubLdk {
 
 pub struct StubOracle;
 impl PriceOracle for StubOracle {
-    fn ask_price(&self, _: &AssetId, _: u64) -> Result<FixedPoint, RfqError> { Ok(FixedPoint::from_integer(5000)) }
-    fn bid_price(&self, _: &AssetId, _: u64) -> Result<FixedPoint, RfqError> { Ok(FixedPoint::from_integer(4800)) }
+    // Rates are asset units per BTC (Go rfqmsg.AssetRate semantics):
+    // 20,000,000 units/BTC = 5000 msat per unit.
+    fn ask_price(&self, _: &AssetId, _: u64) -> Result<FixedPoint, RfqError> { Ok(FixedPoint::from_integer(20_000_000)) }
+    // 25,000,000 units/BTC = 4000 msat per unit.
+    fn bid_price(&self, _: &AssetId, _: u64) -> Result<FixedPoint, RfqError> { Ok(FixedPoint::from_integer(25_000_000)) }
 }
 
 // ============================================================================

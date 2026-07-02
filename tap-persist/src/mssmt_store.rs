@@ -32,8 +32,8 @@ use tap_primitives::mssmt::{
 use crate::sqlite::SqliteDb;
 
 /// A namespaced, SQLite-backed MS-SMT tree store.
-pub struct SqliteTreeStore<'a> {
-    db: &'a SqliteDb,
+pub struct SqliteTreeStore {
+    db: std::sync::Arc<SqliteDb>,
     namespace: String,
     /// Latched error from infallible update operations.
     err: RefCell<Option<StoreError>>,
@@ -57,9 +57,9 @@ fn to_hash32(bytes: &[u8]) -> Result<[u8; 32], StoreError> {
         .map_err(|_| StoreError::Other("invalid 32-byte column".into()))
 }
 
-impl<'a> SqliteTreeStore<'a> {
+impl SqliteTreeStore {
     /// Creates a new tree store over the given namespace.
-    pub fn new(db: &'a SqliteDb, namespace: impl Into<String>) -> Self {
+    pub fn new(db: std::sync::Arc<SqliteDb>, namespace: impl Into<String>) -> Self {
         SqliteTreeStore {
             db,
             namespace: namespace.into(),
@@ -251,7 +251,7 @@ impl<'a> SqliteTreeStore<'a> {
     }
 }
 
-impl TreeStoreViewTx for SqliteTreeStore<'_> {
+impl TreeStoreViewTx for SqliteTreeStore {
     fn get_children(
         &self,
         height: usize,
@@ -314,7 +314,7 @@ impl TreeStoreViewTx for SqliteTreeStore<'_> {
     }
 }
 
-impl TreeStoreUpdateTx for SqliteTreeStore<'_> {
+impl TreeStoreUpdateTx for SqliteTreeStore {
     fn update_root(&mut self, node: &BranchNode) {
         self.insert_branch(node);
         let hash = node.node_hash();
@@ -434,6 +434,7 @@ impl TreeStoreUpdateTx for SqliteTreeStore<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tap_primitives::mssmt::{
         copy_tree_store, CompactedTree, DefaultStore,
     };
@@ -448,8 +449,8 @@ mod tests {
     /// SQLite-backed tree must produce identical roots.
     #[test]
     fn test_sqlite_tree_matches_memory_tree() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let store = SqliteTreeStore::new(&db, "test-ns");
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let store = SqliteTreeStore::new(Arc::clone(&db), "test-ns");
         let mut sqlite_tree = CompactedTree::new(store);
         let mut memory_tree = CompactedTree::new(DefaultStore::new());
 
@@ -476,17 +477,17 @@ mod tests {
     /// instance over the same namespace.
     #[test]
     fn test_sqlite_tree_persistence() {
-        let db = SqliteDb::open_in_memory().unwrap();
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
 
         {
-            let store = SqliteTreeStore::new(&db, "persist-ns");
+            let store = SqliteTreeStore::new(Arc::clone(&db), "persist-ns");
             let mut tree = CompactedTree::new(store);
             tree.insert(make_key(1), LeafNode::new(vec![1], 100)).unwrap();
             tree.insert(make_key(2), LeafNode::new(vec![2], 200)).unwrap();
             assert!(tree.store.take_error().is_none());
         }
 
-        let store = SqliteTreeStore::new(&db, "persist-ns");
+        let store = SqliteTreeStore::new(Arc::clone(&db), "persist-ns");
         let tree = CompactedTree::new(store);
         let root = tree.root().unwrap();
         assert_eq!(root.node_sum(), 300);
@@ -496,22 +497,22 @@ mod tests {
     /// Namespaces are isolated.
     #[test]
     fn test_sqlite_tree_namespaces_isolated() {
-        let db = SqliteDb::open_in_memory().unwrap();
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
 
         let mut tree_a =
-            CompactedTree::new(SqliteTreeStore::new(&db, "ns-a"));
+            CompactedTree::new(SqliteTreeStore::new(Arc::clone(&db), "ns-a"));
         tree_a.insert(make_key(1), LeafNode::new(vec![1], 100)).unwrap();
 
-        let tree_b = CompactedTree::new(SqliteTreeStore::new(&db, "ns-b"));
+        let tree_b = CompactedTree::new(SqliteTreeStore::new(Arc::clone(&db), "ns-b"));
         assert_eq!(tree_b.root().unwrap().node_sum(), 0);
     }
 
     /// Copying a persistent tree into memory preserves the root.
     #[test]
     fn test_copy_tree_store_from_sqlite() {
-        let db = SqliteDb::open_in_memory().unwrap();
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
         let mut tree =
-            CompactedTree::new(SqliteTreeStore::new(&db, "copy-ns"));
+            CompactedTree::new(SqliteTreeStore::new(Arc::clone(&db), "copy-ns"));
         for i in 0..5u8 {
             tree.insert(make_key(i), LeafNode::new(vec![i], 10)).unwrap();
         }
@@ -535,9 +536,9 @@ mod tests {
     /// Deleting a leaf updates the persistent root.
     #[test]
     fn test_sqlite_tree_delete() {
-        let db = SqliteDb::open_in_memory().unwrap();
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
         let mut tree =
-            CompactedTree::new(SqliteTreeStore::new(&db, "del-ns"));
+            CompactedTree::new(SqliteTreeStore::new(Arc::clone(&db), "del-ns"));
         tree.insert(make_key(1), LeafNode::new(vec![1], 100)).unwrap();
         tree.insert(make_key(2), LeafNode::new(vec![2], 200)).unwrap();
         tree.delete(make_key(1)).unwrap();

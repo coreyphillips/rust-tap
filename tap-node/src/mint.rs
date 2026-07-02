@@ -248,14 +248,18 @@ where
                 txid: txid.unwrap_or([0u8; 32]),
                 vout: tap_output_index,
             };
-            let _ = node.asset_store.lock().unwrap().insert_asset(OwnedAsset {
+            let mut owned = OwnedAsset::new(
                 asset_id,
-                amount: *amount,
+                *amount,
                 anchor_outpoint,
                 script_key,
-                spent: false,
-                block_height: 0,
-            });
+                0,
+            );
+            owned.genesis_tag = Some(genesis.tag.clone());
+            owned.genesis_meta_hash = Some(genesis.meta_hash);
+            owned.genesis_output_index = Some(genesis.output_index);
+            owned.genesis_asset_type = Some(genesis.asset_type);
+            let _ = node.asset_store.lock().unwrap().insert_asset(owned);
 
             MintedAsset {
                 asset_id,

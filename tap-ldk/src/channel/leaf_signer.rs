@@ -11,23 +11,263 @@
 //! transactions.
 //!
 //! For each HTLC that carries asset balances, the signer produces
-//! Schnorr signatures over the virtual asset transaction. These
-//! signatures are bundled into the `aux_signatures` blob that travels
-//! alongside the standard `CommitmentSigned` message.
+//! Schnorr signatures over the second-level virtual asset transaction.
+//! These signatures are bundled into the `aux_signatures` blob (Go
+//! `tapchannelmsg.CommitSig`) that travels alongside the standard
+//! `CommitmentSigned` message.
 
 use std::collections::BTreeMap;
 
 use lightning::bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 
 use tap_primitives::asset::{
-    Asset, AssetVersion, Genesis, OutPoint, PrevId, ScriptKey, ScriptVersion,
-    Witness,
+    Asset, AssetId, AssetVersion, OutPoint, PrevId, ScriptKey,
+    ScriptVersion, Witness,
 };
 use tap_primitives::crypto::virtual_tx;
+use tap_primitives::encoding::bigsize::{decode_bigsize, encode_bigsize};
+use tap_primitives::encoding::tlv::{TlvRecord, TlvStream};
 use tap_primitives::vm::InputSet;
 
+use super::allocation::{Allocation, AllocationType};
 use super::blobs::{ChannelBlob, CommitmentBlob, HtlcBlob};
 use super::traits::{AssetChannelError, AssetLeafSigner};
+
+/// The TLV type of the HTLC partial signature record in a Go
+/// `tapchannelmsg.CommitSig` (`HtlcSigsRecordType` = `tlv.TlvType65537`).
+pub const HTLC_SIGS_RECORD_TYPE: u64 = 65537;
+
+/// Maximum number of HTLC signature lists accepted when unpacking (Go
+/// `tapchannelmsg.MaxNumHTLCs`).
+pub const MAX_NUM_HTLC_SIGS: u64 = 966;
+
+/// The sequence Go sets on second-level HTLC inputs for anchor
+/// channels (`lnwallet.HtlcSecondLevelInputSequence`); taproot asset
+/// channels always use anchors.
+pub const HTLC_SECOND_LEVEL_INPUT_SEQUENCE: u32 = 1;
+
+/// An asset-level signature for one asset in an HTLC, matching Go
+/// `tapchannelmsg.AssetSig`: a TLV stream `{0: asset_id, 1: 64-byte
+/// Schnorr sig, 2: u32 sighash type}`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetSig {
+    /// The asset the signature is for.
+    pub asset_id: AssetId,
+    /// The 64-byte BIP-340 Schnorr signature.
+    pub sig: [u8; 64],
+    /// The sighash type used (0 = default).
+    pub sighash_type: u32,
+}
+
+impl AssetSig {
+    /// Encodes as a Go `AssetSig` TLV stream.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut stream = TlvStream::new();
+        stream.push(TlvRecord::bytes(0, &self.asset_id.0));
+        stream.push(TlvRecord::bytes(1, &self.sig));
+        stream.push(TlvRecord::u32(2, self.sighash_type));
+        stream.encode()
+    }
+
+    /// Decodes from a Go `AssetSig` TLV stream.
+    pub fn decode(data: &[u8]) -> Result<Self, AssetChannelError> {
+        let stream = TlvStream::decode(data)
+            .map_err(|e| AssetChannelError(format!("asset sig: {}", e)))?;
+        let id_record = stream.get(0).ok_or_else(|| {
+            AssetChannelError("asset sig missing asset id".into())
+        })?;
+        if id_record.value.len() != 32 {
+            return Err(AssetChannelError(
+                "asset sig asset id must be 32 bytes".into(),
+            ));
+        }
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&id_record.value);
+        let sig_record = stream.get(1).ok_or_else(|| {
+            AssetChannelError("asset sig missing signature".into())
+        })?;
+        if sig_record.value.len() != 64 {
+            return Err(AssetChannelError(
+                "asset sig must be 64 bytes".into(),
+            ));
+        }
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&sig_record.value);
+        let sighash_type = stream
+            .get(2)
+            .ok_or_else(|| {
+                AssetChannelError("asset sig missing sighash type".into())
+            })?
+            .as_u32()
+            .map_err(|e| {
+                AssetChannelError(format!("asset sig sighash: {}", e))
+            })?;
+        Ok(AssetSig {
+            asset_id: AssetId(id),
+            sig,
+            sighash_type,
+        })
+    }
+}
+
+fn write_inline_var_bytes(buf: &mut Vec<u8>, data: &[u8]) {
+    encode_bigsize(buf, data.len() as u64);
+    buf.extend_from_slice(data);
+}
+
+fn read_inline_var_bytes<'a>(
+    data: &'a [u8],
+    offset: &mut usize,
+) -> Result<&'a [u8], AssetChannelError> {
+    let (len, len_size) = decode_bigsize(&data[*offset..])
+        .map_err(|e| AssetChannelError(format!("var bytes: {}", e)))?;
+    *offset += len_size;
+    let end = offset
+        .checked_add(len as usize)
+        .filter(|&e| e <= data.len())
+        .ok_or_else(|| AssetChannelError("aux signatures truncated".into()))?;
+    let out = &data[*offset..end];
+    *offset = end;
+    Ok(out)
+}
+
+/// Encodes an `AssetSigListRecord` as Go does when nesting it inside
+/// the HTLC partial sigs record: a TLV stream containing a single
+/// type 0 record whose value is `varint(count) || varbytes(AssetSig)*`.
+fn encode_asset_sig_list(sigs: &[AssetSig]) -> Vec<u8> {
+    let mut value = Vec::new();
+    encode_bigsize(&mut value, sigs.len() as u64);
+    for sig in sigs {
+        write_inline_var_bytes(&mut value, &sig.encode());
+    }
+    let mut stream = TlvStream::new();
+    stream.push(TlvRecord::new(0, value));
+    stream.encode()
+}
+
+fn decode_asset_sig_list(
+    data: &[u8],
+) -> Result<Vec<AssetSig>, AssetChannelError> {
+    let stream = TlvStream::decode(data)
+        .map_err(|e| AssetChannelError(format!("sig list: {}", e)))?;
+    let record = stream.get(0).ok_or_else(|| {
+        AssetChannelError("sig list missing record".into())
+    })?;
+    let value = &record.value;
+    let mut offset = 0usize;
+    let (count, count_size) = decode_bigsize(value)
+        .map_err(|e| AssetChannelError(format!("sig count: {}", e)))?;
+    offset += count_size;
+    if count > MAX_NUM_HTLC_SIGS {
+        return Err(AssetChannelError(format!(
+            "too many signatures: {}",
+            count
+        )));
+    }
+    let mut sigs = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let bytes = read_inline_var_bytes(value, &mut offset)?;
+        sigs.push(AssetSig::decode(bytes)?);
+    }
+    if offset != value.len() {
+        return Err(AssetChannelError(
+            "trailing bytes after sig list".into(),
+        ));
+    }
+    Ok(sigs)
+}
+
+/// Packs per-HTLC asset signatures into the Go-compatible
+/// `tapchannelmsg.CommitSig` blob: a TLV stream `{65537: varint(count)
+/// || varbytes(AssetSigListRecord)*}`.
+pub fn pack_aux_signatures(htlc_sigs: &[Vec<AssetSig>]) -> Vec<u8> {
+    let mut value = Vec::new();
+    encode_bigsize(&mut value, htlc_sigs.len() as u64);
+    for sigs in htlc_sigs {
+        write_inline_var_bytes(&mut value, &encode_asset_sig_list(sigs));
+    }
+    let mut stream = TlvStream::new();
+    stream.push(TlvRecord::new(HTLC_SIGS_RECORD_TYPE, value));
+    stream.encode()
+}
+
+/// Unpacks per-HTLC asset signatures from a Go-compatible
+/// `tapchannelmsg.CommitSig` blob.
+pub fn unpack_aux_signatures(
+    data: &[u8],
+) -> Result<Vec<Vec<AssetSig>>, AssetChannelError> {
+    let stream = TlvStream::decode(data)
+        .map_err(|e| AssetChannelError(format!("commit sig: {}", e)))?;
+    let record = stream.get(HTLC_SIGS_RECORD_TYPE).ok_or_else(|| {
+        AssetChannelError("commit sig missing HTLC sigs record".into())
+    })?;
+    let value = &record.value;
+    let (count, mut offset) = decode_bigsize(value)
+        .map_err(|e| AssetChannelError(format!("htlc count: {}", e)))?;
+    if count > MAX_NUM_HTLC_SIGS {
+        return Err(AssetChannelError(format!(
+            "too many HTLC sig lists: {}",
+            count
+        )));
+    }
+    let mut htlc_sigs = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let bytes = read_inline_var_bytes(value, &mut offset)?;
+        htlc_sigs.push(decode_asset_sig_list(bytes)?);
+    }
+    if offset != value.len() {
+        return Err(AssetChannelError(
+            "trailing bytes after commit sig".into(),
+        ));
+    }
+    Ok(htlc_sigs)
+}
+
+/// Parameters for building a second-level HTLC allocation, mirroring
+/// the inputs of Go `tapchannel.createSecondLevelHtlcAllocations`.
+#[derive(Clone, Debug)]
+pub struct SecondLevelHtlcParams {
+    /// The HTLC index in the commitment.
+    pub htlc_index: u64,
+    /// The output index of the HTLC output on the commitment tx.
+    pub output_index: u32,
+    /// The BTC amount of the HTLC output in satoshis.
+    pub btc_amount_sat: u64,
+    /// The CLTV timeout of the HTLC (outgoing HTLCs; zero for
+    /// incoming).
+    pub cltv_timeout: Option<u32>,
+    /// The internal key of the second-level output.
+    pub internal_key: tap_primitives::asset::SerializedKey,
+    /// The (tweaked) script key of the second-level asset output.
+    pub script_key: tap_primitives::asset::SerializedKey,
+}
+
+/// Builds the [`Allocation`] for a second-level HTLC transaction
+/// output, mirroring Go `createSecondLevelHtlcAllocations`.
+///
+/// The `sequence` is set to the anchor-channel second-level input
+/// sequence (1), matching `lnwallet.HtlcSecondLevelInputSequence` for
+/// taproot channels.
+pub fn create_second_level_htlc_allocation(
+    params: &SecondLevelHtlcParams,
+    htlc_asset_amount: u64,
+) -> Allocation {
+    Allocation {
+        alloc_type: AllocationType::SecondLevelHtlc,
+        output_index: params.output_index,
+        amount: htlc_asset_amount,
+        asset_version: 1,
+        btc_amount: params.btc_amount_sat,
+        sequence: HTLC_SECOND_LEVEL_INPUT_SEQUENCE,
+        internal_key: Some(params.internal_key),
+        script_key: Some(ScriptKey::from_pub_key(params.script_key)),
+        sort_taproot_key_bytes: params.script_key.0[1..].to_vec(),
+        sort_cltv: params.cltv_timeout.unwrap_or(0),
+        lock_time: params.cltv_timeout.unwrap_or(0) as u64,
+        htlc_index: params.htlc_index,
+        ..Allocation::default()
+    }
+}
 
 /// Default implementation of [`AssetLeafSigner`].
 ///
@@ -44,39 +284,61 @@ impl TapAssetLeafSigner {
         TapAssetLeafSigner { signing_key }
     }
 
-    /// Builds a virtual asset for an HTLC and computes its BIP-341 sighash.
+    /// Builds the 1-in-1-out second-level virtual asset transition for
+    /// an HTLC and computes its BIP-341 sighash.
     ///
-    /// Constructs the synthetic 1-in-1-out virtual transaction matching
-    /// Go's `InputKeySpendSigHash` and returns the 32-byte sighash.
-    fn compute_htlc_sighash(
+    /// The previous outpoint is the real HTLC output on the commitment
+    /// transaction (`commitment_txid` + the allocation's output index),
+    /// the relative lock time is the allocation's sequence, and the
+    /// genesis comes from the channel's funded asset proof.
+    pub fn compute_htlc_sighash(
         &self,
         channel_blob: &ChannelBlob,
         htlc_blob: &HtlcBlob,
-        htlc_index: usize,
+        allocation: &Allocation,
+        commitment_txid: [u8; 32],
     ) -> Result<[u8; 32], AssetChannelError> {
         let funded = channel_blob.funded_assets.first().ok_or_else(|| {
             AssetChannelError("no funded assets in channel".into())
         })?;
 
-        let total_amount: u64 = htlc_blob.amounts.iter().map(|b| b.amount).sum();
+        // The genesis must be the real one from the channel's funded
+        // asset, carried by its funding proof.
+        let genesis = funded
+            .proof
+            .as_ref()
+            .map(|p| p.asset.genesis.clone())
+            .ok_or_else(|| {
+                AssetChannelError(
+                    "funded asset missing proof (genesis unknown)".into(),
+                )
+            })?;
 
-        // Build a prev_id referencing the HTLC input.
+        let total_amount: u64 =
+            htlc_blob.amounts.iter().map(|b| b.amount).sum();
+
+        let script_key = allocation
+            .script_key
+            .as_ref()
+            .map(|k| k.pub_key)
+            .unwrap_or(funded.script_key);
+
+        // The real previous outpoint: the HTLC output on the commitment
+        // transaction.
         let prev_id = PrevId {
-            out_point: OutPoint { txid: [0u8; 32], vout: htlc_index as u32 },
+            out_point: OutPoint {
+                txid: commitment_txid,
+                vout: allocation.output_index,
+            },
             id: funded.asset_id,
             script_key: funded.script_key,
         };
 
-        // Build the input (previous) asset.
+        // Build the input (previous) asset: the HTLC output asset on
+        // the commitment transaction.
         let prev_asset = Asset {
             version: AssetVersion::V0,
-            genesis: Genesis {
-                first_prev_out: OutPoint::default(),
-                tag: String::new(),
-                meta_hash: [0u8; 32],
-                output_index: 0,
-                asset_type: tap_primitives::asset::AssetType::Normal,
-            },
+            genesis: genesis.clone(),
             amount: total_amount,
             lock_time: 0,
             relative_lock_time: 0,
@@ -89,12 +351,15 @@ impl TapAssetLeafSigner {
         };
 
         // Build the new (output) asset for the HTLC second-level tx.
+        // The relative lock time mirrors the allocation sequence and
+        // the lock time mirrors the CLTV (Go sets vOut.LockTime to the
+        // HTLC timeout).
         let new_asset = Asset {
             version: AssetVersion::V0,
-            genesis: prev_asset.genesis.clone(),
+            genesis,
             amount: total_amount,
-            lock_time: 0,
-            relative_lock_time: 0,
+            lock_time: allocation.lock_time,
+            relative_lock_time: allocation.sequence as u64,
             prev_witnesses: vec![Witness {
                 prev_id: Some(prev_id.clone()),
                 tx_witness: vec![],
@@ -102,7 +367,7 @@ impl TapAssetLeafSigner {
             }],
             split_commitment_root: None,
             script_version: ScriptVersion::V0,
-            script_key: ScriptKey::from_pub_key(funded.script_key),
+            script_key: ScriptKey::from_pub_key(script_key),
             group_key: None,
             unknown_odd_types: BTreeMap::new(),
         };
@@ -130,9 +395,12 @@ impl AssetLeafSigner for TapAssetLeafSigner {
         channel_blob: &ChannelBlob,
         _commitment_blob: &CommitmentBlob,
         htlc_blobs: &[HtlcBlob],
-    ) -> Result<Vec<Vec<u8>>, AssetChannelError> {
+        commitment_txid: [u8; 32],
+    ) -> Result<Vec<Vec<AssetSig>>, AssetChannelError> {
         let secp = Secp256k1::new();
         let keypair = Keypair::from_secret_key(&secp, &self.signing_key);
+
+        let funded = channel_blob.funded_assets.first();
 
         let mut signatures = Vec::with_capacity(htlc_blobs.len());
 
@@ -141,68 +409,50 @@ impl AssetLeafSigner for TapAssetLeafSigner {
                 signatures.push(Vec::new());
                 continue;
             }
+            let funded = funded.ok_or_else(|| {
+                AssetChannelError("no funded assets in channel".into())
+            })?;
 
-            let sighash =
-                self.compute_htlc_sighash(channel_blob, htlc_blob, idx)?;
+            let total: u64 =
+                htlc_blob.amounts.iter().map(|b| b.amount).sum();
+            let params = SecondLevelHtlcParams {
+                htlc_index: idx as u64,
+                output_index: idx as u32,
+                btc_amount_sat: 354,
+                cltv_timeout: None,
+                internal_key: funded.script_key,
+                script_key: funded.script_key,
+            };
+            let allocation =
+                create_second_level_htlc_allocation(&params, total);
+
+            let sighash = self.compute_htlc_sighash(
+                channel_blob,
+                htlc_blob,
+                &allocation,
+                commitment_txid,
+            )?;
             let msg = Message::from_digest(sighash);
             let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
 
-            signatures.push(sig.as_ref().to_vec());
+            let mut sig_bytes = [0u8; 64];
+            sig_bytes.copy_from_slice(sig.as_ref());
+            signatures.push(vec![AssetSig {
+                asset_id: funded.asset_id,
+                sig: sig_bytes,
+                sighash_type: 0,
+            }]);
         }
 
         Ok(signatures)
     }
 }
 
-/// Packs HTLC asset signatures into the `aux_signatures` blob for
-/// `CommitmentSigned`.
-///
-/// Format: `[u16 count][for each: u16 sig_len, sig_bytes]`
-pub fn pack_aux_signatures(sigs: &[Vec<u8>]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&(sigs.len() as u16).to_be_bytes());
-    for sig in sigs {
-        buf.extend_from_slice(&(sig.len() as u16).to_be_bytes());
-        buf.extend_from_slice(sig);
-    }
-    buf
-}
-
-/// Unpacks HTLC asset signatures from the `aux_signatures` blob.
-pub fn unpack_aux_signatures(data: &[u8]) -> Result<Vec<Vec<u8>>, AssetChannelError> {
-    if data.len() < 2 {
-        return Err(AssetChannelError("aux_signatures too short".into()));
-    }
-    let count = u16::from_be_bytes([data[0], data[1]]) as usize;
-    let mut offset = 2;
-    let mut sigs = Vec::with_capacity(count);
-
-    for _ in 0..count {
-        if offset + 2 > data.len() {
-            return Err(AssetChannelError(
-                "aux_signatures truncated".into(),
-            ));
-        }
-        let sig_len =
-            u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
-        offset += 2;
-        if offset + sig_len > data.len() {
-            return Err(AssetChannelError(
-                "aux_signatures truncated".into(),
-            ));
-        }
-        sigs.push(data[offset..offset + sig_len].to_vec());
-        offset += sig_len;
-    }
-
-    Ok(sigs)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channel::blobs::{AssetBalance, FundedAsset};
-    use tap_primitives::asset::AssetId;
+    use crate::channel::blobs::AssetBalance;
+    use tap_primitives::asset::SerializedKey;
 
     fn test_key() -> SecretKey {
         let mut secret = [0u8; 32];
@@ -211,35 +461,44 @@ mod tests {
         SecretKey::from_slice(&secret).unwrap()
     }
 
+    fn test_channel(asset_byte: u8) -> ChannelBlob {
+        let script_key = SerializedKey([0x02; 33]);
+        ChannelBlob {
+            funded_assets: vec![crate::channel::blobs::AssetOutput {
+                asset_id: tap_primitives::asset::AssetId([asset_byte; 32]),
+                amount: 1000,
+                script_key,
+                proof: Some(crate::channel::blobs::tests::test_proof(
+                    asset_byte,
+                    1000,
+                    script_key,
+                )),
+            }],
+            decimal_display: 0,
+            group_key: None,
+        }
+    }
+
+    fn empty_commitment() -> CommitmentBlob {
+        CommitmentBlob::default()
+    }
+
     #[test]
     fn test_sign_htlc_signatures() {
         let signer = TapAssetLeafSigner::new(test_key());
-        let channel = ChannelBlob {
-            funded_assets: vec![FundedAsset {
-                asset_id: AssetId([0xAA; 32]),
-                amount: 1000,
-                script_key: tap_primitives::asset::SerializedKey([0x02; 33]),
-            }],
-            decimal_display: None,
-            group_key: None,
-        };
-        let commitment = CommitmentBlob {
-            local_assets: vec![],
-            remote_assets: vec![],
-            outgoing_htlc_assets: vec![],
-            incoming_htlc_assets: vec![],
-        };
+        let channel = test_channel(0xAA);
+        let commitment = empty_commitment();
         let htlc_blobs = vec![
             HtlcBlob {
                 amounts: vec![AssetBalance {
-                    asset_id: AssetId([0xAA; 32]),
+                    asset_id: tap_primitives::asset::AssetId([0xAA; 32]),
                     amount: 100,
                 }],
                 rfq_id: Some([0x42; 32]),
             },
             HtlcBlob {
                 amounts: vec![AssetBalance {
-                    asset_id: AssetId([0xAA; 32]),
+                    asset_id: tap_primitives::asset::AssetId([0xAA; 32]),
                     amount: 50,
                 }],
                 rfq_id: None,
@@ -247,15 +506,91 @@ mod tests {
         ];
 
         let sigs = signer
-            .sign_htlc_second_level(&channel, &commitment, &htlc_blobs)
+            .sign_htlc_second_level(
+                &channel,
+                &commitment,
+                &htlc_blobs,
+                [0x09; 32],
+            )
             .unwrap();
 
         assert_eq!(sigs.len(), 2);
-        // Each Schnorr signature is 64 bytes.
-        assert_eq!(sigs[0].len(), 64);
-        assert_eq!(sigs[1].len(), 64);
+        assert_eq!(sigs[0].len(), 1);
+        assert_eq!(sigs[1].len(), 1);
         // Different HTLCs should produce different signatures.
-        assert_ne!(sigs[0], sigs[1]);
+        assert_ne!(sigs[0][0].sig, sigs[1][0].sig);
+    }
+
+    #[test]
+    fn test_sighash_depends_on_commitment_txid_and_index() {
+        let signer = TapAssetLeafSigner::new(test_key());
+        let channel = test_channel(0xAA);
+        let htlc = HtlcBlob {
+            amounts: vec![AssetBalance {
+                asset_id: tap_primitives::asset::AssetId([0xAA; 32]),
+                amount: 100,
+            }],
+            rfq_id: None,
+        };
+        let funded_key = channel.funded_assets[0].script_key;
+        let params = SecondLevelHtlcParams {
+            htlc_index: 0,
+            output_index: 2,
+            btc_amount_sat: 354,
+            cltv_timeout: Some(800_000),
+            internal_key: funded_key,
+            script_key: funded_key,
+        };
+        let alloc = create_second_level_htlc_allocation(&params, 100);
+        assert_eq!(alloc.alloc_type.to_u8(), 5);
+        assert_eq!(alloc.sequence, HTLC_SECOND_LEVEL_INPUT_SEQUENCE);
+
+        let h1 = signer
+            .compute_htlc_sighash(&channel, &htlc, &alloc, [0x01; 32])
+            .unwrap();
+        let h2 = signer
+            .compute_htlc_sighash(&channel, &htlc, &alloc, [0x02; 32])
+            .unwrap();
+        assert_ne!(h1, h2, "sighash must commit to the commitment txid");
+
+        let mut alloc_other_index = alloc.clone();
+        alloc_other_index.output_index = 3;
+        let h3 = signer
+            .compute_htlc_sighash(
+                &channel,
+                &htlc,
+                &alloc_other_index,
+                [0x01; 32],
+            )
+            .unwrap();
+        assert_ne!(h1, h3, "sighash must commit to the output index");
+    }
+
+    #[test]
+    fn test_missing_proof_errors() {
+        let signer = TapAssetLeafSigner::new(test_key());
+        let mut channel = test_channel(0xAA);
+        channel.funded_assets[0].proof = None;
+        let htlc = HtlcBlob {
+            amounts: vec![AssetBalance {
+                asset_id: tap_primitives::asset::AssetId([0xAA; 32]),
+                amount: 100,
+            }],
+            rfq_id: None,
+        };
+        let funded_key = channel.funded_assets[0].script_key;
+        let params = SecondLevelHtlcParams {
+            htlc_index: 0,
+            output_index: 0,
+            btc_amount_sat: 354,
+            cltv_timeout: None,
+            internal_key: funded_key,
+            script_key: funded_key,
+        };
+        let alloc = create_second_level_htlc_allocation(&params, 100);
+        assert!(signer
+            .compute_htlc_sighash(&channel, &htlc, &alloc, [0; 32])
+            .is_err());
     }
 
     #[test]
@@ -263,22 +598,21 @@ mod tests {
         let signer = TapAssetLeafSigner::new(test_key());
         let channel = ChannelBlob {
             funded_assets: vec![],
-            decimal_display: None,
+            decimal_display: 0,
             group_key: None,
         };
-        let commitment = CommitmentBlob {
-            local_assets: vec![],
-            remote_assets: vec![],
-            outgoing_htlc_assets: vec![],
-            incoming_htlc_assets: vec![],
-        };
         let htlc_blobs = vec![HtlcBlob {
-            amounts: vec![], // No asset amounts.
+            amounts: vec![],
             rfq_id: None,
         }];
 
         let sigs = signer
-            .sign_htlc_second_level(&channel, &commitment, &htlc_blobs)
+            .sign_htlc_second_level(
+                &channel,
+                &empty_commitment(),
+                &htlc_blobs,
+                [0; 32],
+            )
             .unwrap();
 
         assert_eq!(sigs.len(), 1);
@@ -287,43 +621,68 @@ mod tests {
 
     #[test]
     fn test_pack_unpack_roundtrip() {
-        let sigs = vec![vec![0x01; 64], vec![0x02; 64], vec![]];
-        let packed = pack_aux_signatures(&sigs);
+        let htlc_sigs = vec![
+            vec![AssetSig {
+                asset_id: tap_primitives::asset::AssetId([0xAA; 32]),
+                sig: [0x01; 64],
+                sighash_type: 0,
+            }],
+            vec![
+                AssetSig {
+                    asset_id: tap_primitives::asset::AssetId([0xBB; 32]),
+                    sig: [0x02; 64],
+                    sighash_type: 1,
+                },
+                AssetSig {
+                    asset_id: tap_primitives::asset::AssetId([0xCC; 32]),
+                    sig: [0x03; 64],
+                    sighash_type: 0,
+                },
+            ],
+            vec![],
+        ];
+        let packed = pack_aux_signatures(&htlc_sigs);
         let unpacked = unpack_aux_signatures(&packed).unwrap();
-        assert_eq!(sigs, unpacked);
+        assert_eq!(htlc_sigs, unpacked);
+    }
+
+    #[test]
+    fn test_pack_format_is_go_commit_sig() {
+        // An empty CommitSig is a single TLV record 65537 with a
+        // zero-count varint value.
+        let packed = pack_aux_signatures(&[]);
+        // Type 65537 encodes as BigSize fe 00 01 00 01, length 1,
+        // value 00.
+        assert_eq!(packed, vec![0xfe, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00]);
     }
 
     #[test]
     fn test_deterministic_signatures() {
         let signer = TapAssetLeafSigner::new(test_key());
-        let channel = ChannelBlob {
-            funded_assets: vec![FundedAsset {
-                asset_id: AssetId([0xBB; 32]),
-                amount: 500,
-                script_key: tap_primitives::asset::SerializedKey([0x02; 33]),
-            }],
-            decimal_display: None,
-            group_key: None,
-        };
-        let commitment = CommitmentBlob {
-            local_assets: vec![],
-            remote_assets: vec![],
-            outgoing_htlc_assets: vec![],
-            incoming_htlc_assets: vec![],
-        };
+        let channel = test_channel(0xBB);
         let htlc_blobs = vec![HtlcBlob {
             amounts: vec![AssetBalance {
-                asset_id: AssetId([0xBB; 32]),
+                asset_id: tap_primitives::asset::AssetId([0xBB; 32]),
                 amount: 200,
             }],
             rfq_id: None,
         }];
 
         let sigs1 = signer
-            .sign_htlc_second_level(&channel, &commitment, &htlc_blobs)
+            .sign_htlc_second_level(
+                &channel,
+                &empty_commitment(),
+                &htlc_blobs,
+                [0x05; 32],
+            )
             .unwrap();
         let sigs2 = signer
-            .sign_htlc_second_level(&channel, &commitment, &htlc_blobs)
+            .sign_htlc_second_level(
+                &channel,
+                &empty_commitment(),
+                &htlc_blobs,
+                [0x05; 32],
+            )
             .unwrap();
 
         assert_eq!(sigs1, sigs2);

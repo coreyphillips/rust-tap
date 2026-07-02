@@ -21,7 +21,7 @@ use tap_primitives::commitment::{
     AssetCommitment, TapCommitment, TapCommitmentVersion,
 };
 
-use super::blobs::{AssetBalance, ChannelBlob, CommitmentBlob};
+use super::blobs::{AssetOutput, ChannelBlob, CommitmentBlob};
 use super::traits::{AssetChannelError, AssetLeafCreator, ChannelParty};
 
 /// Default implementation of [`AssetLeafCreator`] for Taproot Assets.
@@ -69,21 +69,21 @@ impl AssetLeafCreator for TapAssetLeafCreator {
         }
 
         // Create TAP commitment leaves for HTLC outputs.
-        for htlc in &commitment_blob.outgoing_htlc_assets {
+        for (htlc_index, outputs) in &commitment_blob.outgoing_htlc_assets {
             if let Some(leaf) = create_balance_leaf(
                 channel_blob,
-                &htlc.balances,
-                htlc.htlc_index as u32 + 2, // HTLC outputs start at index 2
+                outputs,
+                *htlc_index as u32 + 2, // HTLC outputs start at index 2
             )? {
                 leaves.push(leaf);
             }
         }
 
-        for htlc in &commitment_blob.incoming_htlc_assets {
+        for (htlc_index, outputs) in &commitment_blob.incoming_htlc_assets {
             if let Some(leaf) = create_balance_leaf(
                 channel_blob,
-                &htlc.balances,
-                htlc.htlc_index as u32 + 2,
+                outputs,
+                *htlc_index as u32 + 2,
             )? {
                 leaves.push(leaf);
             }
@@ -99,7 +99,7 @@ impl AssetLeafCreator for TapAssetLeafCreator {
 /// Returns `None` if there are no non-zero balances.
 fn create_balance_leaf(
     channel_blob: &ChannelBlob,
-    balances: &[AssetBalance],
+    balances: &[AssetOutput],
     output_index: u32,
 ) -> Result<Option<(u32, Vec<u8>)>, AssetChannelError> {
     // Filter out zero balances.
@@ -112,18 +112,14 @@ fn create_balance_leaf(
     // Build assets from the balances.
     let mut assets = Vec::new();
     for balance in &non_zero {
-        // Find the funded asset info for this asset ID.
-        let funded = channel_blob
+        // Prefer the funded asset's script key; fall back to the
+        // output's own script key.
+        let script_key = channel_blob
             .funded_assets
             .iter()
-            .find(|f| f.asset_id == balance.asset_id);
-
-        let script_key = funded
+            .find(|f| f.asset_id == balance.asset_id)
             .map(|f| f.script_key)
-            .ok_or_else(|| AssetChannelError(format!(
-                "no funded asset found for asset_id {:?}",
-                balance.asset_id
-            )))?;
+            .unwrap_or(balance.script_key);
 
         // Create a minimal asset for the commitment.
         let asset = Asset {
@@ -168,8 +164,17 @@ fn create_balance_leaf(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channel::blobs::{FundedAsset, HtlcAssetBalance};
+    use crate::channel::blobs::FundedAsset;
     use tap_primitives::asset::{AssetId, SerializedKey};
+
+    fn output(amount: u64) -> AssetOutput {
+        AssetOutput {
+            asset_id: AssetId([0xAA; 32]),
+            amount,
+            script_key: SerializedKey([0x02; 33]),
+            proof: None,
+        }
+    }
 
     fn test_channel_blob() -> ChannelBlob {
         ChannelBlob {
@@ -177,24 +182,18 @@ mod tests {
                 asset_id: AssetId([0xAA; 32]),
                 amount: 1000,
                 script_key: SerializedKey([0x02; 33]),
+                proof: None,
             }],
-            decimal_display: None,
+            decimal_display: 0,
             group_key: None,
         }
     }
 
     fn test_commitment_blob() -> CommitmentBlob {
         CommitmentBlob {
-            local_assets: vec![AssetBalance {
-                asset_id: AssetId([0xAA; 32]),
-                amount: 600,
-            }],
-            remote_assets: vec![AssetBalance {
-                asset_id: AssetId([0xAA; 32]),
-                amount: 400,
-            }],
-            outgoing_htlc_assets: vec![],
-            incoming_htlc_assets: vec![],
+            local_assets: vec![output(600)],
+            remote_assets: vec![output(400)],
+            ..CommitmentBlob::default()
         }
     }
 
@@ -222,13 +221,7 @@ mod tests {
         let creator = TapAssetLeafCreator;
         let channel = test_channel_blob();
         let mut commit = test_commitment_blob();
-        commit.outgoing_htlc_assets.push(HtlcAssetBalance {
-            htlc_index: 0,
-            balances: vec![AssetBalance {
-                asset_id: AssetId([0xAA; 32]),
-                amount: 100,
-            }],
-        });
+        commit.outgoing_htlc_assets.insert(0, vec![output(100)]);
 
         let leaves = creator
             .create_aux_leaves(&channel, &commit, ChannelParty::Local)

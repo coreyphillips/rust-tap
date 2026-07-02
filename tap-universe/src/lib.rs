@@ -29,8 +29,12 @@ pub mod syncer;
 pub mod traits;
 pub mod types;
 
+#[cfg(feature = "http-client")]
+pub use http_client::HttpUniverseClient;
 pub use ignore::{IgnoreError, IgnoreSig, IgnoreTuple, SignedIgnoreTuple};
 pub use memory::{MemoryFederationDb, MemoryUniverseBackend};
-pub use syncer::SimpleSyncer;
+pub use syncer::{
+    sync_all, LeafVerifier, ProofLeafVerifier, SimpleSyncer, SyncAllResult,
+};
 pub use traits::{DiffEngine, FederationDb, MultiverseArchive, Syncer, UniverseBackend};
 pub use types::*;

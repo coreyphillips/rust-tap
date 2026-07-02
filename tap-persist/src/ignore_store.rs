@@ -192,19 +192,19 @@ mod sqlite_impl {
 
     /// SQLite-backed [`IgnoreTupleStore`] with a bounded negative
     /// cache for `is_ignored` lookups.
-    pub struct SqliteIgnoreStore<'a> {
-        db: &'a SqliteDb,
+    pub struct SqliteIgnoreStore {
+        db: std::sync::Arc<SqliteDb>,
         negative_cache: Mutex<NegativeCache>,
     }
 
-    impl<'a> SqliteIgnoreStore<'a> {
-        pub fn new(db: &'a SqliteDb) -> Self {
+    impl SqliteIgnoreStore {
+        pub fn new(db: std::sync::Arc<SqliteDb>) -> Self {
             Self::with_cache_size(db, DEFAULT_NEGATIVE_CACHE_SIZE)
         }
 
         /// Creates a store with a custom negative cache capacity
         /// (0 disables the cache).
-        pub fn with_cache_size(db: &'a SqliteDb, capacity: usize) -> Self {
+        pub fn with_cache_size(db: std::sync::Arc<SqliteDb>, capacity: usize) -> Self {
             SqliteIgnoreStore {
                 db,
                 negative_cache: Mutex::new(NegativeCache::new(capacity)),
@@ -212,7 +212,7 @@ mod sqlite_impl {
         }
     }
 
-    impl IgnoreTupleStore for SqliteIgnoreStore<'_> {
+    impl IgnoreTupleStore for SqliteIgnoreStore {
         fn insert_tuples(
             &mut self,
             group_key: &SerializedKey,
@@ -331,6 +331,7 @@ mod sqlite_impl {
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     use tap_primitives::asset::{AssetId, OutPoint};
     use tap_universe::ignore::{IgnoreSig, IgnoreTuple};
@@ -375,8 +376,8 @@ mod tests {
     /// Both backends agree on insert/list/is_ignored.
     #[test]
     fn test_ignore_store_backends_agree() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut sqlite_store = SqliteIgnoreStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut sqlite_store = SqliteIgnoreStore::new(Arc::clone(&db));
         let mut memory_store = MemoryIgnoreStore::new();
 
         let tuples = vec![signed_tuple(0, 10), signed_tuple(1, 20)];
@@ -410,8 +411,8 @@ mod tests {
     /// is later inserted.
     #[test]
     fn test_negative_cache_invalidation() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteIgnoreStore::with_cache_size(&db, 4);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteIgnoreStore::with_cache_size(Arc::clone(&db), 4);
 
         let tuple = signed_tuple(0, 10);
 
@@ -445,8 +446,8 @@ mod tests {
     fn test_ignore_checker_adapter() {
         use tap_primitives::proof::IgnoreChecker as _;
 
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteIgnoreStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteIgnoreStore::new(Arc::clone(&db));
         let tuple = signed_tuple(0, 10);
         store.insert_tuples(&group_key(), &[tuple.clone()]).unwrap();
 
@@ -469,8 +470,8 @@ mod tests {
             DefaultMerkleVerifier, FixedHeightChainLookup, VerifierCtx,
         };
 
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteIgnoreStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteIgnoreStore::new(Arc::clone(&db));
         let tuple = signed_tuple(0, 10);
         store.insert_tuples(&group_key(), &[tuple.clone()]).unwrap();
 

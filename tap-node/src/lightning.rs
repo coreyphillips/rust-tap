@@ -47,8 +47,11 @@ where
             asset_id,
             amount: asset_amount,
             script_key: key_desc.pub_key,
+            // The funding proof is attached once the funding flow
+            // completes (see TapAssetFundingController).
+            proof: None,
         }],
-        decimal_display: None,
+        decimal_display: 0,
         group_key: None,
     };
 
@@ -126,6 +129,10 @@ where
     L: LdkChannelOps + Send + Sync + 'static,
     P: PriceOracle + Send + Sync + 'static,
 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     node.tap_channel_mgr
         .handle_intercepted_htlc(
             intercept_id,
@@ -133,6 +140,7 @@ where
             next_node_id,
             amt_msat,
             custom_records,
+            now,
         )
         .map_err(|e| TapNodeError::Lightning(e))
 }

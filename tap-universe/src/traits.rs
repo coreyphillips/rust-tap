@@ -118,12 +118,14 @@ pub trait DiffEngine {
 
 /// Orchestrates sync between local and remote universes.
 pub trait Syncer {
-    /// Syncs a universe from a remote server.
+    /// Syncs a universe from a remote server into `local`.
     ///
     /// Compares local and remote roots, fetches missing leaves,
-    /// and inserts them locally. Returns the diff of new leaves added.
+    /// verifies them, and inserts them locally. Returns the diff of
+    /// new leaves added.
     fn sync_universe(
         &self,
+        local: &mut dyn UniverseBackend,
         remote: &dyn DiffEngine,
         id: &UniverseId,
     ) -> Result<AssetSyncDiff, UniverseError>;

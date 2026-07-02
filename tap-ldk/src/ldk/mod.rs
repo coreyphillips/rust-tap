@@ -26,8 +26,12 @@ use std::sync::Mutex;
 use tap_primitives::asset::AssetId;
 
 use crate::channel::blobs::{ChannelBlob, CommitmentBlob};
+use crate::channel::traits::{AssetChannelError, AssetTrafficShaper};
 use crate::config::TapConfig;
-use crate::rfq::QuoteManager;
+use crate::routing::{
+    compute_htlc_btc_amount, AssetHtlcData, DEFAULT_ON_CHAIN_HTLC_MSAT,
+};
+use crate::rfq::{AcceptedQuote, QuoteManager, RfqError};
 use crate::wire::TapMessage;
 
 /// A channel identifier (32 bytes).
@@ -125,13 +129,32 @@ where
         );
     }
 
-    /// Associates an SCID with an asset channel (called after funding
-    /// confirms and the channel becomes usable).
-    pub fn set_channel_scid(
+    /// Updates the latest commitment blob for an asset channel.
+    pub fn update_commitment_blob(
         &self,
         channel_id: &ChannelId,
-        scid: u64,
-    ) {
+        blob: CommitmentBlob,
+    ) -> Result<(), AssetChannelError> {
+        let mut channels = self.channels.lock().unwrap();
+        let state = channels.get_mut(channel_id).ok_or_else(|| {
+            AssetChannelError("unknown asset channel".into())
+        })?;
+        state.commitment_blob = Some(blob);
+        Ok(())
+    }
+
+    /// Returns true if the given SCID belongs to an asset channel.
+    ///
+    /// Also available via the [`AssetTrafficShaper`] impl; this
+    /// inherent method keeps the call ergonomic without importing the
+    /// trait.
+    pub fn is_asset_channel(&self, scid: u64) -> bool {
+        self.scid_to_channel.lock().unwrap().contains_key(&scid)
+    }
+
+    /// Associates an SCID with an asset channel (called after funding
+    /// confirms and the channel becomes usable).
+    pub fn set_channel_scid(&self, channel_id: &ChannelId, scid: u64) {
         let mut channels = self.channels.lock().unwrap();
         if let Some(state) = channels.get_mut(channel_id) {
             state.scid = Some(scid);
@@ -142,17 +165,66 @@ where
         }
     }
 
-    /// Returns true if the given SCID belongs to an asset channel.
-    pub fn is_asset_channel(&self, scid: u64) -> bool {
-        self.scid_to_channel.lock().unwrap().contains_key(&scid)
-    }
-
     /// Returns the asset channel state for a given channel ID.
     pub fn get_channel_state(
         &self,
         channel_id: &ChannelId,
     ) -> Option<AssetChannelState> {
         self.channels.lock().unwrap().get(channel_id).cloned()
+    }
+
+    /// Returns the asset channel state for a given SCID.
+    fn channel_state_by_scid(&self, scid: u64) -> Option<AssetChannelState> {
+        let channel_id = *self.scid_to_channel.lock().unwrap().get(&scid)?;
+        self.get_channel_state(&channel_id)
+    }
+
+    /// Creates and records an outgoing buy quote request for the given
+    /// peer. The returned message should be sent to that peer.
+    pub fn request_buy_quote(
+        &self,
+        asset_id: AssetId,
+        max_amount: u64,
+        peer: [u8; 33],
+        now: u64,
+    ) -> TapMessage {
+        let mut rfq = self.rfq.lock().unwrap();
+        TapMessage::RfqBuyRequest(
+            rfq.create_buy_request(asset_id, max_amount, peer, now),
+        )
+    }
+
+    /// Creates and records an outgoing sell quote request for the given
+    /// peer. The returned message should be sent to that peer.
+    pub fn request_sell_quote(
+        &self,
+        asset_id: AssetId,
+        max_msat: u64,
+        peer: [u8; 33],
+        now: u64,
+    ) -> TapMessage {
+        let mut rfq = self.rfq.lock().unwrap();
+        TapMessage::RfqSellRequest(
+            rfq.create_sell_request(asset_id, max_msat, peer, now),
+        )
+    }
+
+    /// Returns whether a pending outgoing request with the given ID is
+    /// a buy (`Some(true)`), a sell (`Some(false)`), or unknown. Use as
+    /// the session lookup for [`TapMessage::decode`].
+    pub fn pending_request_is_buy(
+        &self,
+        id: &crate::wire::messages::RfqId,
+    ) -> Option<bool> {
+        self.rfq.lock().unwrap().pending_request_is_buy(id)
+    }
+
+    /// Looks up an accepted quote by ID.
+    pub fn get_quote(
+        &self,
+        id: &crate::wire::messages::RfqId,
+    ) -> Option<AcceptedQuote> {
+        self.rfq.lock().unwrap().get_quote(id).cloned()
     }
 
     /// Handles an incoming TAP custom message from a peer.
@@ -165,57 +237,82 @@ where
         match msg {
             TapMessage::RfqBuyRequest(req) => {
                 let mut rfq = self.rfq.lock().unwrap();
-                match rfq.handle_buy_request(&req, peer, now, self.config.rfq_quote_lifetime_secs) {
-                    Ok(accept) => {
-                        Some(TapMessage::RfqBuyAccept(accept))
-                    }
-                    Err(reject) => {
-                        Some(TapMessage::RfqBuyReject(reject))
-                    }
+                match rfq.handle_buy_request(
+                    &req,
+                    peer,
+                    now,
+                    self.config.rfq_quote_lifetime_secs,
+                ) {
+                    Ok(accept) => Some(TapMessage::RfqBuyAccept(accept)),
+                    Err(reject) => Some(TapMessage::RfqBuyReject(reject)),
                 }
             }
             TapMessage::RfqSellRequest(req) => {
                 let mut rfq = self.rfq.lock().unwrap();
-                match rfq.handle_sell_request(&req, peer, now, self.config.rfq_quote_lifetime_secs) {
-                    Ok(accept) => {
-                        Some(TapMessage::RfqSellAccept(accept))
-                    }
-                    Err(reject) => {
-                        Some(TapMessage::RfqSellReject(reject))
-                    }
+                match rfq.handle_sell_request(
+                    &req,
+                    peer,
+                    now,
+                    self.config.rfq_quote_lifetime_secs,
+                ) {
+                    Ok(accept) => Some(TapMessage::RfqSellAccept(accept)),
+                    Err(reject) => Some(TapMessage::RfqSellReject(reject)),
                 }
             }
             TapMessage::RfqBuyAccept(accept) => {
-                // Peer accepted our buy request.
+                // Peer accepted our buy request: validate against the
+                // pending request (peer binding + real asset ID).
                 let mut rfq = self.rfq.lock().unwrap();
-                // We need the asset_id — it would be in our pending
-                // request. For now just record it.
-                rfq.record_buy_accept(
-                    &accept,
-                    AssetId([0; 32]), // Looked up from pending requests.
-                    peer,
-                );
+                let _ = rfq.handle_buy_accept(&accept, peer, now);
                 None
             }
             TapMessage::RfqSellAccept(accept) => {
                 let mut rfq = self.rfq.lock().unwrap();
-                rfq.record_sell_accept(
-                    &accept,
-                    AssetId([0; 32]),
-                    peer,
-                );
+                let _ = rfq.handle_sell_accept(&accept, peer, now);
                 None
             }
-            // Funding messages would be handled by the funding controller.
+            TapMessage::RfqBuyReject(reject)
+            | TapMessage::RfqSellReject(reject) => {
+                let mut rfq = self.rfq.lock().unwrap();
+                let _ = rfq.handle_reject(&reject, peer);
+                None
+            }
+            // Funding messages are handled by the funding controller.
             _ => None,
         }
     }
 
+    /// Looks up a valid (known and unexpired) quote.
+    fn valid_quote(
+        &self,
+        id: &crate::wire::messages::RfqId,
+        now: u64,
+    ) -> Result<AcceptedQuote, RfqError> {
+        let rfq = self.rfq.lock().unwrap();
+        let quote =
+            rfq.get_quote(id).ok_or(RfqError::QuoteNotFound(*id))?;
+        if !quote.is_valid(now) {
+            return Err(RfqError::QuoteExpired {
+                id: *id,
+                expiry: quote.expiry,
+                now,
+            });
+        }
+        Ok(quote.clone())
+    }
+
     /// Handles an intercepted HTLC that may be an asset payment.
     ///
-    /// If the HTLC carries asset custom records and we have a valid quote,
-    /// forwards it with the adjusted BTC amount. Otherwise, forwards
-    /// normally.
+    /// Asset HTLCs are only forwarded when they carry a locked-in RFQ
+    /// ID that maps to a known, unexpired quote; the forwarded BTC
+    /// amount is computed from the quote's rate (with the on-chain
+    /// minimum clamp), mirroring Go's `rfqmath` conversion. Anything
+    /// else fails back:
+    /// - asset HTLC without an RFQ ID
+    /// - unknown or expired quote
+    /// - rate conversion failure
+    ///
+    /// Non-asset HTLCs are forwarded unchanged.
     pub fn handle_intercepted_htlc(
         &self,
         intercept_id: [u8; 32],
@@ -223,66 +320,209 @@ where
         next_node_id: [u8; 33],
         amt_msat: u64,
         custom_records: &[(u64, Vec<u8>)],
+        now: u64,
     ) -> Result<(), String> {
-        // Check if this is an asset payment.
-        if let Some(asset_data) =
-            crate::routing::AssetHtlcData::from_custom_tlvs(custom_records)
-        {
-            // Look up the RFQ quote if present.
-            let adjusted_amt = if let Some(ref rfq_id) = asset_data.rfq_id {
-                let rfq = self.rfq.lock().unwrap();
-                if let Some(quote) = rfq.get_quote(rfq_id) {
-                    crate::routing::compute_htlc_btc_amount(
-                        asset_data.asset_amount,
-                        Some(quote),
-                    )
-                } else {
-                    amt_msat // No quote found, forward original amount.
-                }
-            } else {
-                amt_msat
-            };
-
-            return self.ldk.forward_intercepted_htlc(
-                intercept_id,
-                next_hop_scid,
-                next_node_id,
-                adjusted_amt,
-            );
-        }
+        let asset_data = AssetHtlcData::from_custom_tlvs(custom_records);
 
         // Not an asset HTLC — forward normally.
+        let asset_data = match asset_data {
+            None => {
+                return self.ldk.forward_intercepted_htlc(
+                    intercept_id,
+                    next_hop_scid,
+                    next_node_id,
+                    amt_msat,
+                );
+            }
+            Some(data) => data,
+        };
+
+        // An asset HTLC without a locked-in quote cannot be valued;
+        // forwarding it at the original amount would hand out the
+        // asset without compensation. Fail it back.
+        let rfq_id = match asset_data.rfq_id {
+            Some(id) => id,
+            None => {
+                self.ldk.fail_intercepted_htlc(intercept_id)?;
+                return Err("asset HTLC missing RFQ ID".into());
+            }
+        };
+
+        let quote = match self.valid_quote(&rfq_id, now) {
+            Ok(quote) => quote,
+            Err(e) => {
+                self.ldk.fail_intercepted_htlc(intercept_id)?;
+                return Err(format!("asset HTLC quote invalid: {}", e));
+            }
+        };
+
+        let asset_amount = asset_data.sum_balances();
+        let adjusted_amt = if asset_amount == 0 {
+            // No asset units in the HTLC: nothing to convert; use the
+            // minimum on-chain amount.
+            DEFAULT_ON_CHAIN_HTLC_MSAT
+        } else {
+            match compute_htlc_btc_amount(asset_amount, &quote) {
+                Ok(amt) => amt,
+                Err(e) => {
+                    self.ldk.fail_intercepted_htlc(intercept_id)?;
+                    return Err(format!(
+                        "asset HTLC amount conversion failed: {}",
+                        e
+                    ));
+                }
+            }
+        };
+
         self.ldk.forward_intercepted_htlc(
             intercept_id,
             next_hop_scid,
             next_node_id,
-            amt_msat,
+            adjusted_amt,
         )
     }
 
-    /// Prunes expired RFQ quotes.
+    /// Prunes expired RFQ quotes and timed-out pending requests.
     pub fn prune_expired_quotes(&self, now: u64) {
         self.rfq.lock().unwrap().prune_expired(now);
+    }
+}
+
+impl<L, P> AssetTrafficShaper for TapChannelManager<L, P>
+where
+    L: LdkChannelOps,
+    P: crate::rfq::manager::PriceOracle,
+{
+    fn is_asset_channel(&self, scid: u64) -> bool {
+        self.scid_to_channel.lock().unwrap().contains_key(&scid)
+    }
+
+    fn payment_bandwidth(
+        &self,
+        scid: u64,
+        _htlc_amt_msat: u64,
+    ) -> Result<u64, AssetChannelError> {
+        let state = self.channel_state_by_scid(scid).ok_or_else(|| {
+            AssetChannelError(format!("no asset channel for scid {}", scid))
+        })?;
+
+        // The channel's local asset balance from the latest commitment
+        // blob; without a commitment we cannot report any bandwidth.
+        let commitment = match state.commitment_blob {
+            Some(c) => c,
+            None => return Ok(0),
+        };
+
+        let rfq = self.rfq.lock().unwrap();
+        let mut total_msat: u64 = 0;
+        for output in &commitment.local_assets {
+            // Find any quote for this asset; without one, the balance
+            // cannot be valued in msat (mirrors Go, which requires an
+            // RFQ to derive bandwidth).
+            let quote = rfq
+                .buy_quotes()
+                .values()
+                .chain(rfq.sell_quotes().values())
+                .find(|q| q.asset_id == output.asset_id);
+            if let Some(quote) = quote {
+                let msat = crate::rfq::math::units_to_milli_satoshi(
+                    output.amount,
+                    &quote.rate,
+                )
+                .map_err(|e| {
+                    AssetChannelError(format!("bandwidth: {}", e))
+                })?;
+                total_msat = total_msat.saturating_add(msat);
+            }
+        }
+        Ok(total_msat)
+    }
+
+    fn shape_outgoing_htlc(
+        &self,
+        scid: u64,
+        original_amt_msat: u64,
+        custom_records: &[(u64, Vec<u8>)],
+    ) -> Result<(u64, Vec<(u64, Vec<u8>)>), AssetChannelError> {
+        // An HTLC that already carries asset units (keysend/forward)
+        // passes through unchanged (mirrors Go ProduceHtlcExtraData).
+        if let Some(existing) =
+            AssetHtlcData::from_custom_tlvs(custom_records)
+        {
+            if existing.sum_balances() > 0 {
+                return Ok((original_amt_msat, custom_records.to_vec()));
+            }
+        }
+
+        let state = self.channel_state_by_scid(scid).ok_or_else(|| {
+            AssetChannelError(format!("no asset channel for scid {}", scid))
+        })?;
+        let primary_asset = state
+            .channel_blob
+            .funded_assets
+            .first()
+            .map(|f| f.asset_id)
+            .ok_or_else(|| {
+                AssetChannelError("channel has no funded assets".into())
+            })?;
+
+        // Find a sell quote for the channel's asset (we are paying out
+        // BTC value as assets).
+        let rfq = self.rfq.lock().unwrap();
+        let quote = rfq
+            .sell_quotes()
+            .values()
+            .chain(rfq.buy_quotes().values())
+            .find(|q| q.asset_id == primary_asset)
+            .cloned()
+            .ok_or_else(|| {
+                AssetChannelError("no quote available for asset".into())
+            })?;
+        drop(rfq);
+
+        let asset_amount = crate::rfq::math::milli_satoshi_to_units(
+            original_amt_msat,
+            &quote.rate,
+        )
+        .map_err(|e| AssetChannelError(format!("conversion: {}", e)))?;
+        if asset_amount == 0 {
+            return Err(AssetChannelError(format!(
+                "asset rate {} too high to represent {} msat",
+                quote.rate, original_amt_msat
+            )));
+        }
+
+        let data = AssetHtlcData {
+            balances: vec![crate::channel::blobs::AssetBalance {
+                asset_id: primary_asset,
+                amount: asset_amount,
+            }],
+            rfq_id: Some(quote.id),
+        };
+
+        Ok((DEFAULT_ON_CHAIN_HTLC_MSAT, data.to_custom_tlvs()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channel::blobs::FundedAsset;
+    use crate::channel::blobs::{AssetBalance, FundedAsset};
     use crate::rfq::{FixedPoint, RfqError};
     use crate::wire::*;
-    use tap_primitives::asset::SerializedKey;
     use std::sync::Mutex as StdMutex;
+    use tap_primitives::asset::SerializedKey;
 
     struct MockLdk {
         forwarded: StdMutex<Vec<(u64, u64)>>, // (scid, amt)
+        failed: StdMutex<Vec<[u8; 32]>>,
     }
 
     impl MockLdk {
         fn new() -> Self {
             MockLdk {
                 forwarded: StdMutex::new(Vec::new()),
+                failed: StdMutex::new(Vec::new()),
             }
         }
     }
@@ -301,7 +541,11 @@ mod tests {
                 .push((next_hop_scid, amt_msat));
             Ok(())
         }
-        fn fail_intercepted_htlc(&self, _: [u8; 32]) -> Result<(), String> {
+        fn fail_intercepted_htlc(
+            &self,
+            intercept_id: [u8; 32],
+        ) -> Result<(), String> {
+            self.failed.lock().unwrap().push(intercept_id);
             Ok(())
         }
     }
@@ -313,32 +557,81 @@ mod tests {
             _: &AssetId,
             _: u64,
         ) -> Result<FixedPoint, RfqError> {
-            Ok(FixedPoint::from_integer(5000))
+            // 20,000,000 units per BTC = 5000 msat per unit.
+            Ok(FixedPoint::new(20_000_000, 0))
         }
         fn bid_price(
             &self,
             _: &AssetId,
             _: u64,
         ) -> Result<FixedPoint, RfqError> {
-            Ok(FixedPoint::from_integer(4800))
+            // 25,000,000 units per BTC = 4000 msat per unit.
+            Ok(FixedPoint::new(25_000_000, 0))
         }
+    }
+
+    const NOW: u64 = 1_000_000;
+
+    fn test_blob(asset_byte: u8, amount: u64) -> ChannelBlob {
+        ChannelBlob {
+            funded_assets: vec![FundedAsset {
+                asset_id: AssetId([asset_byte; 32]),
+                amount,
+                script_key: SerializedKey([0x02; 33]),
+                proof: None,
+            }],
+            decimal_display: 0,
+            group_key: None,
+        }
+    }
+
+    fn commitment_with_local(
+        asset_byte: u8,
+        amount: u64,
+    ) -> CommitmentBlob {
+        CommitmentBlob {
+            local_assets: vec![crate::channel::blobs::AssetOutput {
+                asset_id: AssetId([asset_byte; 32]),
+                amount,
+                script_key: SerializedKey([0x02; 33]),
+                proof: None,
+            }],
+            ..CommitmentBlob::default()
+        }
+    }
+
+    /// Sets up a manager with a stored sell quote and returns the
+    /// quote's RFQ ID.
+    fn store_quote(
+        mgr: &TapChannelManager<MockLdk, MockOracle>,
+        asset_byte: u8,
+    ) -> crate::wire::messages::RfqId {
+        // Incoming buy request from the peer produces a stored quote
+        // at the ask rate (20M units/BTC = 5000 msat/unit).
+        let req = RfqBuyRequest {
+            id: [0x51; 32],
+            asset_id: AssetId([asset_byte; 32]),
+            asset_max_amount: 10_000,
+            asset_group_key: None,
+            expiry: NOW + 600,
+            rate_hint: None,
+        };
+        let resp = mgr
+            .handle_tap_message(
+                [0x02; 33],
+                TapMessage::RfqBuyRequest(req),
+                NOW,
+            )
+            .unwrap();
+        assert!(matches!(resp, TapMessage::RfqBuyAccept(_)));
+        [0x51; 32]
     }
 
     #[test]
     fn test_register_asset_channel() {
         let mgr = TapChannelManager::new(MockLdk::new(), MockOracle);
         let channel_id = [0x01; 32];
-        let blob = ChannelBlob {
-            funded_assets: vec![FundedAsset {
-                asset_id: AssetId([0xAA; 32]),
-                amount: 1000,
-                script_key: SerializedKey([0x02; 33]),
-            }],
-            decimal_display: None,
-            group_key: None,
-        };
-
-        mgr.register_asset_channel(channel_id, blob);
+        mgr.register_asset_channel(channel_id, test_blob(0xAA, 1000));
         assert!(mgr.get_channel_state(&channel_id).is_some());
     }
 
@@ -346,13 +639,7 @@ mod tests {
     fn test_scid_mapping() {
         let mgr = TapChannelManager::new(MockLdk::new(), MockOracle);
         let channel_id = [0x01; 32];
-        let blob = ChannelBlob {
-            funded_assets: vec![],
-            decimal_display: None,
-            group_key: None,
-        };
-
-        mgr.register_asset_channel(channel_id, blob);
+        mgr.register_asset_channel(channel_id, test_blob(0xAA, 1000));
         assert!(!mgr.is_asset_channel(12345));
 
         mgr.set_channel_scid(&channel_id, 12345);
@@ -368,11 +655,88 @@ mod tests {
             asset_id: AssetId([0xAA; 32]),
             asset_max_amount: 100,
             asset_group_key: None,
+            expiry: NOW + 600,
+            rate_hint: None,
         });
 
-        let response =
-            mgr.handle_tap_message([0x02; 33], msg, 1_000_000);
+        let response = mgr.handle_tap_message([0x02; 33], msg, NOW);
         assert!(matches!(response, Some(TapMessage::RfqBuyAccept(_))));
+    }
+
+    #[test]
+    fn test_buy_accept_records_real_asset_id() {
+        let mgr = TapChannelManager::new(MockLdk::new(), MockOracle);
+        let peer = [0x02; 33];
+
+        // Create a pending outgoing buy request.
+        let msg = mgr.request_buy_quote(AssetId([0xEE; 32]), 500, peer, NOW);
+        let id = match msg {
+            TapMessage::RfqBuyRequest(ref req) => req.id,
+            _ => panic!("expected buy request"),
+        };
+        assert_eq!(mgr.pending_request_is_buy(&id), Some(true));
+
+        // Peer accepts.
+        let accept = TapMessage::RfqBuyAccept(RfqBuyAccept {
+            id,
+            asset_rate: FixedPoint::new(20_000_000, 0),
+            expiry: NOW + 600,
+            sig: [0; 64],
+            max_in_asset: None,
+        });
+        mgr.handle_tap_message(peer, accept, NOW);
+
+        // The quote carries the REAL asset id from the pending request.
+        let quote = mgr.get_quote(&id).unwrap();
+        assert_eq!(quote.asset_id, AssetId([0xEE; 32]));
+        assert!(quote.is_buy);
+        // Pending request consumed.
+        assert_eq!(mgr.pending_request_is_buy(&id), None);
+    }
+
+    #[test]
+    fn test_buy_accept_wrong_peer_ignored() {
+        let mgr = TapChannelManager::new(MockLdk::new(), MockOracle);
+        let peer = [0x02; 33];
+        let msg = mgr.request_buy_quote(AssetId([0xEE; 32]), 500, peer, NOW);
+        let id = match msg {
+            TapMessage::RfqBuyRequest(ref req) => req.id,
+            _ => panic!("expected buy request"),
+        };
+
+        // A different peer sends the accept: no quote is recorded.
+        let accept = TapMessage::RfqBuyAccept(RfqBuyAccept {
+            id,
+            asset_rate: FixedPoint::new(20_000_000, 0),
+            expiry: NOW + 600,
+            sig: [0; 64],
+            max_in_asset: None,
+        });
+        mgr.handle_tap_message([0x03; 33], accept, NOW);
+        assert!(mgr.get_quote(&id).is_none());
+        // The pending request is still there for the real peer.
+        assert_eq!(mgr.pending_request_is_buy(&id), Some(true));
+    }
+
+    #[test]
+    fn test_reject_clears_pending() {
+        let mgr = TapChannelManager::new(MockLdk::new(), MockOracle);
+        let peer = [0x02; 33];
+        let msg =
+            mgr.request_sell_quote(AssetId([0xDD; 32]), 100_000, peer, NOW);
+        let id = match msg {
+            TapMessage::RfqSellRequest(ref req) => req.id,
+            _ => panic!("expected sell request"),
+        };
+        assert_eq!(mgr.pending_request_is_buy(&id), Some(false));
+
+        let reject = TapMessage::RfqSellReject(RfqReject {
+            id,
+            code: crate::wire::compat::RejectCode::PriceOracleUnavailable,
+            message: "no".into(),
+        });
+        mgr.handle_tap_message(peer, reject, NOW);
+        assert_eq!(mgr.pending_request_is_buy(&id), None);
     }
 
     #[test]
@@ -386,6 +750,7 @@ mod tests {
             [0x02; 33],
             50_000,
             &[], // No custom records — normal HTLC.
+            NOW,
         )
         .unwrap();
 
@@ -396,29 +761,150 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_intercepted_htlc_with_asset() {
+    fn test_handle_intercepted_htlc_missing_rfq_fails() {
         let ldk = MockLdk::new();
         let mgr = TapChannelManager::new(ldk, MockOracle);
 
-        // Create asset HTLC custom records.
-        let asset_data = crate::routing::AssetHtlcData {
-            asset_id: AssetId([0xAA; 32]),
-            asset_amount: 100,
+        let asset_data = AssetHtlcData {
+            balances: vec![AssetBalance {
+                asset_id: AssetId([0xAA; 32]),
+                amount: 100,
+            }],
             rfq_id: None, // No quote.
         };
         let tlvs = asset_data.to_custom_tlvs();
 
-        mgr.handle_intercepted_htlc(
-            [0; 32],
+        let res = mgr.handle_intercepted_htlc(
+            [0x0A; 32],
             999,
             [0x02; 33],
             50_000,
             &tlvs,
+            NOW,
+        );
+        assert!(res.is_err());
+        // Failed back, not forwarded.
+        assert!(mgr.ldk.forwarded.lock().unwrap().is_empty());
+        assert_eq!(mgr.ldk.failed.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_handle_intercepted_htlc_unknown_quote_fails() {
+        let ldk = MockLdk::new();
+        let mgr = TapChannelManager::new(ldk, MockOracle);
+
+        let asset_data = AssetHtlcData {
+            balances: vec![AssetBalance {
+                asset_id: AssetId([0xAA; 32]),
+                amount: 100,
+            }],
+            rfq_id: Some([0x99; 32]),
+        };
+        let res = mgr.handle_intercepted_htlc(
+            [0x0B; 32],
+            999,
+            [0x02; 33],
+            50_000,
+            &asset_data.to_custom_tlvs(),
+            NOW,
+        );
+        assert!(res.is_err());
+        assert_eq!(mgr.ldk.failed.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_handle_intercepted_htlc_with_valid_quote() {
+        let ldk = MockLdk::new();
+        let mgr = TapChannelManager::new(ldk, MockOracle);
+        let rfq_id = store_quote(&mgr, 0xAA);
+
+        let asset_data = AssetHtlcData {
+            balances: vec![AssetBalance {
+                asset_id: AssetId([0xAA; 32]),
+                amount: 200,
+            }],
+            rfq_id: Some(rfq_id),
+        };
+
+        mgr.handle_intercepted_htlc(
+            [0x0C; 32],
+            999,
+            [0x02; 33],
+            50_000,
+            &asset_data.to_custom_tlvs(),
+            NOW,
         )
         .unwrap();
 
-        // Should forward with original amount (no quote to adjust).
+        // Forwarded with the CONVERTED amount, not the original:
+        // 200 units * 5000 msat/unit = 1,000,000 msat.
         let fwd = mgr.ldk.forwarded.lock().unwrap();
-        assert_eq!(fwd[0].1, 50_000);
+        assert_eq!(fwd[0].1, 1_000_000);
+    }
+
+    #[test]
+    fn test_handle_intercepted_htlc_expired_quote_fails() {
+        let ldk = MockLdk::new();
+        let mgr = TapChannelManager::new(ldk, MockOracle);
+        let rfq_id = store_quote(&mgr, 0xAA);
+
+        let asset_data = AssetHtlcData {
+            balances: vec![AssetBalance {
+                asset_id: AssetId([0xAA; 32]),
+                amount: 200,
+            }],
+            rfq_id: Some(rfq_id),
+        };
+
+        // Way past the quote's expiry (lifetime is 3600s by default).
+        let res = mgr.handle_intercepted_htlc(
+            [0x0D; 32],
+            999,
+            [0x02; 33],
+            50_000,
+            &asset_data.to_custom_tlvs(),
+            NOW + 100_000,
+        );
+        assert!(res.is_err());
+        assert_eq!(mgr.ldk.failed.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_payment_bandwidth_from_commitment() {
+        let mgr = TapChannelManager::new(MockLdk::new(), MockOracle);
+        let channel_id = [0x01; 32];
+        mgr.register_asset_channel(channel_id, test_blob(0xAA, 1000));
+        mgr.set_channel_scid(&channel_id, 777);
+        store_quote(&mgr, 0xAA);
+
+        // No commitment blob yet: zero bandwidth.
+        assert_eq!(mgr.payment_bandwidth(777, 0).unwrap(), 0);
+
+        mgr.update_commitment_blob(
+            &channel_id,
+            commitment_with_local(0xAA, 300),
+        )
+        .unwrap();
+
+        // 300 units * 5000 msat = 1,500,000 msat.
+        assert_eq!(mgr.payment_bandwidth(777, 0).unwrap(), 1_500_000);
+    }
+
+    #[test]
+    fn test_shape_outgoing_htlc() {
+        let mgr = TapChannelManager::new(MockLdk::new(), MockOracle);
+        let channel_id = [0x01; 32];
+        mgr.register_asset_channel(channel_id, test_blob(0xAA, 1000));
+        mgr.set_channel_scid(&channel_id, 777);
+        let rfq_id = store_quote(&mgr, 0xAA);
+
+        let (amt, records) =
+            mgr.shape_outgoing_htlc(777, 500_000, &[]).unwrap();
+        // Amount reduced to on-chain minimum.
+        assert_eq!(amt, DEFAULT_ON_CHAIN_HTLC_MSAT);
+        let data = AssetHtlcData::from_custom_tlvs(&records).unwrap();
+        // 500,000 msat at 5000 msat/unit = 100 units.
+        assert_eq!(data.balances[0].amount, 100);
+        assert_eq!(data.rfq_id, Some(rfq_id));
     }
 }

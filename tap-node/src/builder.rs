@@ -230,16 +230,34 @@ where
             TapNodeError::Config("price_oracle is required".into())
         })?;
 
-        // Create default stores if not provided.
-        let asset_store: Box<dyn AssetStore + Send> = self
+        // Create default stores if not provided. When `db_path` is
+        // configured (and the `sqlite` feature is enabled), the default
+        // stores are SQLite-backed, sharing one database handle;
+        // otherwise they fall back to in-memory stores.
+        let default_db = open_default_db(
+            &self.config,
+            self.asset_store.is_none()
+                || self.proof_store.is_none()
+                || self.batch_store.is_none(),
+        )?;
+        let asset_store: Box<dyn AssetStore + Send> = match self
             .asset_store
-            .unwrap_or_else(|| create_default_asset_store(&self.config));
-        let proof_store: Box<dyn ProofStore + Send> = self
+        {
+            Some(store) => store,
+            None => default_asset_store(&default_db),
+        };
+        let proof_store: Box<dyn ProofStore + Send> = match self
             .proof_store
-            .unwrap_or_else(|| create_default_proof_store(&self.config));
-        let batch_store: Box<dyn BatchStore + Send> = self
+        {
+            Some(store) => store,
+            None => default_proof_store(&default_db),
+        };
+        let batch_store: Box<dyn BatchStore + Send> = match self
             .batch_store
-            .unwrap_or_else(|| create_default_batch_store(&self.config));
+        {
+            Some(store) => store,
+            None => default_batch_store(&default_db),
+        };
 
         // Create courier.
         let courier: Box<dyn Courier + Send + Sync> =
@@ -300,22 +318,71 @@ where
     }
 }
 
-fn create_default_asset_store(
+/// The shared database handle behind the default (SQLite) stores.
+#[cfg(feature = "sqlite")]
+type DefaultDb = Arc<tap_persist::sqlite::SqliteDb>;
+/// Placeholder when the `sqlite` feature is disabled: there is never a
+/// shared database and defaults are in-memory.
+#[cfg(not(feature = "sqlite"))]
+type DefaultDb = std::convert::Infallible;
+
+/// Opens the shared SQLite database for default stores, if a `db_path`
+/// is configured, any default store is actually needed, and the
+/// `sqlite` feature is enabled.
+#[cfg(feature = "sqlite")]
+fn open_default_db(
+    config: &TapNodeConfig,
+    any_default_needed: bool,
+) -> Result<Option<DefaultDb>, TapNodeError> {
+    match (&config.db_path, any_default_needed) {
+        (Some(path), true) => Ok(Some(Arc::new(
+            tap_persist::sqlite::SqliteDb::open(path)
+                .map_err(TapNodeError::Storage)?,
+        ))),
+        _ => Ok(None),
+    }
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn open_default_db(
     _config: &TapNodeConfig,
+    _any_default_needed: bool,
+) -> Result<Option<DefaultDb>, TapNodeError> {
+    Ok(None)
+}
+
+fn default_asset_store(
+    db: &Option<DefaultDb>,
 ) -> Box<dyn AssetStore + Send> {
-    // For SQLite, the user should provide their own store via the builder
-    // since SqliteXxxStore borrows SqliteDb and cannot be owned here.
-    Box::new(MemoryAssetStore::new())
+    match db {
+        #[cfg(feature = "sqlite")]
+        Some(db) => Box::new(tap_persist::sqlite::SqliteAssetStore::new(
+            Arc::clone(db),
+        )),
+        _ => Box::new(MemoryAssetStore::new()),
+    }
 }
 
-fn create_default_proof_store(
-    _config: &TapNodeConfig,
+fn default_proof_store(
+    db: &Option<DefaultDb>,
 ) -> Box<dyn ProofStore + Send> {
-    Box::new(MemoryProofStore::new())
+    match db {
+        #[cfg(feature = "sqlite")]
+        Some(db) => Box::new(tap_persist::sqlite::SqliteProofStore::new(
+            Arc::clone(db),
+        )),
+        _ => Box::new(MemoryProofStore::new()),
+    }
 }
 
-fn create_default_batch_store(
-    _config: &TapNodeConfig,
+fn default_batch_store(
+    db: &Option<DefaultDb>,
 ) -> Box<dyn BatchStore + Send> {
-    Box::new(MemoryBatchStore::new())
+    match db {
+        #[cfg(feature = "sqlite")]
+        Some(db) => Box::new(tap_persist::sqlite::SqliteBatchStore::new(
+            Arc::clone(db),
+        )),
+        _ => Box::new(MemoryBatchStore::new()),
+    }
 }

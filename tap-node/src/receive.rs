@@ -356,14 +356,13 @@ where
                 node.asset_store
                     .lock()
                     .expect("asset store lock")
-                    .insert_asset(OwnedAsset {
-                        asset_id: asset.asset_id,
-                        amount: asset.amount,
-                        anchor_outpoint: asset.anchor_outpoint,
-                        script_key: asset.script_key,
-                        spent: false,
-                        block_height: asset.block_height,
-                    })
+                    .insert_asset(OwnedAsset::new(
+                        asset.asset_id,
+                        asset.amount,
+                        asset.anchor_outpoint,
+                        asset.script_key,
+                        asset.block_height,
+                    ))
                     .map_err(TapNodeError::Storage)?;
 
                 node.event_bus.emit(

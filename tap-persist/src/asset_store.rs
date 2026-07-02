@@ -11,10 +11,11 @@
 
 use std::collections::HashMap;
 
-use tap_primitives::asset::{AssetId, OutPoint, SerializedKey};
+use tap_onchain::chain::KeyDescriptor;
+use tap_primitives::asset::{AssetId, AssetType, OutPoint, SerializedKey};
 
 /// A tracked asset with its on-chain location and proof.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnedAsset {
     /// The asset ID.
     pub asset_id: AssetId,
@@ -28,6 +29,48 @@ pub struct OwnedAsset {
     pub spent: bool,
     /// Block height at which this asset was confirmed.
     pub block_height: u32,
+    /// Key descriptor (family, index, raw key) behind the script key,
+    /// when the script key is derived from a local wallet key.
+    pub script_key_desc: Option<KeyDescriptor>,
+    /// The taproot internal key of the anchor output, when known.
+    pub internal_key: Option<KeyDescriptor>,
+    /// The genesis tag (asset name), when known. Together with the
+    /// genesis outpoint this allows reconstructing the
+    /// `tap_primitives::asset::Genesis` of the asset.
+    pub genesis_tag: Option<String>,
+    /// The genesis meta hash, when known.
+    pub genesis_meta_hash: Option<[u8; 32]>,
+    /// The genesis output index, when known.
+    pub genesis_output_index: Option<u32>,
+    /// The asset type (normal/collectible), when known.
+    pub genesis_asset_type: Option<AssetType>,
+}
+
+impl OwnedAsset {
+    /// Creates an owned asset with the required fields; the optional
+    /// key descriptors and genesis fields default to `None`.
+    pub fn new(
+        asset_id: AssetId,
+        amount: u64,
+        anchor_outpoint: OutPoint,
+        script_key: SerializedKey,
+        block_height: u32,
+    ) -> Self {
+        OwnedAsset {
+            asset_id,
+            amount,
+            anchor_outpoint,
+            script_key,
+            spent: false,
+            block_height,
+            script_key_desc: None,
+            internal_key: None,
+            genesis_tag: None,
+            genesis_meta_hash: None,
+            genesis_output_index: None,
+            genesis_asset_type: None,
+        }
+    }
 }
 
 /// A record of a completed asset burn.
@@ -146,17 +189,53 @@ mod tests {
     use super::*;
 
     fn test_asset(id_byte: u8, amount: u64, vout: u32) -> OwnedAsset {
-        OwnedAsset {
-            asset_id: AssetId([id_byte; 32]),
+        OwnedAsset::new(
+            AssetId([id_byte; 32]),
             amount,
-            anchor_outpoint: OutPoint {
+            OutPoint {
                 txid: [0xAA; 32],
                 vout,
             },
-            script_key: SerializedKey([0x02; 33]),
-            spent: false,
-            block_height: 800_000,
-        }
+            SerializedKey([0x02; 33]),
+            800_000,
+        )
+    }
+
+    /// An asset with all optional key descriptor and genesis fields set.
+    fn test_asset_full(vout: u32) -> OwnedAsset {
+        let mut asset = test_asset(0xAA, 100, vout);
+        asset.script_key_desc = Some(KeyDescriptor {
+            family: 212,
+            index: 7,
+            pub_key: SerializedKey([0x02; 33]),
+        });
+        asset.internal_key = Some(KeyDescriptor {
+            family: 212,
+            index: 8,
+            pub_key: SerializedKey([0x03; 33]),
+        });
+        asset.genesis_tag = Some("test-coin".to_string());
+        asset.genesis_meta_hash = Some([0x44; 32]);
+        asset.genesis_output_index = Some(1);
+        asset.genesis_asset_type = Some(AssetType::Normal);
+        asset
+    }
+
+    #[test]
+    fn test_asset_optional_fields_round_trip() {
+        let mut store = MemoryAssetStore::new();
+        let full = test_asset_full(0);
+        store.insert_asset(full.clone()).unwrap();
+
+        // Bare asset (all optional fields None) alongside.
+        let bare = test_asset(0xAA, 50, 1);
+        store.insert_asset(bare.clone()).unwrap();
+
+        let mut assets = store.get_unspent(&AssetId([0xAA; 32]));
+        assets.sort_by_key(|a| a.anchor_outpoint.vout);
+        assert_eq!(assets.len(), 2);
+        assert_eq!(assets[0], full);
+        assert_eq!(assets[1], bare);
     }
 
     #[test]

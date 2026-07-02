@@ -125,19 +125,19 @@ impl MailboxStore for MemoryMailboxStore {
 /// as structured columns (for querying) and as the encoded bech32m
 /// string (the source of truth for round-tripping).
 #[cfg(feature = "sqlite")]
-pub struct SqliteMailboxStore<'a> {
-    db: &'a crate::sqlite::SqliteDb,
+pub struct SqliteMailboxStore {
+    db: std::sync::Arc<crate::sqlite::SqliteDb>,
 }
 
 #[cfg(feature = "sqlite")]
-impl<'a> SqliteMailboxStore<'a> {
-    pub fn new(db: &'a crate::sqlite::SqliteDb) -> Self {
+impl SqliteMailboxStore {
+    pub fn new(db: std::sync::Arc<crate::sqlite::SqliteDb>) -> Self {
         SqliteMailboxStore { db }
     }
 }
 
 #[cfg(feature = "sqlite")]
-impl MailboxStore for SqliteMailboxStore<'_> {
+impl MailboxStore for SqliteMailboxStore {
     fn insert_address(&mut self, addr: &TapAddress) -> Result<(), String> {
         let encoded = addr.encode().map_err(|e| e.to_string())?;
         let conn = self.db.conn.lock().map_err(|e| e.to_string())?;
@@ -251,6 +251,7 @@ impl MailboxStore for SqliteMailboxStore<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::collections::BTreeMap;
     use tap_primitives::address::{AddressVersion, TapNetwork};
     use tap_primitives::asset::AssetId;
@@ -323,8 +324,8 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn test_sqlite_mailbox_store() {
-        let db = crate::sqlite::SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteMailboxStore::new(&db);
+        let db = Arc::new(crate::sqlite::SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteMailboxStore::new(Arc::clone(&db));
         exercise_store(&mut store);
     }
 }
