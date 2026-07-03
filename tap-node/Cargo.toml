@@ -16,3 +16,7 @@ bitcoin_hashes = { version = "0.14", default-features = false, features = ["std"
 [features]
 default = ["sqlite"]
 sqlite = ["tap-persist/sqlite"]
+# Enables Postgres-backed default stores: setting `db_url` to a
+# postgres:// URL in TapNodeConfig selects tap-persist's PostgresDb
+# (where `db_path` selects SQLite).
+postgres = ["tap-persist/postgres"]

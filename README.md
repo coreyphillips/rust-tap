@@ -18,7 +18,7 @@ On-chain functionality is testnet-ready. Lightning asset channel integration is 
 | Address V0/V1/V2 + authmailbox courier client (ECIES) | Complete; gRPC mailbox transport is a follow-up |
 | Universe sync (diff-based MS-SMT federation, verified inserts) | Complete |
 | Universe server (`tap-server`, tapd-compatible REST) | Complete -- rust-tap to rust-tap federation proven; gRPC follow-up for tapd-native sync |
-| SQLite + in-memory persistence | Complete (8 migrations) |
+| SQLite, PostgreSQL (feature `postgres`) + in-memory persistence | Complete (11 migrations, shared trait-test suite across backends) |
 | TLV wire encoding (Go `tapd`-compatible) | Complete, byte-exact against Go vectors |
 | Node lifecycle (mint/send/confirmation watching via `tick()` or background thread) | Complete |
 | LDK integration (channels, HTLC signing, cooperative/force close) | Data structures and signing at Go wire parity; live channel flow blocked on rust-lightning extension points (see `tap-ldk/docs/ldk-fork-requirements.md`) |
@@ -74,7 +74,7 @@ taproot-ldk/
 ├── tap-primitives/       Core protocol: MS-SMT, assets, commitments, VM, proofs, crypto, encoding
 ├── tap-onchain/          On-chain pipelines: minting, transfers, PSBT, proof courier
 ├── tap-ldk/              LDK integration (in progress): channels, RFQ, routing, wire messages
-├── tap-persist/          Storage traits + in-memory and SQLite backends
+├── tap-persist/          Storage traits + in-memory, SQLite, and PostgreSQL backends
 ├── tap-universe/         Universe sync: decentralized asset discovery and federation
 ├── tap-node/             High-level node: builder pattern, managed lifecycle, simple API
 └── examples/quickstart/  Interactive CLI wallet for testnet experimentation

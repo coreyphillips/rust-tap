@@ -31,7 +31,7 @@
 //! i.e. no pagination limit), so neither do we.
 
 use std::collections::HashMap;
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 use std::collections::{HashSet, VecDeque};
 #[cfg(feature = "sqlite")]
 use std::sync::Mutex;
@@ -70,21 +70,28 @@ pub trait IgnoreTupleStore {
 }
 
 /// Negative-cache key: an asset point hash scoped by its group key.
-#[cfg(feature = "sqlite")]
-type NegativeCacheKey = ([u8; 33], [u8; 32]);
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) type NegativeCacheKey = ([u8; 33], [u8; 32]);
+
+/// Default capacity of the negative cache, mirroring Go's
+/// `DefaultNegativeLookupCacheSize`
+/// (tapdb/supply_ignore_checker.go:23). Shared by the SQLite and
+/// Postgres ignore stores.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) const DEFAULT_NEGATIVE_CACHE_SIZE: usize = 10_000;
 
 /// A bounded set of group-scoped asset-point hashes known NOT to be
 /// ignored.
-#[cfg(feature = "sqlite")]
-struct NegativeCache {
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) struct NegativeCache {
     set: HashSet<NegativeCacheKey>,
     order: VecDeque<NegativeCacheKey>,
     capacity: usize,
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 impl NegativeCache {
-    fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         NegativeCache {
             set: HashSet::new(),
             order: VecDeque::new(),
@@ -92,11 +99,11 @@ impl NegativeCache {
         }
     }
 
-    fn contains(&self, key: &NegativeCacheKey) -> bool {
+    pub(crate) fn contains(&self, key: &NegativeCacheKey) -> bool {
         self.set.contains(key)
     }
 
-    fn insert(&mut self, key: NegativeCacheKey) {
+    pub(crate) fn insert(&mut self, key: NegativeCacheKey) {
         if self.capacity == 0 || self.set.contains(&key) {
             return;
         }
@@ -111,7 +118,7 @@ impl NegativeCache {
         self.order.push_back(key);
     }
 
-    fn remove(&mut self, key: &NegativeCacheKey) {
+    pub(crate) fn remove(&mut self, key: &NegativeCacheKey) {
         if self.set.remove(key) {
             self.order.retain(|k| k != key);
         }
@@ -262,7 +269,7 @@ mod sqlite_impl {
     /// Default capacity of the negative cache, mirroring Go's
     /// `DefaultNegativeLookupCacheSize`
     /// (tapdb/supply_ignore_checker.go:23).
-    pub(super) const DEFAULT_NEGATIVE_CACHE_SIZE: usize = 10_000;
+    pub(super) use super::DEFAULT_NEGATIVE_CACHE_SIZE;
 
     /// SQLite-backed [`IgnoreTupleStore`] with a bounded negative
     /// cache for `is_ignored` lookups.

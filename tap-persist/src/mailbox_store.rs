@@ -390,109 +390,12 @@ fn key_desc_from_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "sqlite")]
     use std::sync::Arc;
-    use std::collections::BTreeMap;
-    use tap_primitives::address::{AddressVersion, TapNetwork};
-    use tap_primitives::asset::AssetId;
 
-    fn test_address(script_key_byte: u8) -> TapAddress {
-        // Address decode validates keys on-curve (like Go), so the
-        // test keys must be valid points: x = 0xAA repeated is a valid
-        // x coordinate.
-        let mut internal_key = [0xAA; 33];
-        internal_key[0] = 0x02;
-        TapAddress {
-            version: AddressVersion::V2,
-            asset_version: 0,
-            asset_id: Some(AssetId([0xAA; 32])),
-            script_key: SerializedKey([script_key_byte; 33]),
-            internal_key: SerializedKey(internal_key),
-            amount: 1000,
-            network: TapNetwork::Regtest,
-            proof_courier_addr: Some(
-                "authmailbox+universerpc://foo.bar:10029".to_string(),
-            ),
-            group_key: None,
-            tapscript_sibling: None,
-            unknown_odd_types: BTreeMap::new(),
-        }
-    }
-
-    fn exercise_store(store: &mut dyn MailboxStore) {
-        let addr = test_address(0x02);
-        store.insert_address(&addr).unwrap();
-
-        // Duplicate script keys are rejected.
-        assert!(store.insert_address(&addr).is_err());
-
-        let listed = store.list_addresses().unwrap();
-        assert_eq!(listed, vec![addr.clone()]);
-
-        let found = store
-            .address_by_script_key(&addr.script_key)
-            .unwrap()
-            .unwrap();
-        assert_eq!(found, addr);
-        assert!(store
-            .address_by_script_key(&SerializedKey([0x05; 33]))
-            .unwrap()
-            .is_none());
-
-        // Cursors default to zero, then upsert.
-        let key = addr.script_key;
-        assert_eq!(
-            store.get_cursor(&key).unwrap(),
-            MailboxCursor::default()
-        );
-        let cursor = MailboxCursor {
-            last_message_id: 42,
-            last_block: 800_000,
-        };
-        store.set_cursor(&key, cursor).unwrap();
-        assert_eq!(store.get_cursor(&key).unwrap(), cursor);
-
-        let cursor2 = MailboxCursor {
-            last_message_id: 43,
-            last_block: 800_001,
-        };
-        store.set_cursor(&key, cursor2).unwrap();
-        assert_eq!(store.get_cursor(&key).unwrap(), cursor2);
-
-        // Key descriptors: none stored yet.
-        assert!(store.key_descriptors(&key).unwrap().is_none());
-
-        // Store descriptors whose raw keys differ from the address
-        // keys (the tweaked-script-key case) and read them back.
-        let script_desc = KeyDescriptor {
-            family: 212,
-            index: 5,
-            pub_key: SerializedKey([0x02; 33]),
-        };
-        let internal_desc = KeyDescriptor {
-            family: 212,
-            index: 6,
-            pub_key: SerializedKey([0x03; 33]),
-        };
-        store
-            .set_key_descriptors(&key, &script_desc, &internal_desc)
-            .unwrap();
-        let (s, i) = store.key_descriptors(&key).unwrap().unwrap();
-        assert_eq!(s, script_desc);
-        assert_eq!(i, internal_desc);
-
-        // Setting descriptors for an unknown address fails.
-        assert!(store
-            .set_key_descriptors(
-                &SerializedKey([0x05; 33]),
-                &script_desc,
-                &internal_desc,
-            )
-            .is_err());
-        assert!(store
-            .key_descriptors(&SerializedKey([0x05; 33]))
-            .unwrap()
-            .is_none());
-    }
+    // The shared per-trait exercise lives in the testkit so the same
+    // scenario also runs against the Postgres backend.
+    use crate::testkit::exercise_mailbox_store as exercise_store;
 
     #[test]
     fn test_memory_mailbox_store() {

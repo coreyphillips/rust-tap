@@ -18,8 +18,14 @@ use tap_primitives::address::TapNetwork;
 pub struct TapNodeConfig {
     /// Network (mainnet, testnet, regtest, simnet, testnet4).
     pub network: TapNetwork,
-    /// SQLite database path. `None` uses in-memory storage.
+    /// SQLite database path. `None` uses in-memory storage (unless
+    /// `db_url` selects another backend).
     pub db_path: Option<PathBuf>,
+    /// Database connection URL for the default stores. Currently only
+    /// `postgres://` (or `postgresql://`) URLs are supported and
+    /// require the `postgres` feature. `db_path` takes precedence when
+    /// both are set; when neither is set, storage is in-memory.
+    pub db_url: Option<String>,
     /// Default proof courier URL.
     pub courier_url: String,
     /// Universe federation server addresses.
@@ -52,6 +58,7 @@ impl Default for TapNodeConfig {
         TapNodeConfig {
             network: TapNetwork::Regtest,
             db_path: None,
+            db_url: None,
             courier_url: String::new(),
             universe_servers: vec![],
             universe_sync_interval_secs: 600,
