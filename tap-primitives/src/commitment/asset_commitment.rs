@@ -95,7 +95,7 @@ impl AssetCommitment {
                 asset.script_key.serialized(),
                 asset.group_key.is_some(),
             );
-            let leaf = asset_leaf(asset);
+            let leaf = asset_leaf(asset)?;
             tree.insert(key, leaf)
                 .map_err(|e| CommitmentError::TreeError(format!("{}", e)))?;
 
@@ -172,8 +172,12 @@ impl AssetCommitment {
 /// - V1 assets: encoding without witnesses (segwit style)
 ///
 /// The leaf sum is the asset's amount.
-pub fn asset_leaf(asset: &Asset) -> LeafNode {
+///
+/// Errors on unknown asset versions, mirroring Go's `Asset.Leaf()`
+/// (asset/asset.go:2169).
+pub fn asset_leaf(asset: &Asset) -> Result<LeafNode, CommitmentError> {
     crate::encoding::asset::asset_to_leaf(asset)
+        .map_err(|e| CommitmentError::UnknownAssetVersion(e.to_string()))
 }
 
 /// Errors from commitment operations.
@@ -189,6 +193,9 @@ pub enum CommitmentError {
     /// An alt leaf collides with another new or already committed alt
     /// leaf (Go's `asset.ErrDuplicateAltLeafKey`).
     DuplicateAltLeafKey([u8; 32]),
+    /// A leaf was requested for an asset with an unknown version
+    /// (Go's `asset.ErrUnknownVersion` in `Asset.Leaf()`).
+    UnknownAssetVersion(String),
 }
 
 impl std::fmt::Display for CommitmentError {
@@ -216,6 +223,9 @@ impl std::fmt::Display for CommitmentError {
                     "duplicate alt leaf key: {}",
                     crate::hex::encode(key)
                 )
+            }
+            CommitmentError::UnknownAssetVersion(msg) => {
+                write!(f, "unknown asset version: {}", msg)
             }
         }
     }

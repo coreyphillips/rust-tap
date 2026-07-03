@@ -543,7 +543,8 @@ impl TransferBuilder {
         // `PrevID`s, so inserting the real input `PrevID`s here would
         // make `split_commitment_root` (and the signature over it)
         // diverge from Go for every split send.
-        let root_leaf = asset_leaf(&root_spend_template(&root_asset));
+        let root_leaf = asset_leaf(&root_spend_template(&root_asset))
+            .map_err(|e| SendError::SplitError(e.to_string()))?;
         split_tree
             .insert(root_locator.hash(), root_leaf)
             .map_err(|e| SendError::SplitError(e.to_string()))?;
@@ -556,7 +557,8 @@ impl TransferBuilder {
                 script_key: *split.asset.script_key.serialized(),
                 amount: split.asset.amount,
             };
-            let leaf = asset_leaf(&split.asset);
+            let leaf = asset_leaf(&split.asset)
+                .map_err(|e| SendError::SplitError(e.to_string()))?;
             split_tree
                 .insert(locator.hash(), leaf)
                 .map_err(|e| SendError::SplitError(e.to_string()))?;
@@ -818,7 +820,7 @@ mod tests {
             script_key: *result.root_asset.script_key.serialized(),
             amount: result.root_asset.amount,
         };
-        tree.insert(root_locator.hash(), asset_leaf(&template))
+        tree.insert(root_locator.hash(), asset_leaf(&template).unwrap())
             .unwrap();
 
         for split in &result.recipient_assets {
@@ -832,7 +834,7 @@ mod tests {
             if let Some(w) = leaf_asset.prev_witnesses.first_mut() {
                 w.split_commitment = None;
             }
-            tree.insert(locator.hash(), asset_leaf(&leaf_asset))
+            tree.insert(locator.hash(), asset_leaf(&leaf_asset).unwrap())
                 .unwrap();
         }
 
@@ -849,7 +851,7 @@ mod tests {
         let mut real_root = result.root_asset.clone();
         real_root.split_commitment_root = None;
         wrong_tree
-            .insert(root_locator.hash(), asset_leaf(&real_root))
+            .insert(root_locator.hash(), asset_leaf(&real_root).unwrap())
             .unwrap();
         for split in &result.recipient_assets {
             let locator = SplitLocator {
@@ -863,7 +865,7 @@ mod tests {
                 w.split_commitment = None;
             }
             wrong_tree
-                .insert(locator.hash(), asset_leaf(&leaf_asset))
+                .insert(locator.hash(), asset_leaf(&leaf_asset).unwrap())
                 .unwrap();
         }
         let wrong = wrong_tree.root().unwrap();

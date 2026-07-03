@@ -569,7 +569,7 @@ fn build_and_register_proof(
     let asset_id = genesis.id();
     let has_group = false;
     let ack = asset_commitment_key(&asset_id, &script_key, has_group);
-    let leaf = asset_leaf(&asset);
+    let leaf = asset_leaf(&asset).map_err(|e| format!("asset leaf: {}", e))?;
 
     // Inner tree (AssetCommitment).
     let mut inner_tree = FullTree::new(DefaultStore::new());

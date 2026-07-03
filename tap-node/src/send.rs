@@ -322,14 +322,10 @@ where
     txid_display.reverse();
 
     // Locate the change and recipient outputs in the final transaction
-    // by their scripts (the funding wallet may reorder outputs).
-    let (change_script, _) =
-        tap_onchain::psbt::commitment::create_tap_output_script(
-            &change_internal_x_only,
-            result.prepared.change_commitment.commitment(),
-            None,
-        )
-        .map_err(|e| TapNodeError::Storage(format!("tap output: {}", e)))?;
+    // by their scripts (the funding wallet may reorder outputs). A
+    // full-value send has no change TAP output at all: the anchor
+    // template carries only the recipient commitment (any BTC change
+    // the wallet added is a plain output).
     let (recipient_script, _) =
         tap_onchain::psbt::commitment::create_tap_output_script(
             &recipient_internal_x_only,
@@ -337,14 +333,6 @@ where
             None,
         )
         .map_err(|e| TapNodeError::Storage(format!("tap output: {}", e)))?;
-
-    let change_vout = anchor_tx
-        .output
-        .iter()
-        .position(|o| o.script_pubkey == change_script)
-        .ok_or(TapNodeError::Storage(
-            "change TAP output missing from signed transaction".into(),
-        ))? as u32;
     let recipient_vout = anchor_tx
         .output
         .iter()
@@ -352,15 +340,38 @@ where
         .ok_or(TapNodeError::Storage(
             "recipient TAP output missing from signed transaction".into(),
         ))? as u32;
-
-    let change_outpoint = OutPoint {
-        txid: txid_internal,
-        vout: change_vout,
-    };
     let recipient_outpoint = OutPoint {
         txid: txid_internal,
         vout: recipient_vout,
     };
+
+    let change_vout = if result.prepared.is_split {
+        let (change_script, _) =
+            tap_onchain::psbt::commitment::create_tap_output_script(
+                &change_internal_x_only,
+                result.prepared.change_commitment.commitment(),
+                None,
+            )
+            .map_err(|e| {
+                TapNodeError::Storage(format!("tap output: {}", e))
+            })?;
+        Some(
+            anchor_tx
+                .output
+                .iter()
+                .position(|o| o.script_pubkey == change_script)
+                .ok_or(TapNodeError::Storage(
+                    "change TAP output missing from signed transaction"
+                        .into(),
+                ))? as u32,
+        )
+    } else {
+        None
+    };
+    let change_outpoint = change_vout.map(|vout| OutPoint {
+        txid: txid_internal,
+        vout,
+    });
 
     // Step 6: Mark the spent inputs as spent, scoped to their exact
     // identity so sibling passive assets at the same anchor outpoint are
@@ -391,7 +402,7 @@ where
     // Step 7: Persist the change output as a new owned asset (never a
     // tombstone: zero-change splits use the un-spendable NUMS key).
     let has_change = result.prepared.is_split && change_amount > 0;
-    if has_change {
+    if let (true, Some(change_outpoint)) = (has_change, change_outpoint) {
         let mut owned = OwnedAsset::new(
             asset_id,
             change_amount,
@@ -416,8 +427,15 @@ where
     // Step 7b: Persist each re-anchored passive asset at the change
     // outpoint under its unchanged script key, so it stays spendable
     // (its stored descriptor + genesis fields let follow-up sends sign
-    // it). Its old identity was marked spent above.
+    // it). Its old identity was marked spent above. Passive assets
+    // force a split, so the change output always exists here.
     for work in &passive_work {
+        let change_outpoint = change_outpoint.ok_or_else(|| {
+            TapNodeError::Storage(
+                "passive assets present but no change output was created"
+                    .into(),
+            )
+        })?;
         let mut owned = OwnedAsset::new(
             work.owned.asset_id,
             work.owned.amount,
@@ -447,6 +465,15 @@ where
         .prepared
         .is_split
     {
+        let (change_vout, change_outpoint) =
+            match (change_vout, change_outpoint) {
+                (Some(vout), Some(outpoint)) => (vout, outpoint),
+                _ => {
+                    return Err(TapNodeError::Storage(
+                        "split transfer without a change output".into(),
+                    ))
+                }
+            };
         let asset_outputs = [
             OutputProofInfo {
                 asset: &result.prepared.root_asset,
@@ -536,12 +563,18 @@ where
 
         (recipient_suffix, change_suffix, passive_suffixes)
     } else {
-        // Full-value send with no passive assets: the root asset IS the
-        // recipient asset and there is no change to prove. The duplicate
-        // commitment placed in output 0 by the transfer template
-        // prevents exclusion proofs against it, so only the recipient
-        // output is listed. (A full-value send that carries passive
-        // assets is forced into the split branch above.)
+        // Full-value send with no passive assets: the root asset IS
+        // the recipient asset and there is no change to prove. The
+        // anchor template carries a single TAP-committed output (the
+        // recipient's), so exclusion proofs cover every other template
+        // output. (A full-value send that carries passive assets is
+        // forced into the split branch above.)
+        //
+        // NOTE: exclusion proofs for a P2TR BTC change output added by
+        // the funding wallet are still omitted, since its internal key
+        // is unknown to the node (documented limitation; Go adds a
+        // BIP-86 tapscript exclusion proof from the funding PSBT's
+        // derivation info).
         let asset_outputs = [OutputProofInfo {
             asset: &result.prepared.root_asset,
             anchor_output_index: recipient_vout,
@@ -589,7 +622,7 @@ where
             change_script_key: has_change.then(|| {
                 result.prepared.root_asset.script_key.pub_key
             }),
-            change_outpoint: has_change.then_some(change_outpoint),
+            change_outpoint: if has_change { change_outpoint } else { None },
             change_suffix,
             base_file,
             courier_url: recipient.proof_courier_addr.clone(),

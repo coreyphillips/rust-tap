@@ -28,9 +28,7 @@ use tap_primitives::asset::AssetId;
 use crate::channel::blobs::{ChannelBlob, CommitmentBlob};
 use crate::channel::traits::{AssetChannelError, AssetTrafficShaper};
 use crate::config::TapConfig;
-use crate::routing::{
-    compute_htlc_btc_amount, AssetHtlcData, DEFAULT_ON_CHAIN_HTLC_MSAT,
-};
+use crate::routing::{AssetHtlcData, DEFAULT_ON_CHAIN_HTLC_MSAT};
 use crate::rfq::{AcceptedQuote, QuoteManager, RfqError};
 use crate::wire::TapMessage;
 
@@ -311,6 +309,14 @@ where
     /// - asset HTLC without an RFQ ID
     /// - unknown or expired quote
     /// - rate conversion failure
+    /// - HTLC that would push the quote past its negotiated maximum
+    ///   amount, cumulatively across in-flight HTLCs (Go
+    ///   `CheckHtlcCompliance`, rfq/order.go)
+    ///
+    /// Forwarded asset HTLCs count against the quote's maximum until
+    /// they are resolved; call [`Self::handle_htlc_resolved`] when the
+    /// HTLC settles or fails to release the tracked amount (Go
+    /// `TrackAcceptedHtlc` / `UntrackHtlc`, rfq/order.go).
     ///
     /// Non-asset HTLCs are forwarded unchanged.
     pub fn handle_intercepted_htlc(
@@ -356,13 +362,20 @@ where
             }
         };
 
+        // The msat value of the assets carried by the HTLC. This is
+        // the amount counted against the quote's negotiated maximum
+        // (Go compares `htlc.AmountOutMsat`, rfq/order.go) and, once
+        // clamped to the on-chain minimum, the amount forwarded (same
+        // clamp as `compute_htlc_btc_amount`).
         let asset_amount = asset_data.sum_balances();
-        let adjusted_amt = if asset_amount == 0 {
-            // No asset units in the HTLC: nothing to convert; use the
-            // minimum on-chain amount.
-            DEFAULT_ON_CHAIN_HTLC_MSAT
+        let value_msat = if asset_amount == 0 {
+            // No asset units in the HTLC: nothing to convert.
+            0
         } else {
-            match compute_htlc_btc_amount(asset_amount, &quote) {
+            match crate::rfq::math::units_to_milli_satoshi(
+                asset_amount,
+                &quote.rate,
+            ) {
                 Ok(amt) => amt,
                 Err(e) => {
                     self.ldk.fail_intercepted_htlc(intercept_id)?;
@@ -373,13 +386,48 @@ where
                 }
             }
         };
+        let adjusted_amt = value_msat.max(DEFAULT_ON_CHAIN_HTLC_MSAT);
 
-        self.ldk.forward_intercepted_htlc(
+        // Enforce the quote's maximum amount cumulatively across
+        // in-flight HTLCs (Go `CheckHtlcCompliance`, rfq/order.go).
+        // The amount is tracked under the same lock so concurrent
+        // HTLCs cannot jointly exceed the cap; it is released again on
+        // resolution via [`Self::handle_htlc_resolved`], or below if
+        // the forward fails.
+        {
+            let mut rfq = self.rfq.lock().unwrap();
+            if let Err(e) = rfq.check_htlc_amount(&rfq_id, value_msat) {
+                drop(rfq);
+                self.ldk.fail_intercepted_htlc(intercept_id)?;
+                return Err(format!(
+                    "asset HTLC exceeds quote max amount: {}",
+                    e
+                ));
+            }
+            rfq.track_accepted_htlc(rfq_id, intercept_id, value_msat);
+        }
+
+        let result = self.ldk.forward_intercepted_htlc(
             intercept_id,
             next_hop_scid,
             next_node_id,
             adjusted_amt,
-        )
+        );
+        if result.is_err() {
+            self.rfq.lock().unwrap().untrack_htlc(&intercept_id);
+        }
+        result
+    }
+
+    /// Releases an intercepted HTLC's contribution to its quote's
+    /// cumulative maximum amount once the HTLC is resolved, whether
+    /// settled or failed.
+    ///
+    /// Mirrors Go's `UntrackHtlc` calls from the HTLC settle and fail
+    /// event handlers (rfq/order.go). Unknown intercept IDs are
+    /// ignored, so this is safe to call for every resolved HTLC.
+    pub fn handle_htlc_resolved(&self, intercept_id: [u8; 32]) {
+        self.rfq.lock().unwrap().untrack_htlc(&intercept_id);
     }
 
     /// Prunes expired RFQ quotes and timed-out pending requests.
@@ -867,6 +915,131 @@ mod tests {
         );
         assert!(res.is_err());
         assert_eq!(mgr.ldk.failed.lock().unwrap().len(), 1);
+    }
+
+    /// Builds asset HTLC custom TLVs carrying `amount` units of asset
+    /// 0xAA locked to the given quote.
+    fn asset_tlvs(
+        rfq_id: crate::wire::messages::RfqId,
+        amount: u64,
+    ) -> Vec<(u64, Vec<u8>)> {
+        AssetHtlcData {
+            balances: vec![AssetBalance {
+                asset_id: AssetId([0xAA; 32]),
+                amount,
+            }],
+            rfq_id: Some(rfq_id),
+        }
+        .to_custom_tlvs()
+    }
+
+    #[test]
+    fn test_handle_intercepted_htlc_at_quote_max_passes() {
+        let mgr = TapChannelManager::new(MockLdk::new(), MockOracle);
+        // Quote cap: 10,000 units at 5000 msat/unit = 50,000,000 msat.
+        let rfq_id = store_quote(&mgr, 0xAA);
+
+        // 10,000 units lands exactly on the cap and is forwarded.
+        mgr.handle_intercepted_htlc(
+            [0x10; 32],
+            999,
+            [0x02; 33],
+            50_000,
+            &asset_tlvs(rfq_id, 10_000),
+            NOW,
+        )
+        .unwrap();
+
+        let fwd = mgr.ldk.forwarded.lock().unwrap();
+        assert_eq!(fwd.len(), 1);
+        assert_eq!(fwd[0].1, 50_000_000);
+        assert!(mgr.ldk.failed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_handle_intercepted_htlc_over_quote_max_fails() {
+        let mgr = TapChannelManager::new(MockLdk::new(), MockOracle);
+        let rfq_id = store_quote(&mgr, 0xAA);
+
+        // 10,001 units exceed the 10,000-unit (50M msat) cap by one
+        // unit and the HTLC is failed back.
+        let res = mgr.handle_intercepted_htlc(
+            [0x11; 32],
+            999,
+            [0x02; 33],
+            50_000,
+            &asset_tlvs(rfq_id, 10_001),
+            NOW,
+        );
+        assert!(res.unwrap_err().contains("max amount"));
+        assert!(mgr.ldk.forwarded.lock().unwrap().is_empty());
+        assert_eq!(mgr.ldk.failed.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_handle_intercepted_htlc_cumulative_quote_max() {
+        let mgr = TapChannelManager::new(MockLdk::new(), MockOracle);
+        let rfq_id = store_quote(&mgr, 0xAA);
+
+        // Two HTLCs of 6,000 units (30M msat) each against the 50M
+        // msat cap: the first fits, the second would sum to 60M msat
+        // and is failed back (Go's cumulative CurrentAmountMsat
+        // check).
+        mgr.handle_intercepted_htlc(
+            [0x12; 32],
+            999,
+            [0x02; 33],
+            50_000,
+            &asset_tlvs(rfq_id, 6_000),
+            NOW,
+        )
+        .unwrap();
+
+        let res = mgr.handle_intercepted_htlc(
+            [0x13; 32],
+            999,
+            [0x02; 33],
+            50_000,
+            &asset_tlvs(rfq_id, 6_000),
+            NOW,
+        );
+        assert!(res.unwrap_err().contains("max amount"));
+        assert_eq!(mgr.ldk.forwarded.lock().unwrap().len(), 1);
+        assert_eq!(mgr.ldk.failed.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_htlc_resolution_releases_quote_amount() {
+        let mgr = TapChannelManager::new(MockLdk::new(), MockOracle);
+        let rfq_id = store_quote(&mgr, 0xAA);
+
+        mgr.handle_intercepted_htlc(
+            [0x14; 32],
+            999,
+            [0x02; 33],
+            50_000,
+            &asset_tlvs(rfq_id, 6_000),
+            NOW,
+        )
+        .unwrap();
+
+        // Once the first HTLC resolves (settled or failed), its 30M
+        // msat is released and a second 6,000-unit HTLC fits again
+        // (Go UntrackHtlc on HTLC resolution).
+        mgr.handle_htlc_resolved([0x14; 32]);
+
+        mgr.handle_intercepted_htlc(
+            [0x15; 32],
+            999,
+            [0x02; 33],
+            50_000,
+            &asset_tlvs(rfq_id, 6_000),
+            NOW,
+        )
+        .unwrap();
+
+        assert_eq!(mgr.ldk.forwarded.lock().unwrap().len(), 2);
+        assert!(mgr.ldk.failed.lock().unwrap().is_empty());
     }
 
     #[test]

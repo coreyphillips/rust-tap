@@ -63,7 +63,8 @@ pub fn populate_split_proofs(
     // `commitment.NewSplitCommitment`, which never re-inserts the
     // real-witness root asset into the tree.
     let root_leaf =
-        asset_leaf(&super::transfer::root_spend_template(&prepared.root_asset));
+        asset_leaf(&super::transfer::root_spend_template(&prepared.root_asset))
+            .map_err(|e| SendError::SplitError(e.to_string()))?;
     tree.insert(root_locator.hash(), root_leaf)
         .map_err(|e| SendError::SplitError(e.to_string()))?;
 
@@ -79,7 +80,8 @@ pub fn populate_split_proofs(
         if let Some(witness) = split_no_witness.prev_witnesses.first_mut() {
             witness.split_commitment = None;
         }
-        let leaf = asset_leaf(&split_no_witness);
+        let leaf = asset_leaf(&split_no_witness)
+            .map_err(|e| SendError::SplitError(e.to_string()))?;
         tree.insert(locator.hash(), leaf)
             .map_err(|e| SendError::SplitError(e.to_string()))?;
     }
@@ -215,7 +217,7 @@ mod tests {
         // Reconstruct the leaf as it was in the tree (without split commitment).
         let mut asset_without_sc = split.asset.clone();
         asset_without_sc.prev_witnesses[0].split_commitment = None;
-        let leaf = asset_leaf(&asset_without_sc);
+        let leaf = asset_leaf(&asset_without_sc).unwrap();
 
         let (root_hash, root_sum) =
             prepared.root_asset.split_commitment_root.unwrap();

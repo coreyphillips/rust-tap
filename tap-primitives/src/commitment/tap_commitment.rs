@@ -195,25 +195,27 @@ impl TapCommitment {
 
     /// Checks if the given bytes look like a TAP commitment script.
     ///
-    /// Checks for the presence of the marker (V0/V1) or tag (V2) at the
-    /// expected offset. The script must be exactly 73 bytes, matching
-    /// Go's `IsTaprootAssetCommitmentScript`.
+    /// The script must be exactly 73 bytes. Mirrors Go's
+    /// `IsTaprootAssetCommitmentScript` (commitment/tap.go:432) exactly:
+    /// the check switches on the leading version byte first, so a script
+    /// whose first byte is neither `TapCommitmentV0` nor `TapCommitmentV1`
+    /// is only accepted if it starts with the V2 tag, and a script whose
+    /// first byte IS a V0/V1 version byte is only accepted if the V0/V1
+    /// marker follows it. Checking marker and tag independent of the
+    /// version byte would falsely accept crafted 73-byte scripts.
     pub fn is_tap_commitment_script(script: &[u8]) -> bool {
         if script.len() != 73 {
             return false;
         }
 
-        // V0/V1: marker at offset 1.
-        if script[1..33] == *TAPROOT_ASSETS_MARKER {
-            return true;
-        }
+        match script[0] {
+            // V0 and V1 commitment scripts use the legacy TapLeaf
+            // format: version(1) || marker(32) || ...
+            0 | 1 => script[1..33] == *TAPROOT_ASSETS_MARKER,
 
-        // V2: tag at offset 0.
-        if script[0..32] == *TAPROOT_ASSETS_V2_TAG {
-            return true;
+            // Everything else must use the V2 format: tag(32) || ...
+            _ => script[0..32] == *TAPROOT_ASSETS_V2_TAG,
         }
-
-        false
     }
 }
 
@@ -325,5 +327,34 @@ mod tests {
     fn test_not_tap_commitment_script() {
         assert!(!TapCommitment::is_tap_commitment_script(&[0u8; 73]));
         assert!(!TapCommitment::is_tap_commitment_script(&[0u8; 10]));
+    }
+
+    #[test]
+    fn test_crafted_script_marker_with_bad_version_byte() {
+        // A crafted 73-byte script that carries the V0/V1 marker at
+        // offset 1 but has a version byte that is neither 0 nor 1. Go
+        // falls through to the V2 branch (which requires the tag at
+        // offset 0) and rejects it; so must we.
+        let mut script = [0u8; 73];
+        script[0] = 0x05;
+        script[1..33].copy_from_slice(&*TAPROOT_ASSETS_MARKER);
+        assert!(!TapCommitment::is_tap_commitment_script(&script));
+
+        // The same script with a valid V0/V1 version byte is accepted.
+        script[0] = 0x00;
+        assert!(TapCommitment::is_tap_commitment_script(&script));
+        script[0] = 0x01;
+        assert!(TapCommitment::is_tap_commitment_script(&script));
+    }
+
+    #[test]
+    fn test_crafted_script_v0_version_byte_requires_marker() {
+        // A script starting with a V0/V1 version byte must carry the
+        // marker at offset 1; the V2 tag branch is not consulted for
+        // these version bytes (mirrors Go's switch semantics).
+        let mut script = [0u8; 73];
+        script[0] = 0x00;
+        script[1..32].copy_from_slice(&TAPROOT_ASSETS_V2_TAG[1..32]);
+        assert!(!TapCommitment::is_tap_commitment_script(&script));
     }
 }

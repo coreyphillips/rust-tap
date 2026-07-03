@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 use tap_primitives::asset::AssetId;
 
+use super::math::units_to_milli_satoshi;
 use super::FixedPoint;
 use crate::wire::compat::RejectCode;
 use crate::wire::messages::RfqId;
@@ -37,6 +38,14 @@ pub enum RfqError {
     QuoteNotFound(RfqId),
     /// Quote has expired.
     QuoteExpired { id: RfqId, expiry: u64, now: u64 },
+    /// The HTLC would push the quote past its negotiated maximum
+    /// amount (Go `CheckHtlcCompliance` in `rfq/order.go`).
+    QuoteAmountExceeded {
+        id: RfqId,
+        current_msat: u64,
+        htlc_msat: u64,
+        max_msat: u64,
+    },
     /// No pending outgoing request found for the given ID.
     RequestNotFound(RfqId),
     /// The response came from a different peer than the request was
@@ -65,6 +74,19 @@ impl std::fmt::Display for RfqError {
                     f,
                     "quote {:?} expired: expiry={}, now={}",
                     id, expiry, now
+                )
+            }
+            RfqError::QuoteAmountExceeded {
+                id,
+                current_msat,
+                htlc_msat,
+                max_msat,
+            } => {
+                write!(
+                    f,
+                    "quote {:?} max amount exceeded: current {} msat + \
+                     htlc {} msat > max {} msat",
+                    id, current_msat, htlc_msat, max_msat
                 )
             }
             RfqError::RequestNotFound(id) => {
@@ -144,6 +166,15 @@ pub struct AcceptedQuote {
     pub peer: [u8; 33],
     /// Whether this is a buy (true) or sell (false) from our perspective.
     pub is_buy: bool,
+    /// The negotiated maximum amount, in msat, that may be held in
+    /// accepted HTLCs against this quote at any one time.
+    ///
+    /// Mirrors Go's per-policy caps: `MaxOutboundAssetAmount`
+    /// (converted to msat at the quote's rate) for quotes answering a
+    /// buy request, and `PaymentMaxAmt` for quotes answering a sell
+    /// request (`AssetSalePolicy` / `AssetPurchasePolicy` in
+    /// `rfq/order.go`).
+    pub max_amount_msat: u64,
 }
 
 impl AcceptedQuote {
@@ -173,6 +204,27 @@ pub struct PendingRequest {
 /// Maximum number of pending quotes allowed per peer.
 pub const MAX_PENDING_QUOTES_PER_PEER: usize = 100;
 
+/// Converts an asset-unit maximum to a msat cap at the given rate (Go
+/// converts `MaxOutboundAssetAmount` with `rfqmath.UnitsToMilliSatoshi`
+/// in `AssetSalePolicy.CheckHtlcCompliance`, rfq/order.go).
+///
+/// Go performs this conversion at HTLC compliance check time and fails
+/// every HTLC when it errors; a zero cap reproduces that behavior for
+/// any HTLC carrying value.
+fn unit_max_to_msat_cap(max_units: u64, rate: &FixedPoint) -> u64 {
+    units_to_milli_satoshi(max_units, rate).unwrap_or(0)
+}
+
+/// Applies an optional accepted-fill amount to the requested maximum,
+/// taking the smaller of the two (Go `AcceptedMaxAmount` handling in
+/// `NewAssetSalePolicy` / `NewAssetPurchasePolicy`, rfq/order.go).
+fn effective_max(requested_max: u64, accepted_fill: Option<u64>) -> u64 {
+    match accepted_fill {
+        Some(fill) => fill.min(requested_max),
+        None => requested_max,
+    }
+}
+
 /// Manages RFQ quotes for asset channel payments.
 pub struct QuoteManager<P: PriceOracle> {
     oracle: P,
@@ -186,6 +238,13 @@ pub struct QuoteManager<P: PriceOracle> {
     max_quotes_per_peer: usize,
     /// Optional signer for outgoing accept messages.
     signer: Option<Box<dyn AcceptSigner>>,
+    /// In-flight accepted HTLC amounts in msat, keyed by HTLC ID, with
+    /// the quote they count against (Go's per-policy `htlcToAmt` map
+    /// plus the order handler's `htlcToPolicy` index, rfq/order.go).
+    tracked_htlcs: HashMap<[u8; 32], (RfqId, u64)>,
+    /// Cumulative msat currently held in accepted HTLCs per quote (Go
+    /// `CurrentAmountMsat`, rfq/order.go).
+    quote_used_msat: HashMap<RfqId, u64>,
 }
 
 impl<P: PriceOracle> QuoteManager<P> {
@@ -198,6 +257,8 @@ impl<P: PriceOracle> QuoteManager<P> {
             pending_requests: HashMap::new(),
             max_quotes_per_peer: MAX_PENDING_QUOTES_PER_PEER,
             signer: None,
+            tracked_htlcs: HashMap::new(),
+            quote_used_msat: HashMap::new(),
         }
     }
 
@@ -370,6 +431,13 @@ impl<P: PriceOracle> QuoteManager<P> {
                 }
 
                 // Store the accepted quote (the peer buys, we sell).
+                // The cap is the requested max asset amount, limited by
+                // any accepted fill and converted to msat (Go
+                // AssetSalePolicy, rfq/order.go).
+                let max_units = effective_max(
+                    request.asset_max_amount,
+                    accept.max_in_asset,
+                );
                 self.sell_quotes.insert(
                     request.id,
                     AcceptedQuote {
@@ -379,6 +447,9 @@ impl<P: PriceOracle> QuoteManager<P> {
                         expiry,
                         peer,
                         is_buy: false,
+                        max_amount_msat: unit_max_to_msat_cap(
+                            max_units, &rate,
+                        ),
                     },
                 );
 
@@ -434,6 +505,9 @@ impl<P: PriceOracle> QuoteManager<P> {
                 }
 
                 // Store the accepted quote (the peer sells, we buy).
+                // The cap is the requested max BTC payment in msat,
+                // limited by any accepted fill (Go AssetPurchasePolicy
+                // `PaymentMaxAmt`, rfq/order.go).
                 self.buy_quotes.insert(
                     request.id,
                     AcceptedQuote {
@@ -443,6 +517,10 @@ impl<P: PriceOracle> QuoteManager<P> {
                         expiry,
                         peer,
                         is_buy: true,
+                        max_amount_msat: effective_max(
+                            request.payment_max_amt_msat,
+                            accept.max_in_asset,
+                        ),
                     },
                 );
 
@@ -488,6 +566,11 @@ impl<P: PriceOracle> QuoteManager<P> {
             });
         }
 
+        // Our buy request's max is in asset units; the peer may lower
+        // it via an accepted fill. Convert to a msat cap at the quote
+        // rate (Go AssetSalePolicy max handling, rfq/order.go).
+        let max_units =
+            effective_max(pending.max_amount, accept.max_in_asset);
         let quote = AcceptedQuote {
             id: accept.id,
             asset_id: pending.asset_id,
@@ -495,6 +578,10 @@ impl<P: PriceOracle> QuoteManager<P> {
             expiry: accept.expiry,
             peer,
             is_buy: true,
+            max_amount_msat: unit_max_to_msat_cap(
+                max_units,
+                &accept.asset_rate,
+            ),
         };
         self.pending_requests.remove(&accept.id);
         self.buy_quotes.insert(accept.id, quote.clone());
@@ -538,6 +625,13 @@ impl<P: PriceOracle> QuoteManager<P> {
             expiry: accept.expiry,
             peer,
             is_buy: false,
+            // Our sell request's max is already in msat (Go
+            // `PaymentMaxAmt`, rfq/order.go), possibly lowered by an
+            // accepted fill.
+            max_amount_msat: effective_max(
+                pending.max_amount,
+                accept.max_in_asset,
+            ),
         };
         self.pending_requests.remove(&accept.id);
         self.sell_quotes.insert(accept.id, quote.clone());
@@ -575,6 +669,74 @@ impl<P: PriceOracle> QuoteManager<P> {
             .or_else(|| self.sell_quotes.get(id))
     }
 
+    /// Returns the msat total currently held in accepted HTLCs against
+    /// the given quote (Go `CurrentAmountMsat`, rfq/order.go).
+    pub fn quote_used_msat(&self, id: &RfqId) -> u64 {
+        self.quote_used_msat.get(id).copied().unwrap_or(0)
+    }
+
+    /// Checks that adding an HTLC of `amt_msat` would not push the
+    /// quote past its negotiated maximum amount, cumulatively across
+    /// in-flight accepted HTLCs.
+    ///
+    /// Mirrors Go's `CheckHtlcCompliance` cap check, which compares
+    /// `CurrentAmountMsat + htlc.AmountOutMsat` against the policy
+    /// maximum (rfq/order.go). An HTLC that lands exactly on the cap
+    /// is allowed.
+    pub fn check_htlc_amount(
+        &self,
+        id: &RfqId,
+        amt_msat: u64,
+    ) -> Result<(), RfqError> {
+        let quote =
+            self.get_quote(id).ok_or(RfqError::QuoteNotFound(*id))?;
+        let current = self.quote_used_msat(id);
+        if current.saturating_add(amt_msat) > quote.max_amount_msat {
+            return Err(RfqError::QuoteAmountExceeded {
+                id: *id,
+                current_msat: current,
+                htlc_msat: amt_msat,
+                max_msat: quote.max_amount_msat,
+            });
+        }
+        Ok(())
+    }
+
+    /// Accounts for a newly accepted HTLC against a quote; this may
+    /// affect the acceptance of future HTLCs (Go `TrackAcceptedHtlc`,
+    /// rfq/order.go).
+    pub fn track_accepted_htlc(
+        &mut self,
+        quote_id: RfqId,
+        htlc_id: [u8; 32],
+        amt_msat: u64,
+    ) {
+        // Drop any stale entry for the same HTLC ID first so the used
+        // total never double-counts.
+        self.untrack_htlc(&htlc_id);
+        self.tracked_htlcs.insert(htlc_id, (quote_id, amt_msat));
+        let used = self.quote_used_msat.entry(quote_id).or_insert(0);
+        *used = used.saturating_add(amt_msat);
+    }
+
+    /// Stops tracking the uniquely identified HTLC, releasing its
+    /// amount from the quote's cumulative total. Called when the HTLC
+    /// is resolved, whether settled or failed (Go `UntrackHtlc`,
+    /// rfq/order.go). Unknown HTLC IDs are ignored.
+    pub fn untrack_htlc(&mut self, htlc_id: &[u8; 32]) {
+        let (quote_id, amt_msat) = match self.tracked_htlcs.remove(htlc_id)
+        {
+            Some(entry) => entry,
+            None => return,
+        };
+        if let Some(used) = self.quote_used_msat.get_mut(&quote_id) {
+            *used = used.saturating_sub(amt_msat);
+            if *used == 0 {
+                self.quote_used_msat.remove(&quote_id);
+            }
+        }
+    }
+
     /// Returns all accepted buy quotes.
     pub fn buy_quotes(&self) -> &HashMap<RfqId, AcceptedQuote> {
         &self.buy_quotes
@@ -585,12 +747,25 @@ impl<P: PriceOracle> QuoteManager<P> {
         &self.sell_quotes
     }
 
-    /// Removes expired quotes and timed-out pending requests.
+    /// Removes expired quotes and timed-out pending requests, along
+    /// with any HTLC amount tracking for quotes that no longer exist
+    /// (Go drops the tracking together with the policy).
     pub fn prune_expired(&mut self, now: u64) {
         self.buy_quotes.retain(|_, q| q.is_valid(now));
         self.sell_quotes.retain(|_, q| q.is_valid(now));
         self.pending_requests.retain(|_, p| {
             now < p.created_at + DEFAULT_QUOTE_LIFETIME_SECS
+        });
+
+        let buy_quotes = &self.buy_quotes;
+        let sell_quotes = &self.sell_quotes;
+        self.tracked_htlcs.retain(|_, (quote_id, _)| {
+            buy_quotes.contains_key(quote_id)
+                || sell_quotes.contains_key(quote_id)
+        });
+        self.quote_used_msat.retain(|quote_id, _| {
+            buy_quotes.contains_key(quote_id)
+                || sell_quotes.contains_key(quote_id)
         });
     }
 }
@@ -816,6 +991,129 @@ mod tests {
 
         mgr.prune_expired(NOW + DEFAULT_QUOTE_LIFETIME_SECS);
         assert!(mgr.get_pending_request(&out.id).is_none());
+    }
+
+    #[test]
+    fn test_quote_max_amount_msat_from_requests() {
+        let mut mgr = QuoteManager::new(MockOracle);
+
+        // Buy request: 10,000 units at the ask rate of 20M units/BTC
+        // (5000 msat/unit) = 50,000,000 msat cap.
+        let buy = RfqBuyRequest {
+            id: make_id(1),
+            asset_id: AssetId([0xAA; 32]),
+            asset_max_amount: 10_000,
+            asset_group_key: None,
+            expiry: NOW + 600,
+            rate_hint: None,
+        };
+        mgr.handle_buy_request(&buy, PEER, NOW, 600).unwrap();
+        assert_eq!(
+            mgr.get_quote(&make_id(1)).unwrap().max_amount_msat,
+            50_000_000
+        );
+
+        // Sell request: the cap is the max payment msat, unchanged.
+        let sell = RfqSellRequest {
+            id: make_id(2),
+            asset_id: AssetId([0xBB; 32]),
+            payment_max_amt_msat: 123_456,
+            asset_group_key: None,
+            expiry: NOW + 600,
+            rate_hint: None,
+        };
+        mgr.handle_sell_request(&sell, PEER, NOW, 600).unwrap();
+        assert_eq!(
+            mgr.get_quote(&make_id(2)).unwrap().max_amount_msat,
+            123_456
+        );
+    }
+
+    #[test]
+    fn test_buy_accept_max_amount_uses_accepted_fill() {
+        let mut mgr = QuoteManager::new(MockOracle);
+        let req =
+            mgr.create_buy_request(AssetId([0xCC; 32]), 1000, PEER, NOW);
+
+        let accept = RfqBuyAccept {
+            id: req.id,
+            asset_rate: FixedPoint::new(20_000_000, 0),
+            expiry: NOW + 600,
+            sig: [0; 64],
+            max_in_asset: Some(400),
+        };
+        let quote = mgr.handle_buy_accept(&accept, PEER, NOW).unwrap();
+        // min(1000, 400) = 400 units at 5000 msat/unit.
+        assert_eq!(quote.max_amount_msat, 2_000_000);
+    }
+
+    #[test]
+    fn test_check_track_untrack_htlc_amounts() {
+        let mut mgr = QuoteManager::new(MockOracle);
+        let id = make_id(7);
+        let req = RfqBuyRequest {
+            id,
+            asset_id: AssetId([0xAA; 32]),
+            asset_max_amount: 10_000,
+            asset_group_key: None,
+            expiry: NOW + 600,
+            rate_hint: None,
+        };
+        // Cap: 10,000 units * 5000 msat/unit = 50,000,000 msat.
+        mgr.handle_buy_request(&req, PEER, NOW, 600).unwrap();
+
+        // Unknown quote.
+        assert!(matches!(
+            mgr.check_htlc_amount(&make_id(9), 1),
+            Err(RfqError::QuoteNotFound(_))
+        ));
+
+        // Exactly at the cap passes; one msat over fails.
+        assert!(mgr.check_htlc_amount(&id, 50_000_000).is_ok());
+        assert!(matches!(
+            mgr.check_htlc_amount(&id, 50_000_001),
+            Err(RfqError::QuoteAmountExceeded { .. })
+        ));
+
+        // After tracking 30M msat, only 20M msat headroom remains.
+        mgr.track_accepted_htlc(id, [0x01; 32], 30_000_000);
+        assert_eq!(mgr.quote_used_msat(&id), 30_000_000);
+        assert!(mgr.check_htlc_amount(&id, 20_000_000).is_ok());
+        assert!(matches!(
+            mgr.check_htlc_amount(&id, 20_000_001),
+            Err(RfqError::QuoteAmountExceeded { .. })
+        ));
+
+        // Resolution (settle or fail) releases the tracked amount.
+        mgr.untrack_htlc(&[0x01; 32]);
+        assert_eq!(mgr.quote_used_msat(&id), 0);
+        assert!(mgr.check_htlc_amount(&id, 50_000_000).is_ok());
+
+        // Unknown HTLC IDs are ignored.
+        mgr.untrack_htlc(&[0x0F; 32]);
+        assert_eq!(mgr.quote_used_msat(&id), 0);
+    }
+
+    #[test]
+    fn test_prune_expired_drops_htlc_tracking() {
+        let mut mgr = QuoteManager::new(MockOracle);
+        let id = make_id(8);
+        let req = RfqBuyRequest {
+            id,
+            asset_id: AssetId([0xAA; 32]),
+            asset_max_amount: 10_000,
+            asset_group_key: None,
+            expiry: NOW + 100,
+            rate_hint: None,
+        };
+        mgr.handle_buy_request(&req, PEER, NOW, 100).unwrap();
+        mgr.track_accepted_htlc(id, [0x01; 32], 1_000);
+        assert_eq!(mgr.quote_used_msat(&id), 1_000);
+
+        // Pruning the expired quote drops its HTLC tracking too.
+        mgr.prune_expired(NOW + 101);
+        assert!(mgr.get_quote(&id).is_none());
+        assert_eq!(mgr.quote_used_msat(&id), 0);
     }
 
     #[test]

@@ -21,7 +21,8 @@
 //! - `GET/POST /v1/taproot-assets/universe/proofs/asset-id/{id}/{txid}/{vout}/{script_key}`
 //!   (GET queries, POST inserts; txid in display order)
 //! - `POST /v1/taproot-assets/universe/proofs/query/{id}/{proof_type}`
-//!   (the query path `HttpUniverseClient` uses; leaf key in the body)
+//!   (the query path `HttpUniverseClient` uses; leaf key in the body,
+//!   txid in display order, matching tapd)
 //! - `GET  /v1/taproot-assets/universe/info`
 //!
 //! Handlers run the synchronous [`UniverseService`] methods on the
@@ -412,8 +413,11 @@ async fn post_proof(
 /// POST /v1/taproot-assets/universe/proofs/query/{id}/{proof_type}
 ///
 /// The proof query path `HttpUniverseClient::query_proof_leaf` uses;
-/// the leaf key is carried in the body (txid in internal byte order,
-/// see the `json` module docs).
+/// the leaf key is carried in the body with the txid in display byte
+/// order, matching tapd (see the `json` module docs). For backward
+/// compatibility with older rust-tap clients that sent the txid in
+/// internal byte order, a failed lookup is retried with the txid
+/// reversed.
 async fn post_query_proof(
     State(service): State<UniverseService>,
     Path((id, proof_type)): Path<(String, String)>,
@@ -426,7 +430,16 @@ async fn post_query_proof(
 
     let selector = UniverseSelector::Asset(asset_id);
     let found = run_blocking(move || {
-        service.query_proof(&selector, proof_type, &key)
+        match service.query_proof(&selector, proof_type, &key)? {
+            Some(found) => Ok(Some(found)),
+            None => {
+                // Backward compatibility: older rust-tap clients sent
+                // the txid in internal byte order. Retry reversed.
+                let mut legacy_key = key.clone();
+                legacy_key.outpoint.txid.reverse();
+                service.query_proof(&selector, proof_type, &legacy_key)
+            }
+        }
     })
     .await?;
 

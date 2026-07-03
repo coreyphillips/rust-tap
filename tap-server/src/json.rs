@@ -27,13 +27,14 @@
 //!   as decimal strings, matching protojson.
 //! - Proof types use the RPC enum strings `PROOF_TYPE_ISSUANCE` and
 //!   `PROOF_TYPE_TRANSFER`.
-//! - Outpoint txids in *served* `AssetKey.op.hash_str` fields are in
-//!   display order (reversed), matching tapd. Divergence: the txid in
-//!   the *received* `POST proofs/query` body (`leaf_key.op.hash_str`)
-//!   is interpreted in internal byte order, because that is what
-//!   `HttpUniverseClient::query_proof_leaf` sends (it hex encodes the
-//!   internal txid without reversing). tapd would expect display
-//!   order there.
+//! - Outpoint txids in `AssetKey.op.hash_str` fields are in display
+//!   order (reversed from internal), matching tapd, both when served
+//!   and when received in the `POST proofs/query` body
+//!   (`leaf_key.op.hash_str`); tapd parses that field with
+//!   `chainhash.NewHashFromStr`, which takes display order. For
+//!   backward compatibility with older rust-tap clients that sent the
+//!   txid in internal byte order, the query handler retries a failed
+//!   lookup with the reversed txid (see `rest::post_query_proof`).
 //! - `ID.group_key_str` is served as the full 33-byte compressed key
 //!   (hex) to preserve parity; tapd serves the 32-byte x-only key.
 //!   `HttpUniverseClient` accepts both. Incoming group keys may be
@@ -349,8 +350,9 @@ pub fn parse_insert_proof_body(body: &Value) -> Result<Vec<u8>, String> {
 /// "script_key_str"}}`), the shape sent by
 /// `HttpUniverseClient::query_proof_leaf`.
 ///
-/// Divergence from tapd: `op.hash_str` is interpreted in internal
-/// (non-display) byte order; see the module docs.
+/// `op.hash_str` is interpreted in display byte order (reversed into
+/// internal order), matching tapd's `chainhash.NewHashFromStr`; see
+/// the module docs.
 pub fn parse_query_proof_body(body: &Value) -> Result<LeafKey, String> {
     use tap_primitives::asset::{OutPoint, SerializedKey};
 
@@ -362,7 +364,9 @@ pub fn parse_query_proof_body(body: &Value) -> Result<LeafKey, String> {
         .get("hash_str")
         .and_then(|h| h.as_str())
         .ok_or_else(|| "request missing leaf_key.op.hash_str".to_string())?;
-    let txid: [u8; 32] = decode_bytes_array(hash_str)?;
+    let mut txid: [u8; 32] = decode_bytes_array(hash_str)?;
+    // Display order -> internal order.
+    txid.reverse();
 
     let vout = match op.get("index") {
         Some(Value::Number(n)) => n.as_u64().unwrap_or(0) as u32,
@@ -462,7 +466,9 @@ mod tests {
     #[test]
     fn test_parse_query_proof_body_roundtrip() {
         // The exact body shape HttpUniverseClient::query_proof_leaf
-        // sends: internal-order txid hex, hex script key.
+        // sends: display-order txid hex, hex script key.
+        let mut display_txid = [0u8; 32];
+        display_txid[0] = 0xAA; // display order: internal txid ends 0xAA
         let body = json!({
             "id": {
                 "asset_id_str": "11".repeat(32),
@@ -470,14 +476,16 @@ mod tests {
             },
             "leaf_key": {
                 "op": {
-                    "hash_str": "ab".repeat(32),
+                    "hash_str": hex_encode(&display_txid),
                     "index": 4
                 },
                 "script_key_str": "02".repeat(33)
             }
         });
         let key = parse_query_proof_body(&body).expect("parse");
-        assert_eq!(key.outpoint.txid, [0xAB; 32]);
+        // Display order -> internal order: display[0] = internal[31].
+        assert_eq!(key.outpoint.txid[31], 0xAA);
+        assert_eq!(key.outpoint.txid[0], 0x00);
         assert_eq!(key.outpoint.vout, 4);
         assert_eq!(key.script_key, SerializedKey([0x02; 33]));
     }

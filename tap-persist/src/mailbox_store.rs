@@ -257,12 +257,17 @@ mod tests {
     use tap_primitives::asset::AssetId;
 
     fn test_address(script_key_byte: u8) -> TapAddress {
+        // Address decode validates keys on-curve (like Go), so the
+        // test keys must be valid points: x = 0xAA repeated is a valid
+        // x coordinate.
+        let mut internal_key = [0xAA; 33];
+        internal_key[0] = 0x02;
         TapAddress {
             version: AddressVersion::V2,
             asset_version: 0,
             asset_id: Some(AssetId([0xAA; 32])),
             script_key: SerializedKey([script_key_byte; 33]),
-            internal_key: SerializedKey([0x03; 33]),
+            internal_key: SerializedKey(internal_key),
             amount: 1000,
             network: TapNetwork::Regtest,
             proof_courier_addr: Some(

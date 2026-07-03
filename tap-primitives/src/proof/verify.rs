@@ -400,7 +400,8 @@ fn derive_by_asset_inclusion(
         asset.script_key.serialized(),
         asset.group_key.is_some(),
     );
-    let leaf = crate::commitment::asset_leaf(asset);
+    let leaf = crate::commitment::asset_leaf(asset)
+        .map_err(|e| verify_err(e.to_string()))?;
 
     // The asset commitment is rebuilt from the proof's own tap key
     // (Go's AssetCommitment{TapKey: p.AssetProof.TapKey}).

@@ -248,7 +248,7 @@ async fn query_proof_post_endpoint() {
     let (app, id, key, leaf) = app_with_genesis_leaf();
 
     // The exact body HttpUniverseClient::query_proof_leaf sends:
-    // internal-order txid hex in leaf_key.op.hash_str.
+    // display-order txid hex in leaf_key.op.hash_str, matching tapd.
     let body = json!({
         "id": {
             "asset_id_str": hex(id.asset_id.as_bytes()),
@@ -256,7 +256,7 @@ async fn query_proof_post_endpoint() {
         },
         "leaf_key": {
             "op": {
-                "hash_str": hex(&key.outpoint.txid),
+                "hash_str": display_txid_hex(&key),
                 "index": key.outpoint.vout
             },
             "script_key_str": hex(key.script_key.as_bytes())
@@ -279,6 +279,26 @@ async fn query_proof_post_endpoint() {
             .pointer("/asset_leaf/asset/amount")
             .and_then(|v| v.as_str()),
         Some(leaf.amount.to_string().as_str())
+    );
+
+    // Backward compatibility: older rust-tap clients sent the txid in
+    // internal byte order; the server retries the reversed txid.
+    let legacy_body = json!({
+        "leaf_key": {
+            "op": {
+                "hash_str": hex(&key.outpoint.txid),
+                "index": key.outpoint.vout
+            },
+            "script_key_str": hex(key.script_key.as_bytes())
+        }
+    });
+    let (status, response) = post(&app, &uri, &legacy_body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        response
+            .pointer("/asset_leaf/proof")
+            .and_then(|v| v.as_str()),
+        Some(hex(&leaf.proof).as_str())
     );
 
     // Unknown leaf key: 404 so the client maps it to None.

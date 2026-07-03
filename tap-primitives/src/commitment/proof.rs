@@ -421,7 +421,7 @@ mod tests {
         );
 
         // Build inner tree and get proof.
-        let leaf = asset_leaf(&asset);
+        let leaf = asset_leaf(&asset).unwrap();
         let mut inner_tree = FullTree::new(DefaultStore::new());
         inner_tree.insert(ack, leaf.clone()).unwrap();
         let inner_proof = inner_tree.merkle_proof(ack).unwrap();

@@ -497,3 +497,179 @@ fn tampered_split_proof_fails() {
         .verify(Some(&prev_snapshot), &ctx(), &opts)
         .expect_err("tampered proof must fail");
 }
+
+#[test]
+fn full_value_transfer_proof_verifies_with_complete_exclusions() {
+    // Full-value send (no split, no passives): the anchor template
+    // carries a SINGLE TAP-committed output - the recipient's - like
+    // Go's interactive full-value send (one vOutput, BTC change is a
+    // plain wallet output). The recipient proof must verify with
+    // exclusion proofs covering every other anchor output.
+    let secp = Secp256k1::new();
+    let (owner_kp, owner_key) = keypair(0x81);
+    let (_, recipient_key) = keypair(0x82);
+    let (internal0_kp, _) = keypair(0x91);
+    let (internal1_kp, internal1_key) = keypair(0x92);
+    let (btc_kp, btc_key) = keypair(0xA1);
+
+    let genesis = Genesis {
+        first_prev_out: OutPoint {
+            txid: [0x68; 32],
+            vout: 1,
+        },
+        tag: "full-value-roundtrip".to_string(),
+        meta_hash: [0u8; 32],
+        output_index: 0,
+        asset_type: AssetType::Normal,
+    };
+
+    let prev_anchor = OutPoint {
+        txid: [0xBE; 32],
+        vout: 0,
+    };
+    let prev_asset = Asset {
+        version: AssetVersion::V0,
+        genesis: genesis.clone(),
+        amount: 100,
+        lock_time: 0,
+        relative_lock_time: 0,
+        prev_witnesses: vec![Witness {
+            prev_id: Some(PrevId::ZERO),
+            tx_witness: vec![],
+            split_commitment: None,
+        }],
+        split_commitment_root: None,
+        script_version: ScriptVersion::V0,
+        script_key: ScriptKey::from_pub_key(owner_key),
+        group_key: None,
+        unknown_odd_types: std::collections::BTreeMap::new(),
+    };
+    let prev_id = PrevId {
+        out_point: prev_anchor.clone(),
+        id: genesis.id(),
+        script_key: owner_key,
+    };
+
+    let inputs = vec![SelectedInput {
+        prev_id: prev_id.clone(),
+        anchor_point: prev_anchor.clone(),
+        amount: 100,
+        asset_type: AssetType::Normal,
+        script_key: ScriptKey::from_pub_key(owner_key),
+    }];
+    let outputs = vec![TransferOutput {
+        output_index: 0,
+        amount: 100,
+        script_key: ScriptKey::from_pub_key(recipient_key),
+        asset_version: AssetVersion::V0,
+        interactive: true,
+    }];
+
+    let mut prev_assets = InputSet::new();
+    prev_assets.insert(prev_id, prev_asset.clone());
+
+    let result = execute_transfer_with_version(
+        &inputs,
+        &outputs,
+        &genesis,
+        &prev_assets,
+        &TestSigner { keypair: owner_kp },
+        &[
+            internal0_kp.x_only_public_key().0,
+            internal1_kp.x_only_public_key().0,
+        ],
+        Some(TapCommitmentVersion::V2),
+    )
+    .expect("transfer pipeline");
+    let prepared = &result.prepared;
+    assert!(!prepared.is_split);
+
+    // Exactly one TAP-committed output in the template: no duplicate
+    // change commitment at index 0.
+    assert_eq!(result.template.tx.output.len(), 1);
+    assert_eq!(result.template.tap_outputs.len(), 1);
+
+    // The anchor transaction gains a plain BIP-86 P2TR wallet change
+    // output at index 1.
+    let mut anchor_tx = result.template.tx.clone();
+    anchor_tx.output.push(bitcoin::TxOut {
+        value: bitcoin::Amount::from_sat(5_000),
+        script_pubkey: bitcoin::ScriptBuf::new_p2tr(
+            &secp,
+            btc_kp.x_only_public_key().0,
+            None,
+        ),
+    });
+
+    let asset_outputs = vec![OutputProofInfo {
+        asset: &prepared.root_asset,
+        anchor_output_index: 0,
+        internal_key: internal1_key,
+        commitment: &prepared.output_commitments[0],
+        tapscript_sibling: None,
+    }];
+    let bip86_outputs = vec![Bip86Output {
+        output_index: 1,
+        internal_key: btc_key,
+    }];
+
+    let proof = create_proof_suffix(
+        &anchor_tx,
+        prev_anchor.clone(),
+        &asset_outputs,
+        0,
+        &bip86_outputs,
+    )
+    .expect("proof suffix");
+
+    // Complete exclusion coverage: every anchor output other than the
+    // inclusion output has an exclusion proof (here: the single BIP-86
+    // output).
+    assert_eq!(proof.exclusion_proofs.len(), 1);
+    let bip86_proof = &proof.exclusion_proofs[0];
+    assert_eq!(bip86_proof.output_index, 1);
+    assert!(bip86_proof
+        .tapscript_proof
+        .as_ref()
+        .map(|tp| tp.bip86)
+        .unwrap_or(false));
+    assert!(proof.split_root_proof.is_none());
+
+    let prev_snapshot = AssetSnapshot {
+        asset: prev_asset,
+        out_point: prev_anchor.clone(),
+        anchor_block_hash: [0u8; 32],
+        anchor_block_height: 0,
+        anchor_tx: AnchorTx::default(),
+        output_index: prev_anchor.vout,
+        internal_key: owner_key,
+        script_root: None,
+        tapscript_sibling: None,
+        split_asset: false,
+        meta_reveal: None,
+    };
+    let opts = ProofVerificationOptions {
+        challenge_bytes: None,
+        skip_chain_verification: true,
+        skip_time_lock_validation: false,
+    };
+
+    // Encode/decode round trip, then full verification.
+    let encoded = encode_proof(&proof);
+    let decoded = decode_proof(&encoded).expect("decode");
+    assert_eq!(encode_proof(&decoded), encoded);
+    let snapshot = decoded
+        .verify(Some(&prev_snapshot), &ctx(), &opts)
+        .expect("full-value recipient proof must verify");
+    assert_eq!(snapshot.output_index, 0);
+    assert_eq!(snapshot.asset.amount, 100);
+    assert!(!snapshot.split_asset);
+
+    // Dropping the BIP-86 exclusion proof breaks the complete coverage
+    // requirement: verification must fail.
+    let mut incomplete = decoded.clone();
+    incomplete.exclusion_proofs.clear();
+    incomplete
+        .verify(Some(&prev_snapshot), &ctx(), &opts)
+        .expect_err("proof without exclusion coverage must fail");
+}

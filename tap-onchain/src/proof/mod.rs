@@ -38,7 +38,6 @@ pub use suffix::{
     update_proof_chain_data, Bip86Output, OutputProofInfo,
     ProofSuffixOptions,
 };
-pub use transition::{
-    append_transition, generate_transition_proof, BaseProofParams,
-    TransitionProofParams,
-};
+#[allow(deprecated)]
+pub use transition::{append_transition, generate_transition_proof};
+pub use transition::{BaseProofParams, TransitionProofParams};

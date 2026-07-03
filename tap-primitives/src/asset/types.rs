@@ -164,6 +164,25 @@ impl SerializedKey {
     pub fn as_bytes(&self) -> &[u8; 33] {
         &self.0
     }
+
+    /// Validates that the key parses as a point on the secp256k1
+    /// curve, mirroring Go's decode-time `btcec.ParsePubKey` calls
+    /// (asset/encoding.go `CompressedPubKeyDecoder` /
+    /// `SerializedKeyDecoder`). Like Go, the all-zero key is accepted
+    /// as the "empty" key without parsing.
+    pub fn validate_on_curve(&self) -> Result<(), AssetError> {
+        if self.0 == [0u8; 33] {
+            return Ok(());
+        }
+        bitcoin::secp256k1::PublicKey::from_slice(&self.0)
+            .map(|_| ())
+            .map_err(|e| {
+                AssetError::InvalidKey(format!(
+                    "invalid compressed public key: {}",
+                    e
+                ))
+            })
+    }
 }
 
 impl std::fmt::Debug for SerializedKey {

@@ -541,7 +541,17 @@ impl TapAddress {
                     }
                     let mut key = [0u8; 33];
                     key.copy_from_slice(value);
-                    script_key = Some(SerializedKey(key));
+                    // Go's address script key record decodes with
+                    // compressedPubKeyDecoder (btcec.ParsePubKey),
+                    // rejecting off-curve keys at decode time.
+                    let key = SerializedKey(key);
+                    key.validate_on_curve().map_err(|e| {
+                        AddressError::InvalidPayload(format!(
+                            "script key: {}",
+                            e
+                        ))
+                    })?;
+                    script_key = Some(key);
                 }
                 tlv_types::INTERNAL_KEY => {
                     if len != 33 {
@@ -553,7 +563,16 @@ impl TapAddress {
                     }
                     let mut key = [0u8; 33];
                     key.copy_from_slice(value);
-                    internal_key = Some(SerializedKey(key));
+                    // Validated at decode time like Go (see script key
+                    // above).
+                    let key = SerializedKey(key);
+                    key.validate_on_curve().map_err(|e| {
+                        AddressError::InvalidPayload(format!(
+                            "internal key: {}",
+                            e
+                        ))
+                    })?;
+                    internal_key = Some(key);
                 }
                 tlv_types::AMOUNT => {
                     let (val, _) = decode_bigsize(value).map_err(
@@ -581,7 +600,17 @@ impl TapAddress {
                     }
                     let mut key = [0u8; 33];
                     key.copy_from_slice(value);
-                    group_key = Some(SerializedKey(key));
+                    // Validated at decode time like Go, which uses
+                    // asset.CompressedPubKeyDecoder for the address
+                    // group key record.
+                    let key = SerializedKey(key);
+                    key.validate_on_curve().map_err(|e| {
+                        AddressError::InvalidPayload(format!(
+                            "group key: {}",
+                            e
+                        ))
+                    })?;
+                    group_key = Some(key);
                 }
                 tlv_types::TAPSCRIPT_SIBLING => {
                     tapscript_sibling = Some(value.to_vec());
@@ -737,7 +766,7 @@ mod tests {
             asset_version: 0,
             asset_id: Some(AssetId([0xAA; 32])),
             script_key: SerializedKey([0x02; 33]),
-            internal_key: SerializedKey([0x03; 33]),
+            internal_key: SerializedKey({ let mut k = [0x22; 33]; k[0] = 0x03; k }),
             amount: 1000,
             network: TapNetwork::Regtest,
             proof_courier_addr: None,
@@ -828,11 +857,38 @@ mod tests {
     #[test]
     fn test_with_group_key() {
         let mut addr = test_address();
-        addr.group_key = Some(SerializedKey([0x03; 33]));
+        addr.group_key = Some(SerializedKey({ let mut k = [0x22; 33]; k[0] = 0x03; k }));
         let encoded = addr.encode().unwrap();
         let decoded = TapAddress::decode(&encoded).unwrap();
         assert_eq!(addr, decoded);
         assert!(decoded.group_key.is_some());
+    }
+
+    #[test]
+    fn test_decode_rejects_off_curve_keys() {
+        // A 33-byte key with a valid compressed prefix whose x
+        // coordinate (0x03 repeated) is not on the curve. Go's address
+        // decoders parse every key with btcec.ParsePubKey.
+        let off_curve = SerializedKey({
+            let mut k = [0x03; 33];
+            k[0] = 0x02;
+            k
+        });
+
+        let mut addr = test_address();
+        addr.script_key = off_curve;
+        let encoded = addr.encode().unwrap();
+        assert!(TapAddress::decode(&encoded).is_err());
+
+        let mut addr = test_address();
+        addr.internal_key = off_curve;
+        let encoded = addr.encode().unwrap();
+        assert!(TapAddress::decode(&encoded).is_err());
+
+        let mut addr = test_address();
+        addr.group_key = Some(off_curve);
+        let encoded = addr.encode().unwrap();
+        assert!(TapAddress::decode(&encoded).is_err());
     }
 
     #[test]
@@ -859,7 +915,7 @@ mod tests {
             asset_id: Some(AssetId([0xAA; 32])),
             group_key: None,
             script_key: SerializedKey([0x02; 33]),
-            internal_key: SerializedKey([0x03; 33]),
+            internal_key: SerializedKey({ let mut k = [0x22; 33]; k[0] = 0x03; k }),
             amount,
             asset_type,
             network: TapNetwork::Regtest,
@@ -1014,7 +1070,7 @@ mod tests {
         // address; here the ID is dropped from the encoding entirely.
         let mut params =
             test_params(AddressVersion::V2, AssetType::Normal, 100);
-        params.group_key = Some(SerializedKey([0x03; 33]));
+        params.group_key = Some(SerializedKey({ let mut k = [0x22; 33]; k[0] = 0x03; k }));
         let addr = new(params).unwrap();
         assert!(addr.asset_id.is_none());
         assert!(addr.group_key.is_some());

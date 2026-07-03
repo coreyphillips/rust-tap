@@ -18,6 +18,17 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 hkdf = { version = "0.12", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 getrandom = "0.2"
+# Full tapscript execution for script-path witness validation (Go runs
+# btcd's txscript engine; we run Bitcoin Core's libbitcoinconsensus).
+#
+# NOTE: this is deliberately a direct dependency instead of the bitcoin
+# crate's `bitcoinconsensus` feature: bitcoin 0.32 pins bitcoinconsensus
+# 0.105.0+25.1 (Core 25.1), which has no taproot support (no
+# VERIFY_TAPROOT flag and no spent-outputs API), and its safe wrapper
+# cannot pass the prevouts required by BIP-341 signature hashing.
+# bitcoinconsensus 0.106.0+26.0 (Core 26.0) adds
+# `verify_script_with_spent_outputs` + VERIFY_TAPROOT.
+bitcoinconsensus = { version = "0.106.0", optional = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
 base64 = "0.22"
@@ -27,8 +38,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [features]
-default = []
+# consensus-validation is on by default for Go parity: Go's VM always
+# executes script-path witnesses through the full txscript engine
+# (taproot-assets vm/vm.go validateWitnessV0).
+default = ["consensus-validation"]
 test-utils = []
+# Executes script-path (tapscript) witnesses with Bitcoin Core's
+# libbitcoinconsensus (builds the C++ sources; requires a C++
+# toolchain). Without this feature, script-path spends are rejected
+# with a clear error while key-path spends are verified natively.
+consensus-validation = ["dep:bitcoinconsensus"]
 
 # Enable test-utils for integration tests
 [dev-dependencies.tap-primitives]

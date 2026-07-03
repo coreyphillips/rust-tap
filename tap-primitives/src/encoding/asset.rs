@@ -239,22 +239,34 @@ pub fn encode_asset(asset: &Asset, encode_type: EncodeType) -> Vec<u8> {
 ///
 /// V0 assets: full encoding with witnesses.
 /// V1 assets: encoding without witnesses (segwit style).
-pub fn encode_asset_leaf(asset: &Asset) -> Vec<u8> {
+///
+/// Unknown versions are rejected, mirroring Go's `Asset.Leaf()`
+/// (asset/asset.go:2169), which errors with `ErrUnknownVersion` before
+/// building a leaf. Note that plain wire-format encode/decode of
+/// unknown versions is still accepted; only LEAF (and therefore
+/// commitment) construction fails.
+pub fn encode_asset_leaf(
+    asset: &Asset,
+) -> Result<Vec<u8>, crate::asset::AssetError> {
     match asset.version {
-        AssetVersion::V1 => encode_asset(asset, EncodeType::Segwit),
-        // V0 (and unknown versions, which Go rejects before leaf
-        // creation) use the full encoding.
-        _ => encode_asset(asset, EncodeType::Normal),
+        AssetVersion::V0 => Ok(encode_asset(asset, EncodeType::Normal)),
+        AssetVersion::V1 => Ok(encode_asset(asset, EncodeType::Segwit)),
+        AssetVersion::Unknown(v) => {
+            Err(crate::asset::AssetError::UnknownVersion(v))
+        }
     }
 }
 
 /// Creates an MS-SMT leaf node from an asset using proper TLV encoding.
 ///
-/// This replaces the placeholder `asset_leaf()` function. The leaf value
-/// is the TLV-encoded asset bytes, and the sum is the asset amount.
-pub fn asset_to_leaf(asset: &Asset) -> mssmt::LeafNode {
-    let encoded = encode_asset_leaf(asset);
-    mssmt::LeafNode::new(encoded, asset.amount)
+/// The leaf value is the TLV-encoded asset bytes, and the sum is the
+/// asset amount. Errors on unknown asset versions, mirroring Go's
+/// `Asset.Leaf()`.
+pub fn asset_to_leaf(
+    asset: &Asset,
+) -> Result<mssmt::LeafNode, crate::asset::AssetError> {
+    let encoded = encode_asset_leaf(asset)?;
+    Ok(mssmt::LeafNode::new(encoded, asset.amount))
 }
 
 /// Encodes an asset as an AltLeaf TLV stream.
@@ -418,10 +430,18 @@ fn decode_prev_id(data: &[u8]) -> Result<PrevId, TlvError> {
     let script_key: [u8; 33] =
         take(data, &mut offset, 33)?.try_into().unwrap();
 
+    // Go's PrevIDDecoder decodes the script key with
+    // SerializedKeyDecoder, which parses it with btcec.ParsePubKey
+    // (rejecting off-curve keys) before storing the raw bytes.
+    let script_key = SerializedKey(script_key);
+    script_key
+        .validate_on_curve()
+        .map_err(|e| decoding_err(format!("prev ID script key: {}", e)))?;
+
     Ok(PrevId {
         out_point: OutPoint { txid, vout },
         id: AssetId(id),
-        script_key: SerializedKey(script_key),
+        script_key,
     })
 }
 
@@ -647,8 +667,14 @@ pub fn decode_asset(data: &[u8]) -> Result<Asset, TlvError> {
                 expect_len(record, 33, "script key")?;
                 let key: [u8; 33] =
                     record.value[..].try_into().unwrap();
-                asset.script_key =
-                    ScriptKey::from_pub_key(SerializedKey(key));
+                // Go's leaf script key record uses
+                // CompressedPubKeyDecoder (btcec.ParsePubKey), which
+                // rejects off-curve keys at decode time.
+                let key = SerializedKey(key);
+                key.validate_on_curve().map_err(|e| {
+                    decoding_err(format!("script key: {}", e))
+                })?;
+                asset.script_key = ScriptKey::from_pub_key(key);
             }
             tlv_types::LEAF_GROUP_KEY => {
                 // The wire record only carries the tweaked group public
@@ -661,10 +687,17 @@ pub fn decode_asset(data: &[u8]) -> Result<Asset, TlvError> {
                 expect_len(record, 33, "group key")?;
                 let key: [u8; 33] =
                     record.value[..].try_into().unwrap();
+                // Go's GroupKeyDecoder parses the group public key
+                // with CompressedPubKeyDecoder (btcec.ParsePubKey),
+                // rejecting off-curve keys at decode time.
+                let key = SerializedKey(key);
+                key.validate_on_curve().map_err(|e| {
+                    decoding_err(format!("group key: {}", e))
+                })?;
                 asset.group_key = Some(GroupKey {
                     version: GroupKeyVersion::V0,
-                    raw_key: SerializedKey(key),
-                    group_pub_key: SerializedKey(key),
+                    raw_key: key,
+                    group_pub_key: key,
                     tapscript_root: Vec::new(),
                     witness: Vec::new(),
                 });
@@ -853,7 +886,7 @@ mod tests {
     fn test_asset_leaf_v0_includes_witnesses() {
         let asset = test_asset();
         assert_eq!(asset.version, AssetVersion::V0);
-        let leaf = asset_to_leaf(&asset);
+        let leaf = asset_to_leaf(&asset).unwrap();
         // The leaf value should contain witness data.
         let stream =
             super::super::tlv::TlvStream::decode(&leaf.value).unwrap();
@@ -866,7 +899,7 @@ mod tests {
         let mut asset = test_asset();
         asset.version = AssetVersion::V1;
         asset.prev_witnesses[0].tx_witness = vec![vec![0xcd; 64]];
-        let leaf = asset_to_leaf(&asset);
+        let leaf = asset_to_leaf(&asset).unwrap();
         let stream =
             super::super::tlv::TlvStream::decode(&leaf.value).unwrap();
         // V1 leaves keep the type-11 record (matching Go); only the raw
@@ -877,6 +910,97 @@ mod tests {
         assert_eq!(witnesses.len(), 1);
         assert!(witnesses[0].get(1).is_some(), "PrevID must be kept");
         assert!(witnesses[0].get(3).is_none(), "TxWitness must be stripped");
+    }
+
+    /// A 33-byte key with a valid compressed prefix whose x coordinate
+    /// (0x03 repeated) is not on the curve.
+    fn off_curve_key() -> [u8; 33] {
+        let mut k = [0x03; 33];
+        k[0] = 0x02;
+        k
+    }
+
+    #[test]
+    fn test_validate_on_curve() {
+        // Valid point accepted.
+        assert!(SerializedKey([0x02; 33]).validate_on_curve().is_ok());
+        // The all-zero "empty" key is accepted without parsing, like
+        // Go's CompressedPubKeyDecoder / SerializedKeyDecoder.
+        assert!(SerializedKey([0u8; 33]).validate_on_curve().is_ok());
+        // Off-curve x rejected.
+        assert!(SerializedKey(off_curve_key())
+            .validate_on_curve()
+            .is_err());
+        // Invalid prefix rejected.
+        assert!(SerializedKey([0xAA; 33]).validate_on_curve().is_err());
+    }
+
+    #[test]
+    fn test_decode_asset_rejects_off_curve_script_key() {
+        let mut asset = test_asset();
+        asset.script_key =
+            ScriptKey::from_pub_key(SerializedKey(off_curve_key()));
+        let encoded = encode_asset(&asset, EncodeType::Normal);
+        assert!(decode_asset(&encoded).is_err());
+
+        // The all-zero key still decodes (Go's empty-key special case).
+        asset.script_key =
+            ScriptKey::from_pub_key(SerializedKey([0u8; 33]));
+        let encoded = encode_asset(&asset, EncodeType::Normal);
+        assert!(decode_asset(&encoded).is_ok());
+    }
+
+    #[test]
+    fn test_decode_asset_rejects_off_curve_group_key() {
+        let mut asset = test_asset();
+        asset.group_key = Some(GroupKey {
+            version: GroupKeyVersion::V0,
+            raw_key: SerializedKey(off_curve_key()),
+            group_pub_key: SerializedKey(off_curve_key()),
+            tapscript_root: vec![],
+            witness: vec![],
+        });
+        let encoded = encode_asset(&asset, EncodeType::Normal);
+        assert!(decode_asset(&encoded).is_err());
+    }
+
+    #[test]
+    fn test_decode_witness_rejects_off_curve_prev_id_key() {
+        let mut asset = test_asset();
+        asset.prev_witnesses = vec![Witness {
+            prev_id: Some(PrevId {
+                out_point: OutPoint {
+                    txid: [0xAB; 32],
+                    vout: 0,
+                },
+                id: asset.genesis.id(),
+                script_key: SerializedKey(off_curve_key()),
+            }),
+            tx_witness: vec![],
+            split_commitment: None,
+        }];
+        let encoded = encode_asset(&asset, EncodeType::Normal);
+        assert!(decode_asset(&encoded).is_err());
+    }
+
+    #[test]
+    fn test_asset_leaf_unknown_version_errors() {
+        // Go's Asset.Leaf() (asset/asset.go:2169) rejects unknown asset
+        // versions with ErrUnknownVersion before building a leaf.
+        let mut asset = test_asset();
+        asset.version = AssetVersion::Unknown(7);
+        assert!(matches!(
+            encode_asset_leaf(&asset),
+            Err(crate::asset::AssetError::UnknownVersion(7))
+        ));
+        assert!(asset_to_leaf(&asset).is_err());
+
+        // Wire-format encode/decode of unknown versions must still be
+        // accepted (Go decodes them openly; only leaf construction
+        // errors).
+        let encoded = encode_asset(&asset, EncodeType::Normal);
+        let decoded = decode_asset(&encoded).unwrap();
+        assert_eq!(decoded.version, AssetVersion::Unknown(7));
     }
 
     #[test]
@@ -909,8 +1033,8 @@ mod tests {
         let mut asset = test_asset();
         asset.group_key = Some(crate::asset::GroupKey {
             version: crate::asset::GroupKeyVersion::V0,
-            raw_key: SerializedKey([0x03; 33]),
-            group_pub_key: SerializedKey([0x04; 33]),
+            raw_key: SerializedKey({ let mut k = [0x22; 33]; k[0] = 0x03; k }),
+            group_pub_key: SerializedKey({ let mut k = [0x33; 33]; k[0] = 0x02; k }),
             tapscript_root: vec![],
             witness: vec![],
         });
@@ -919,7 +1043,10 @@ mod tests {
         let stream = super::super::tlv::TlvStream::decode(&encoded).unwrap();
         let gk = stream.get(17).unwrap();
         assert_eq!(gk.value.len(), 33);
-        assert_eq!(gk.value[0], 0x04);
+        // The record carries the tweaked group public key, not the raw
+        // key.
+        assert_eq!(gk.value[0], 0x02);
+        assert_eq!(gk.value[1], 0x33);
     }
 
     #[test]
@@ -985,8 +1112,8 @@ mod tests {
         asset.relative_lock_time = 6;
         asset.group_key = Some(crate::asset::GroupKey {
             version: crate::asset::GroupKeyVersion::V0,
-            raw_key: SerializedKey([0x03; 33]),
-            group_pub_key: SerializedKey([0x03; 33]),
+            raw_key: SerializedKey({ let mut k = [0x22; 33]; k[0] = 0x03; k }),
+            group_pub_key: SerializedKey({ let mut k = [0x22; 33]; k[0] = 0x03; k }),
             tapscript_root: vec![],
             witness: vec![],
         });
@@ -998,7 +1125,7 @@ mod tests {
         assert_eq!(decoded.relative_lock_time, 6);
         assert_eq!(
             decoded.group_key.unwrap().group_pub_key,
-            SerializedKey([0x03; 33])
+            SerializedKey({ let mut k = [0x22; 33]; k[0] = 0x03; k })
         );
     }
 

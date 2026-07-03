@@ -410,6 +410,7 @@ mod tests {
             expiry: u64::MAX,
             peer: [0x02; 33],
             is_buy: true,
+            max_amount_msat: u64::MAX,
         }
     }
 

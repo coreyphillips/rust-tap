@@ -139,7 +139,12 @@ impl HttpUniverseClient {
         let asset_id_hex = hex_encode(asset_id.as_bytes());
         let proof_type_str = proof_type_rpc_str(proof_type)?;
 
-        let txid_hex = hex_encode(&outpoint.txid);
+        // tapd parses `leaf_key.op.hash_str` with
+        // `chainhash.NewHashFromStr`, which expects display order
+        // (reversed from internal), same as the insert path.
+        let mut txid_display = outpoint.txid;
+        txid_display.reverse();
+        let txid_hex = hex_encode(&txid_display);
         let script_key_hex = hex_encode(script_key.as_bytes());
 
         let body = serde_json::json!({

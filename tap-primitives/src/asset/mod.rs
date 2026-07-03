@@ -491,7 +491,7 @@ mod tests {
         let mut asset = Asset::new_genesis(
             genesis,
             50,
-            ScriptKey::from_pub_key(SerializedKey([0x03; 33])),
+            ScriptKey::from_pub_key(SerializedKey({ let mut k = [0x22; 33]; k[0] = 0x03; k })),
         );
         asset.prev_witnesses = vec![Witness {
             prev_id: Some(prev_id.clone()),
@@ -513,7 +513,7 @@ mod tests {
         let genesis_asset = Asset::new_genesis(
             test_genesis(),
             10,
-            ScriptKey::from_pub_key(SerializedKey([0x03; 33])),
+            ScriptKey::from_pub_key(SerializedKey({ let mut k = [0x22; 33]; k[0] = 0x03; k })),
         );
         assert!(collect_stxo(&genesis_asset).unwrap().is_empty());
     }
@@ -523,9 +523,17 @@ mod tests {
         use crate::encoding::asset::{decode_asset, encode_alt_leaf};
 
         // A plain STXO-style alt leaf, and one carrying witnesses (as
-        // used by asset channels).
+        // used by asset channels). The script keys must be valid curve
+        // points, since decode validates them like Go.
         let plain = test_alt_leaf(0x02);
-        let mut with_witness = test_alt_leaf(0x03);
+        let mut with_witness = Asset::new_alt_leaf(
+            ScriptKey::from_pub_key(SerializedKey({
+                let mut k = [0x22; 33];
+                k[0] = 0x03;
+                k
+            })),
+            ScriptVersion::V0,
+        );
         with_witness.prev_witnesses = vec![Witness {
             prev_id: Some(PrevId::ZERO),
             tx_witness: vec![vec![0x01, 0x02], vec![0x03]],
