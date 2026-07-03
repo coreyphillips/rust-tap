@@ -9,7 +9,6 @@
 
 //! SQLite-backed universe storage and federation database.
 
-use bitcoin_hashes::{sha256, Hash, HashEngine};
 use rusqlite::params;
 use rusqlite::types::Value as SqlValue;
 
@@ -19,32 +18,15 @@ use tap_universe::traits::{FederationDb, UniverseBackend};
 use tap_universe::types::*;
 
 use crate::sqlite::SqliteDb;
+use crate::universe_common::{
+    compute_universe_root, proof_type_from_str, proof_type_str,
+};
 
 /// Converts an optional group key to a SQLite value.
 fn gk_to_sql(id: &UniverseId) -> SqlValue {
     match &id.group_key {
         Some(k) => SqlValue::Blob(k.0.to_vec()),
         None => SqlValue::Null,
-    }
-}
-
-fn proof_type_str(pt: &ProofType) -> &'static str {
-    match pt {
-        ProofType::Issuance => "issuance",
-        ProofType::Transfer => "transfer",
-        ProofType::Ignore => "ignore",
-        ProofType::Burn => "burn",
-        ProofType::MintSupply => "mint_supply",
-    }
-}
-
-fn proof_type_from_str(s: &str) -> ProofType {
-    match s {
-        "transfer" => ProofType::Transfer,
-        "ignore" => ProofType::Ignore,
-        "burn" => ProofType::Burn,
-        "mint_supply" => ProofType::MintSupply,
-        _ => ProofType::Issuance,
     }
 }
 
@@ -95,38 +77,21 @@ fn recompute_root(
         )
         .map_err(|e| e.to_string())?;
 
-    let rows: Vec<(Vec<u8>, u32, Vec<u8>, Vec<u8>, i64)> = stmt
+    let rows: Vec<crate::universe_common::UniverseLeafRow> = stmt
         .query_map(params![root_id], |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, u32>(1)?,
                 row.get::<_, Vec<u8>>(2)?,
                 row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(4)? as u64,
             ))
         })
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
         .collect();
 
-    if rows.is_empty() {
-        return Ok((NodeHash::EMPTY, 0));
-    }
-
-    let mut sum: u64 = 0;
-    let mut engine = sha256::HashEngine::default();
-
-    for (txid, vout, script_key, asset_id, amount) in &rows {
-        engine.input(asset_id);
-        engine.input(&(*amount as u64).to_be_bytes());
-        engine.input(txid);
-        engine.input(&vout.to_be_bytes());
-        engine.input(script_key);
-        sum = sum.saturating_add(*amount as u64);
-    }
-
-    let hash = sha256::Hash::from_engine(engine);
-    Ok((NodeHash(hash.to_byte_array()), sum))
+    Ok(compute_universe_root(&rows))
 }
 
 // ---------------------------------------------------------------------------

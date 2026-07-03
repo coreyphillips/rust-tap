@@ -174,46 +174,16 @@ impl PendingAnchorStore for SqlitePendingAnchorStore {
 mod tests {
     use super::*;
 
+    // The shared per-trait exercise lives in the testkit so the same
+    // scenario also runs against the Postgres backend.
+    use crate::testkit::exercise_pending_anchor_store as exercise_store;
+
     fn test_anchor(txid_byte: u8, kind: u8) -> StoredPendingAnchor {
         StoredPendingAnchor {
             txid: [txid_byte; 32],
             kind,
             payload: vec![0x01, txid_byte, 0x03],
         }
-    }
-
-    fn exercise_store(store: &mut dyn PendingAnchorStore) {
-        // Empty store lists nothing.
-        assert!(store.list_anchors().unwrap().is_empty());
-
-        // Removing a missing txid is a no-op.
-        store.remove_anchor(&[0xEE; 32]).unwrap();
-
-        let mint = test_anchor(0xAA, 0);
-        let transfer = test_anchor(0xBB, 1);
-        store.upsert_anchor(&mint).unwrap();
-        store.upsert_anchor(&transfer).unwrap();
-
-        let mut listed = store.list_anchors().unwrap();
-        listed.sort_by_key(|a| a.txid);
-        assert_eq!(listed, vec![mint.clone(), transfer.clone()]);
-
-        // Upsert replaces the payload for an existing txid
-        // (registration after a restart-reload must be idempotent).
-        let replaced = StoredPendingAnchor {
-            payload: vec![0x09; 8],
-            ..mint.clone()
-        };
-        store.upsert_anchor(&replaced).unwrap();
-        let mut listed = store.list_anchors().unwrap();
-        listed.sort_by_key(|a| a.txid);
-        assert_eq!(listed, vec![replaced, transfer.clone()]);
-
-        // Removal deletes exactly the given txid.
-        store.remove_anchor(&mint.txid).unwrap();
-        assert_eq!(store.list_anchors().unwrap(), vec![transfer.clone()]);
-        store.remove_anchor(&transfer.txid).unwrap();
-        assert!(store.list_anchors().unwrap().is_empty());
     }
 
     #[test]

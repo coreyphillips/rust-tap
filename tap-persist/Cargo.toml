@@ -11,7 +11,14 @@ tap-universe = { path = "../tap-universe" }
 bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 bitcoin_hashes = { version = "0.14", default-features = false, features = ["std"] }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+# The synchronous PostgreSQL client. No connection pool (r2d2) is
+# pulled in: the SQLite backend serializes all store access through a
+# single Mutex<Connection>, and the Postgres backend mirrors that
+# pattern with a single Mutex<postgres::Client>, so a pool would add
+# dependencies without adding concurrency.
+postgres = { version = "0.19", optional = true }
 
 [features]
 default = ["sqlite"]
 sqlite = ["rusqlite"]
+postgres = ["dep:postgres"]

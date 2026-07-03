@@ -305,7 +305,9 @@ where
 
         // Create default stores if not provided. When `db_path` is
         // configured (and the `sqlite` feature is enabled), the default
-        // stores are SQLite-backed, sharing one database handle;
+        // stores are SQLite-backed; when `db_url` is a postgres:// URL
+        // (and the `postgres` feature is enabled), they are
+        // Postgres-backed. Either way they share one database handle;
         // otherwise they fall back to in-memory stores.
         let default_db = open_default_db(
             &self.config,
@@ -447,36 +449,68 @@ where
     }
 }
 
-/// The shared database handle behind the default (SQLite) stores.
-#[cfg(feature = "sqlite")]
-type DefaultDb = Arc<tap_persist::sqlite::SqliteDb>;
-/// Placeholder when the `sqlite` feature is disabled: there is never a
-/// shared database and defaults are in-memory.
-#[cfg(not(feature = "sqlite"))]
-type DefaultDb = std::convert::Infallible;
+/// The shared database handle behind the default SQL-backed stores.
+/// With no SQL feature enabled this enum is uninhabited and defaults
+/// are always in-memory.
+enum DefaultDb {
+    #[cfg(feature = "sqlite")]
+    Sqlite(Arc<tap_persist::sqlite::SqliteDb>),
+    #[cfg(feature = "postgres")]
+    Postgres(Arc<tap_persist::postgres::PostgresDb>),
+}
 
-/// Opens the shared SQLite database for default stores, if a `db_path`
-/// is configured, any default store is actually needed, and the
-/// `sqlite` feature is enabled.
-#[cfg(feature = "sqlite")]
+/// Opens the shared database for default stores, if one is configured
+/// and any default store is actually needed.
+///
+/// Backend selection: `db_path` selects SQLite (feature `sqlite`) and
+/// takes precedence; otherwise a `db_url` starting with `postgres://`
+/// or `postgresql://` selects Postgres (feature `postgres`). A
+/// `db_url` that cannot be honored (unsupported scheme, or the
+/// `postgres` feature is disabled) is a configuration error rather
+/// than a silent fallback to in-memory storage.
 fn open_default_db(
     config: &TapNodeConfig,
     any_default_needed: bool,
 ) -> Result<Option<DefaultDb>, TapNodeError> {
-    match (&config.db_path, any_default_needed) {
-        (Some(path), true) => Ok(Some(Arc::new(
+    if !any_default_needed {
+        return Ok(None);
+    }
+
+    #[cfg(feature = "sqlite")]
+    if let Some(path) = &config.db_path {
+        return Ok(Some(DefaultDb::Sqlite(Arc::new(
             tap_persist::sqlite::SqliteDb::open(path)
                 .map_err(TapNodeError::Storage)?,
-        ))),
-        _ => Ok(None),
+        ))));
     }
-}
 
-#[cfg(not(feature = "sqlite"))]
-fn open_default_db(
-    _config: &TapNodeConfig,
-    _any_default_needed: bool,
-) -> Result<Option<DefaultDb>, TapNodeError> {
+    if let Some(url) = &config.db_url {
+        #[cfg(feature = "postgres")]
+        {
+            if url.starts_with("postgres://")
+                || url.starts_with("postgresql://")
+            {
+                return Ok(Some(DefaultDb::Postgres(Arc::new(
+                    tap_persist::postgres::PostgresDb::connect(url)
+                        .map_err(TapNodeError::Storage)?,
+                ))));
+            }
+            return Err(TapNodeError::Config(format!(
+                "unsupported db_url scheme: {}",
+                url
+            )));
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            let _ = url;
+            return Err(TapNodeError::Config(
+                "db_url is set but the `postgres` feature is disabled"
+                    .into(),
+            ));
+        }
+    }
+
+    let _ = config;
     Ok(None)
 }
 
@@ -485,9 +519,13 @@ fn default_asset_store(
 ) -> Box<dyn AssetStore + Send> {
     match db {
         #[cfg(feature = "sqlite")]
-        Some(db) => Box::new(tap_persist::sqlite::SqliteAssetStore::new(
-            Arc::clone(db),
-        )),
+        Some(DefaultDb::Sqlite(db)) => Box::new(
+            tap_persist::sqlite::SqliteAssetStore::new(Arc::clone(db)),
+        ),
+        #[cfg(feature = "postgres")]
+        Some(DefaultDb::Postgres(db)) => Box::new(
+            tap_persist::postgres::PostgresAssetStore::new(Arc::clone(db)),
+        ),
         _ => Box::new(MemoryAssetStore::new()),
     }
 }
@@ -497,9 +535,13 @@ fn default_proof_store(
 ) -> Box<dyn ProofStore + Send> {
     match db {
         #[cfg(feature = "sqlite")]
-        Some(db) => Box::new(tap_persist::sqlite::SqliteProofStore::new(
-            Arc::clone(db),
-        )),
+        Some(DefaultDb::Sqlite(db)) => Box::new(
+            tap_persist::sqlite::SqliteProofStore::new(Arc::clone(db)),
+        ),
+        #[cfg(feature = "postgres")]
+        Some(DefaultDb::Postgres(db)) => Box::new(
+            tap_persist::postgres::PostgresProofStore::new(Arc::clone(db)),
+        ),
         _ => Box::new(MemoryProofStore::new()),
     }
 }
@@ -509,9 +551,13 @@ fn default_batch_store(
 ) -> Box<dyn BatchStore + Send> {
     match db {
         #[cfg(feature = "sqlite")]
-        Some(db) => Box::new(tap_persist::sqlite::SqliteBatchStore::new(
-            Arc::clone(db),
-        )),
+        Some(DefaultDb::Sqlite(db)) => Box::new(
+            tap_persist::sqlite::SqliteBatchStore::new(Arc::clone(db)),
+        ),
+        #[cfg(feature = "postgres")]
+        Some(DefaultDb::Postgres(db)) => Box::new(
+            tap_persist::postgres::PostgresBatchStore::new(Arc::clone(db)),
+        ),
         _ => Box::new(MemoryBatchStore::new()),
     }
 }
@@ -521,8 +567,14 @@ fn default_pending_anchor_store(
 ) -> Box<dyn PendingAnchorStore + Send> {
     match db {
         #[cfg(feature = "sqlite")]
-        Some(db) => Box::new(
+        Some(DefaultDb::Sqlite(db)) => Box::new(
             tap_persist::pending_anchor_store::SqlitePendingAnchorStore::new(
+                Arc::clone(db),
+            ),
+        ),
+        #[cfg(feature = "postgres")]
+        Some(DefaultDb::Postgres(db)) => Box::new(
+            tap_persist::postgres::PostgresPendingAnchorStore::new(
                 Arc::clone(db),
             ),
         ),
@@ -535,8 +587,14 @@ fn default_supply_tree_store(
 ) -> Box<dyn SupplyTreeStore + Send> {
     match db {
         #[cfg(feature = "sqlite")]
-        Some(db) => Box::new(
+        Some(DefaultDb::Sqlite(db)) => Box::new(
             tap_persist::supply_store::SqliteSupplyTreeStore::new(
+                Arc::clone(db),
+            ),
+        ),
+        #[cfg(feature = "postgres")]
+        Some(DefaultDb::Postgres(db)) => Box::new(
+            tap_persist::postgres::PostgresSupplyTreeStore::new(
                 Arc::clone(db),
             ),
         ),
@@ -549,8 +607,14 @@ fn default_supply_commit_store(
 ) -> Box<dyn SupplyCommitStore + Send> {
     match db {
         #[cfg(feature = "sqlite")]
-        Some(db) => Box::new(
+        Some(DefaultDb::Sqlite(db)) => Box::new(
             tap_persist::supply_store::SqliteSupplyCommitStore::new(
+                Arc::clone(db),
+            ),
+        ),
+        #[cfg(feature = "postgres")]
+        Some(DefaultDb::Postgres(db)) => Box::new(
+            tap_persist::postgres::PostgresSupplyCommitStore::new(
                 Arc::clone(db),
             ),
         ),
@@ -563,8 +627,14 @@ fn default_supply_staging_store(
 ) -> Box<dyn SupplyStagingStore + Send> {
     match db {
         #[cfg(feature = "sqlite")]
-        Some(db) => Box::new(
+        Some(DefaultDb::Sqlite(db)) => Box::new(
             tap_persist::supply_store::SqliteSupplyStagingStore::new(
+                Arc::clone(db),
+            ),
+        ),
+        #[cfg(feature = "postgres")]
+        Some(DefaultDb::Postgres(db)) => Box::new(
+            tap_persist::postgres::PostgresSupplyStagingStore::new(
                 Arc::clone(db),
             ),
         ),
