@@ -14,9 +14,38 @@
 //! sighashes. This replaces `SkipWitnessValidator` for production use.
 
 use bitcoin::secp256k1::{self, Message, Secp256k1, XOnlyPublicKey};
+use bitcoin::sighash::TapSighashType;
 
 use crate::asset::{Asset, ScriptVersion, Witness};
 use crate::vm::{VmError, WitnessValidator};
+
+/// Parses the sighash type carried by a taproot witness signature,
+/// mirroring btcd's `parseTaprootSigAndPubKey`
+/// (txscript/sigvalidate.go:257), which Go's VM relies on when it runs
+/// the txscript engine over the virtual transaction:
+///
+/// - a 64-byte signature implies `SIGHASH_DEFAULT`;
+/// - a 65-byte signature carries an explicit sighash byte, which must
+///   not be 0x00 (an explicit default type must be encoded as a bare
+///   64-byte signature) and must be one of the standard taproot types
+///   (0x01, 0x02, 0x03, 0x81, 0x82, 0x83);
+/// - any other length is invalid.
+///
+/// Note btcd accepts any non-zero 65th byte at parse time and only
+/// fails non-standard values later when computing the sighash; the
+/// observable behavior (witness validation failure) is identical.
+pub fn taproot_witness_sig_hash_type(
+    sig: &[u8],
+) -> Result<TapSighashType, String> {
+    match sig.len() {
+        64 => Ok(TapSighashType::Default),
+        65 if sig[64] != 0 => TapSighashType::from_consensus_u8(sig[64])
+            .map_err(|_| {
+                format!("invalid taproot sighash type: {}", sig[64])
+            }),
+        _ => Err(format!("invalid sig len: {}", sig.len())),
+    }
+}
 
 /// Verifies BIP-340 Schnorr signatures for Taproot Asset witness validation.
 ///
@@ -61,14 +90,18 @@ impl WitnessValidator for SchnorrWitnessValidator {
 
         // The first witness element should be the Schnorr signature
         // (64 or 65 bytes — 64 for default sighash, 65 with explicit
-        // sighash type byte).
+        // non-zero sighash type byte). This mirrors btcd's
+        // parseTaprootSigAndPubKey, which rejects a 65-byte signature
+        // whose trailing byte is 0x00. The caller (the VM engine) has
+        // already computed `sighash` with the type carried by the
+        // trailing byte.
         let sig_bytes = &witness.tx_witness[0];
-        if sig_bytes.len() != 64 && sig_bytes.len() != 65 {
-            return Err(VmError::WitnessValidationFailed(format!(
-                "expected 64 or 65 byte Schnorr signature, got {}",
-                sig_bytes.len()
-            )));
-        }
+        taproot_witness_sig_hash_type(sig_bytes).map_err(|e| {
+            VmError::WitnessValidationFailed(format!(
+                "invalid Schnorr signature: {}",
+                e
+            ))
+        })?;
 
         // Parse the signature (first 64 bytes).
         let sig = secp256k1::schnorr::Signature::from_slice(&sig_bytes[..64])
@@ -100,6 +133,78 @@ impl WitnessValidator for SchnorrWitnessValidator {
                     e
                 ))
             })
+    }
+
+    /// Executes a script-path (tapscript) spend of the virtual
+    /// transaction with Bitcoin Core's libbitcoinconsensus, mirroring
+    /// Go's `validateWitnessV0` running the btcd txscript engine
+    /// (vm/vm.go:340) against the canned prevout
+    /// (`OP_1 <32-byte script key>`, value = input amount).
+    ///
+    /// Go passes `txscript.StandardVerifyFlags`; libbitcoinconsensus
+    /// only exposes consensus flags, so we use the full consensus set
+    /// including taproot (`VERIFY_ALL_PRE_TAPROOT | VERIFY_TAPROOT`).
+    #[cfg(feature = "consensus-validation")]
+    fn validate_script_spend(
+        &self,
+        virtual_tx: &bitcoin::Transaction,
+        prev_out: &bitcoin::TxOut,
+        _witness: &Witness,
+        prev_asset: &Asset,
+    ) -> Result<(), VmError> {
+        if prev_asset.script_version != ScriptVersion::V0 {
+            return Err(VmError::InvalidScriptVersion);
+        }
+
+        let tx_bytes = bitcoin::consensus::encode::serialize(virtual_tx);
+        let script_bytes = prev_out.script_pubkey.as_bytes();
+        let value = prev_out.value.to_sat();
+
+        // The virtual transaction has exactly one input, so the spent
+        // outputs set is the single synthetic prevout.
+        let utxo = bitcoinconsensus::Utxo {
+            script_pubkey: script_bytes.as_ptr(),
+            script_pubkey_len: script_bytes.len() as u32,
+            value: value as i64,
+        };
+
+        bitcoinconsensus::verify_with_flags(
+            script_bytes,
+            value,
+            &tx_bytes,
+            Some(&[utxo]),
+            0,
+            bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT
+                | bitcoinconsensus::VERIFY_TAPROOT,
+        )
+        .map_err(|e| {
+            VmError::WitnessValidationFailed(format!(
+                "tapscript execution failed: {:?}",
+                e
+            ))
+        })
+    }
+
+    /// Without the `consensus-validation` feature there is no script
+    /// interpreter available, so script-path spends are rejected with a
+    /// clear error (Go always executes them via the txscript engine).
+    #[cfg(not(feature = "consensus-validation"))]
+    fn validate_script_spend(
+        &self,
+        _virtual_tx: &bitcoin::Transaction,
+        _prev_out: &bitcoin::TxOut,
+        _witness: &Witness,
+        prev_asset: &Asset,
+    ) -> Result<(), VmError> {
+        if prev_asset.script_version != ScriptVersion::V0 {
+            return Err(VmError::InvalidScriptVersion);
+        }
+
+        Err(VmError::WitnessValidationFailed(
+            "script-path spend validation requires the \
+             consensus-validation feature"
+                .into(),
+        ))
     }
 }
 
@@ -259,6 +364,433 @@ mod tests {
             result,
             Err(VmError::WitnessValidationFailed(_))
         ));
+    }
+
+    #[test]
+    fn test_taproot_witness_sig_hash_type() {
+        use bitcoin::sighash::TapSighashType;
+
+        // 64 bytes: default sighash.
+        assert_eq!(
+            taproot_witness_sig_hash_type(&[0u8; 64]).unwrap(),
+            TapSighashType::Default
+        );
+
+        // 65 bytes with standard non-zero types.
+        for (byte, expected) in [
+            (0x01, TapSighashType::All),
+            (0x02, TapSighashType::None),
+            (0x03, TapSighashType::Single),
+            (0x81, TapSighashType::AllPlusAnyoneCanPay),
+            (0x82, TapSighashType::NonePlusAnyoneCanPay),
+            (0x83, TapSighashType::SinglePlusAnyoneCanPay),
+        ] {
+            let mut sig = vec![0u8; 65];
+            sig[64] = byte;
+            assert_eq!(
+                taproot_witness_sig_hash_type(&sig).unwrap(),
+                expected
+            );
+        }
+
+        // 65 bytes with a 0x00 trailing byte is invalid (btcd's
+        // ErrInvalidTaprootSigLen).
+        assert!(taproot_witness_sig_hash_type(&[0u8; 65]).is_err());
+
+        // Non-standard sighash byte fails.
+        let mut sig = vec![0u8; 65];
+        sig[64] = 0x04;
+        assert!(taproot_witness_sig_hash_type(&sig).is_err());
+
+        // Other lengths fail.
+        assert!(taproot_witness_sig_hash_type(&[0u8; 63]).is_err());
+        assert!(taproot_witness_sig_hash_type(&[0u8; 66]).is_err());
+        assert!(taproot_witness_sig_hash_type(&[]).is_err());
+    }
+
+    /// Builds a (prev_asset, new_asset, prev_assets) triple where the
+    /// previous asset's script key is a taproot output key committing
+    /// to a single `<leaf_key> OP_CHECKSIG` tapscript leaf under the
+    /// given internal key. Returns everything needed to build the
+    /// script-path witness.
+    #[cfg(feature = "consensus-validation")]
+    fn script_path_fixture() -> (
+        Asset,
+        Asset,
+        crate::vm::InputSet,
+        crate::crypto::tapscript::TapscriptLeaf,
+        Keypair,
+        Vec<u8>,
+    ) {
+        use bitcoin::secp256k1::Scalar;
+        use bitcoin::ScriptBuf;
+        use crate::crypto::tapscript::TapscriptLeaf;
+
+        let secp = Secp256k1::new();
+        let leaf_keypair = test_keypair(0x11);
+        let internal_keypair = test_keypair(0x22);
+        let (leaf_x_only, _) = leaf_keypair.x_only_public_key();
+        let (internal_x_only, _) = internal_keypair.x_only_public_key();
+
+        // Script: <32-byte leaf key> OP_CHECKSIG.
+        let mut script = Vec::with_capacity(34);
+        script.push(0x20); // OP_PUSHBYTES_32
+        script.extend_from_slice(&leaf_x_only.serialize());
+        script.push(0xac); // OP_CHECKSIG
+        let leaf = TapscriptLeaf::new(ScriptBuf::from(script));
+        let merkle_root = leaf.leaf_hash();
+
+        // Taproot output key = internal key tweaked with the BIP-341
+        // TapTweak of the merkle root.
+        let tag = bitcoin::hashes::sha256::Hash::hash(b"TapTweak");
+        let mut engine = bitcoin::hashes::sha256::HashEngine::default();
+        use bitcoin::hashes::{Hash, HashEngine};
+        engine.input(tag.as_ref());
+        engine.input(tag.as_ref());
+        engine.input(&internal_x_only.serialize());
+        engine.input(&merkle_root);
+        let tweak = bitcoin::hashes::sha256::Hash::from_engine(engine)
+            .to_byte_array();
+        let scalar = Scalar::from_be_bytes(tweak).unwrap();
+        let (output_key, parity) =
+            internal_x_only.add_tweak(&secp, &scalar).unwrap();
+
+        // Control block: version|parity byte plus the internal key
+        // (single leaf, so no merkle path).
+        let parity_bit: u8 = match parity {
+            bitcoin::secp256k1::Parity::Even => 0,
+            bitcoin::secp256k1::Parity::Odd => 1,
+        };
+        let mut control_block = Vec::with_capacity(33);
+        control_block.push(0xc0 | parity_bit);
+        control_block.extend_from_slice(&internal_x_only.serialize());
+
+        // The previous asset is locked to the taproot output key.
+        let mut prev_key_bytes = [0u8; 33];
+        prev_key_bytes[0] = 0x02;
+        prev_key_bytes[1..].copy_from_slice(&output_key.serialize());
+        let prev_key = SerializedKey(prev_key_bytes);
+
+        let genesis = test_genesis();
+        let prev_asset = Asset {
+            version: AssetVersion::V0,
+            genesis: genesis.clone(),
+            amount: 100,
+            lock_time: 0,
+            relative_lock_time: 0,
+            prev_witnesses: vec![Witness {
+                prev_id: Some(PrevId::ZERO),
+                tx_witness: vec![],
+                split_commitment: None,
+            }],
+            split_commitment_root: None,
+            script_version: ScriptVersion::V0,
+            script_key: ScriptKey::from_pub_key(prev_key),
+            group_key: None,
+            unknown_odd_types: std::collections::BTreeMap::new(),
+        };
+
+        let prev_id = PrevId {
+            out_point: OutPoint {
+                txid: [0xEE; 32],
+                vout: 0,
+            },
+            id: genesis.id(),
+            script_key: prev_key,
+        };
+
+        let new_asset = Asset {
+            version: AssetVersion::V0,
+            genesis: genesis.clone(),
+            amount: 100,
+            lock_time: 0,
+            relative_lock_time: 0,
+            prev_witnesses: vec![Witness {
+                prev_id: Some(prev_id.clone()),
+                tx_witness: vec![],
+                split_commitment: None,
+            }],
+            split_commitment_root: None,
+            script_version: ScriptVersion::V0,
+            script_key: ScriptKey::from_pub_key(SerializedKey([0x03; 33])),
+            group_key: None,
+            unknown_odd_types: std::collections::BTreeMap::new(),
+        };
+
+        let mut prev_assets = crate::vm::InputSet::new();
+        prev_assets.insert(prev_id, prev_asset.clone());
+
+        (
+            prev_asset,
+            new_asset,
+            prev_assets,
+            leaf,
+            leaf_keypair,
+            control_block,
+        )
+    }
+
+    #[test]
+    #[cfg(feature = "consensus-validation")]
+    fn test_script_path_spend_via_vm() {
+        use crate::crypto::tapscript::input_script_spend_sighash;
+        use crate::crypto::virtual_tx::virtual_tx;
+        use bitcoin::sighash::TapSighashType;
+
+        let secp = Secp256k1::new();
+        let (prev_asset, mut new_asset, prev_assets, leaf, leaf_keypair, cb) =
+            script_path_fixture();
+
+        // Sign the BIP-342 script-spend sighash with the leaf key.
+        let (base_tx, _, _) = virtual_tx(&new_asset, &prev_assets).unwrap();
+        let sighash = input_script_spend_sighash(
+            &base_tx,
+            &prev_asset,
+            &new_asset,
+            0,
+            &leaf,
+            TapSighashType::Default,
+        )
+        .unwrap();
+        let sig = secp.sign_schnorr_no_aux_rand(
+            &Message::from_digest(sighash),
+            &leaf_keypair,
+        );
+
+        // Witness stack: [sig, script, control block].
+        new_asset.prev_witnesses[0].tx_witness = vec![
+            sig.as_ref().to_vec(),
+            leaf.script.as_bytes().to_vec(),
+            cb,
+        ];
+
+        let validator = SchnorrWitnessValidator::new();
+        let engine = crate::vm::Engine::new(
+            &new_asset,
+            &[],
+            &prev_assets,
+            &validator,
+        );
+        let result = engine.execute();
+        assert!(
+            result.is_ok(),
+            "script-path spend should verify: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "consensus-validation")]
+    fn test_script_path_spend_tampered_witness_fails() {
+        use crate::crypto::tapscript::input_script_spend_sighash;
+        use crate::crypto::virtual_tx::virtual_tx;
+        use bitcoin::sighash::TapSighashType;
+
+        let secp = Secp256k1::new();
+        let (prev_asset, mut new_asset, prev_assets, leaf, leaf_keypair, cb) =
+            script_path_fixture();
+
+        let (base_tx, _, _) = virtual_tx(&new_asset, &prev_assets).unwrap();
+        let sighash = input_script_spend_sighash(
+            &base_tx,
+            &prev_asset,
+            &new_asset,
+            0,
+            &leaf,
+            TapSighashType::Default,
+        )
+        .unwrap();
+        let sig = secp.sign_schnorr_no_aux_rand(
+            &Message::from_digest(sighash),
+            &leaf_keypair,
+        );
+
+        // Tamper with the signature.
+        let mut bad_sig = sig.as_ref().to_vec();
+        bad_sig[10] ^= 0x01;
+
+        new_asset.prev_witnesses[0].tx_witness = vec![
+            bad_sig,
+            leaf.script.as_bytes().to_vec(),
+            cb.clone(),
+        ];
+
+        let validator = SchnorrWitnessValidator::new();
+        let engine = crate::vm::Engine::new(
+            &new_asset,
+            &[],
+            &prev_assets,
+            &validator,
+        );
+        assert!(
+            engine.execute().is_err(),
+            "tampered script-path witness must fail"
+        );
+
+        // A tampered control block (wrong internal key) must also fail.
+        let mut bad_cb = cb;
+        bad_cb[5] ^= 0x01;
+        new_asset.prev_witnesses[0].tx_witness = vec![
+            sig.as_ref().to_vec(),
+            leaf.script.as_bytes().to_vec(),
+            bad_cb,
+        ];
+        let engine = crate::vm::Engine::new(
+            &new_asset,
+            &[],
+            &prev_assets,
+            &validator,
+        );
+        assert!(
+            engine.execute().is_err(),
+            "tampered control block must fail"
+        );
+    }
+
+    /// Builds a simple 1-in-1-out key-path transfer where the previous
+    /// asset is locked directly to the given keypair's public key.
+    fn key_path_fixture(
+        keypair: &Keypair,
+    ) -> (Asset, Asset, crate::vm::InputSet) {
+        let (x_only, _) = keypair.x_only_public_key();
+        let mut prev_key_bytes = [0u8; 33];
+        prev_key_bytes[0] = 0x02;
+        prev_key_bytes[1..].copy_from_slice(&x_only.serialize());
+        let prev_key = SerializedKey(prev_key_bytes);
+
+        let genesis = test_genesis();
+        let prev_asset = Asset {
+            version: AssetVersion::V0,
+            genesis: genesis.clone(),
+            amount: 100,
+            lock_time: 0,
+            relative_lock_time: 0,
+            prev_witnesses: vec![Witness {
+                prev_id: Some(PrevId::ZERO),
+                tx_witness: vec![],
+                split_commitment: None,
+            }],
+            split_commitment_root: None,
+            script_version: ScriptVersion::V0,
+            script_key: ScriptKey::from_pub_key(prev_key),
+            group_key: None,
+            unknown_odd_types: std::collections::BTreeMap::new(),
+        };
+
+        let prev_id = PrevId {
+            out_point: OutPoint {
+                txid: [0xDD; 32],
+                vout: 0,
+            },
+            id: genesis.id(),
+            script_key: prev_key,
+        };
+
+        let new_asset = Asset {
+            version: AssetVersion::V0,
+            genesis: genesis.clone(),
+            amount: 100,
+            lock_time: 0,
+            relative_lock_time: 0,
+            prev_witnesses: vec![Witness {
+                prev_id: Some(prev_id.clone()),
+                tx_witness: vec![],
+                split_commitment: None,
+            }],
+            split_commitment_root: None,
+            script_version: ScriptVersion::V0,
+            script_key: ScriptKey::from_pub_key(SerializedKey([0x03; 33])),
+            group_key: None,
+            unknown_odd_types: std::collections::BTreeMap::new(),
+        };
+
+        let mut prev_assets = crate::vm::InputSet::new();
+        prev_assets.insert(prev_id, prev_asset.clone());
+        (prev_asset, new_asset, prev_assets)
+    }
+
+    #[test]
+    fn test_key_path_65_byte_sig_with_sighash_flag() {
+        use crate::crypto::virtual_tx::{input_key_spend_sighash, virtual_tx};
+        use bitcoin::sighash::TapSighashType;
+
+        let secp = Secp256k1::new();
+        let keypair = test_keypair(0x33);
+        let (prev_asset, mut new_asset, prev_assets) =
+            key_path_fixture(&keypair);
+
+        let (base_tx, _, _) = virtual_tx(&new_asset, &prev_assets).unwrap();
+
+        // Sign the sighash computed with SIGHASH_ALL (0x01) and append
+        // the explicit flag byte; the engine must verify the signature
+        // against the sighash computed with that type (btcd semantics).
+        let sighash_all = input_key_spend_sighash(
+            &base_tx,
+            &prev_asset,
+            &new_asset,
+            0,
+            TapSighashType::All,
+        )
+        .unwrap();
+        let sig = secp.sign_schnorr_no_aux_rand(
+            &Message::from_digest(sighash_all),
+            &keypair,
+        );
+        let mut sig_with_flag = sig.as_ref().to_vec();
+        sig_with_flag.push(0x01);
+
+        let validator = SchnorrWitnessValidator::new();
+        new_asset.prev_witnesses[0].tx_witness = vec![sig_with_flag];
+        let engine = crate::vm::Engine::new(
+            &new_asset,
+            &[],
+            &prev_assets,
+            &validator,
+        );
+        let result = engine.execute();
+        assert!(
+            result.is_ok(),
+            "65-byte sig with 0x01 flag should verify: {:?}",
+            result
+        );
+
+        // The same 64-byte signature WITHOUT the flag byte must fail:
+        // it would be verified against the default-type sighash, which
+        // differs from the SIGHASH_ALL digest that was signed.
+        new_asset.prev_witnesses[0].tx_witness =
+            vec![sig.as_ref().to_vec()];
+        let engine = crate::vm::Engine::new(
+            &new_asset,
+            &[],
+            &prev_assets,
+            &validator,
+        );
+        assert!(engine.execute().is_err());
+
+        // A 65-byte signature with an explicit 0x00 byte is rejected
+        // (btcd requires the default type to be encoded as 64 bytes).
+        let sighash_default = input_key_spend_sighash(
+            &base_tx,
+            &prev_asset,
+            &new_asset,
+            0,
+            TapSighashType::Default,
+        )
+        .unwrap();
+        let sig_default = secp.sign_schnorr_no_aux_rand(
+            &Message::from_digest(sighash_default),
+            &keypair,
+        );
+        let mut sig_with_zero = sig_default.as_ref().to_vec();
+        sig_with_zero.push(0x00);
+        new_asset.prev_witnesses[0].tx_witness = vec![sig_with_zero];
+        let engine = crate::vm::Engine::new(
+            &new_asset,
+            &[],
+            &prev_assets,
+            &validator,
+        );
+        assert!(engine.execute().is_err());
     }
 
     #[test]

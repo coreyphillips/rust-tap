@@ -25,15 +25,19 @@
 //!     ..Default::default()
 //! };
 //!
-//! let node = TapNodeBuilder::new(config)
-//!     .set_chain_bridge(my_chain)
-//!     .set_wallet_anchor(my_wallet)
-//!     .set_key_ring(my_keys)
-//!     .set_ldk_ops(my_ldk)
-//!     .set_price_oracle(my_oracle)
-//!     .build()?;
+//! let node = std::sync::Arc::new(
+//!     TapNodeBuilder::new(config)
+//!         .set_chain_bridge(my_chain)
+//!         .set_wallet_anchor(my_wallet)
+//!         .set_key_ring(my_keys)
+//!         .set_ldk_ops(my_ldk)
+//!         .set_price_oracle(my_oracle)
+//!         .build()?,
+//! );
 //!
-//! node.start()?;
+//! // `start()` takes an Arc so its worker thread can watch for
+//! // confirmations in the background; start via a clone.
+//! node.clone().start()?;
 //!
 //! // Mint assets
 //! node.queue_mint(Seedling::new_normal("USD-Coin".into(), 1_000_000))?;
@@ -49,6 +53,7 @@
 //! let addr = node.new_address(asset_id, 100)?;
 //! ```
 
+mod anchor_codec;
 pub mod builder;
 pub mod config;
 pub mod error;
@@ -59,6 +64,7 @@ pub mod node;
 pub mod receive;
 pub mod send;
 pub mod sync;
+pub mod tasks;
 pub mod types;
 
 // Primary public API.
@@ -67,6 +73,7 @@ pub use config::TapNodeConfig;
 pub use error::TapNodeError;
 pub use event::TapEvent;
 pub use node::TapNode;
+pub use tasks::TickSummary;
 pub use types::*;
 
 // Re-export key types from workspace crates so users don't need to
@@ -75,7 +82,7 @@ pub use tap_ldk::ldk::LdkChannelOps;
 pub use tap_ldk::rfq::PriceOracle;
 pub use tap_onchain::chain::{
     AssetSigner, ChainBridge, ChainError, FeeRate, KeyDescriptor, KeyRing,
-    WalletAnchor,
+    TxConfirmation, WalletAnchor,
 };
 pub use tap_onchain::mint::Seedling;
 pub use tap_persist::asset_store::OwnedAsset;

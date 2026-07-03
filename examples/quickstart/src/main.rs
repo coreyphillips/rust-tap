@@ -104,16 +104,20 @@ fn main() {
         ..Default::default()
     };
 
-    let node = TapNodeBuilder::new(config)
-        .set_chain_bridge(chain)
-        .set_wallet_anchor(bdk_wallet)
-        .set_key_ring(key_ring)
-        .set_ldk_ops(StubLdk)
-        .set_price_oracle(StubOracle)
-        .build()
-        .expect("Failed to build node");
+    // `start()` takes an Arc so its background worker (confirmation
+    // watching, universe sync) can hold a weak handle to the node.
+    let node = std::sync::Arc::new(
+        TapNodeBuilder::new(config)
+            .set_chain_bridge(chain)
+            .set_wallet_anchor(bdk_wallet)
+            .set_key_ring(key_ring)
+            .set_ldk_ops(StubLdk)
+            .set_price_oracle(StubOracle)
+            .build()
+            .expect("Failed to build node"),
+    );
 
-    node.start().expect("Failed to start node");
+    node.clone().start().expect("Failed to start node");
 
     // Route to subcommand or interactive menu.
     if args.len() > 2 {
@@ -565,7 +569,7 @@ fn build_and_register_proof(
     let asset_id = genesis.id();
     let has_group = false;
     let ack = asset_commitment_key(&asset_id, &script_key, has_group);
-    let leaf = asset_leaf(&asset);
+    let leaf = asset_leaf(&asset).map_err(|e| format!("asset leaf: {}", e))?;
 
     // Inner tree (AssetCommitment).
     let mut inner_tree = FullTree::new(DefaultStore::new());

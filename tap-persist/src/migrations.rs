@@ -18,6 +18,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (3, include_str!("../migrations/003_burns.up.sql")),
     (4, include_str!("../migrations/004_supply.up.sql")),
     (5, include_str!("../migrations/005_mailbox.up.sql")),
+    (6, include_str!("../migrations/006_asset_keys.up.sql")),
+    (7, include_str!("../migrations/007_genesis_point.up.sql")),
+    (8, include_str!("../migrations/008_multi_asset_anchor.up.sql")),
+    (9, include_str!("../migrations/009_pending_anchors.up.sql")),
+    (10, include_str!("../migrations/010_address_key_descs.up.sql")),
 ];
 
 /// Runs all pending migrations against the given connection.
@@ -128,6 +133,7 @@ mod tests {
         assert!(tables.contains(&"supply_commitments".to_string()));
         assert!(tables.contains(&"supply_pre_commits".to_string()));
         assert!(tables.contains(&"ignore_tuples".to_string()));
+        assert!(tables.contains(&"pending_anchors".to_string()));
     }
 
     #[test]
@@ -143,15 +149,23 @@ mod tests {
         );
         assert!(result.is_err());
 
-        // UNIQUE on (anchor_txid, anchor_vout).
+        // UNIQUE on (anchor_txid, anchor_vout, asset_id, script_key):
+        // an exact duplicate is rejected ...
         conn.execute(
             "INSERT INTO owned_assets (asset_id, amount, anchor_txid, anchor_vout, script_key, block_height) VALUES (?1, 100, ?2, 0, ?3, 800000)",
             rusqlite::params![&[0xAAu8; 32][..], &[0xBBu8; 32][..], &[0x02u8; 33][..]],
         ).unwrap();
         let dup = conn.execute(
             "INSERT INTO owned_assets (asset_id, amount, anchor_txid, anchor_vout, script_key, block_height) VALUES (?1, 200, ?2, 0, ?3, 800000)",
-            rusqlite::params![&[0xCCu8; 32][..], &[0xBBu8; 32][..], &[0x02u8; 33][..]],
+            rusqlite::params![&[0xAAu8; 32][..], &[0xBBu8; 32][..], &[0x02u8; 33][..]],
         );
         assert!(dup.is_err());
+
+        // ... while a different asset at the same anchor outpoint is
+        // allowed (multi-asset anchor outputs, migration 008).
+        conn.execute(
+            "INSERT INTO owned_assets (asset_id, amount, anchor_txid, anchor_vout, script_key, block_height) VALUES (?1, 200, ?2, 0, ?3, 800000)",
+            rusqlite::params![&[0xCCu8; 32][..], &[0xBBu8; 32][..], &[0x02u8; 33][..]],
+        ).unwrap();
     }
 }

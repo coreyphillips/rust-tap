@@ -134,17 +134,17 @@ fn recompute_root(
 // ---------------------------------------------------------------------------
 
 /// SQLite-backed universe storage.
-pub struct SqliteUniverseBackend<'a> {
-    db: &'a SqliteDb,
+pub struct SqliteUniverseBackend {
+    db: std::sync::Arc<SqliteDb>,
 }
 
-impl<'a> SqliteUniverseBackend<'a> {
-    pub fn new(db: &'a SqliteDb) -> Self {
+impl SqliteUniverseBackend {
+    pub fn new(db: std::sync::Arc<SqliteDb>) -> Self {
         SqliteUniverseBackend { db }
     }
 }
 
-impl UniverseBackend for SqliteUniverseBackend<'_> {
+impl UniverseBackend for SqliteUniverseBackend {
     fn root_node(
         &self,
         id: &UniverseId,
@@ -371,6 +371,48 @@ impl UniverseBackend for SqliteUniverseBackend<'_> {
 
         Ok(())
     }
+
+    fn universe_ids(&self) -> Result<Vec<UniverseId>, UniverseError> {
+        let conn = self.db.conn.lock().unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT asset_id, group_key, proof_type FROM universe_roots",
+            )
+            .map_err(|e| UniverseError::StoreError(e.to_string()))?;
+
+        let ids = stmt
+            .query_map([], |row| {
+                let aid_bytes: Vec<u8> = row.get(0)?;
+                let gk_bytes: Option<Vec<u8>> = row.get(1)?;
+                let pt: String = row.get(2)?;
+
+                let mut aid = [0u8; 32];
+                if aid_bytes.len() == 32 {
+                    aid.copy_from_slice(&aid_bytes);
+                }
+                let group_key = gk_bytes.and_then(|gk| {
+                    if gk.len() == 33 {
+                        let mut key = [0u8; 33];
+                        key.copy_from_slice(&gk);
+                        Some(SerializedKey(key))
+                    } else {
+                        None
+                    }
+                });
+
+                Ok(UniverseId {
+                    asset_id: AssetId(aid),
+                    group_key,
+                    proof_type: proof_type_from_str(&pt),
+                })
+            })
+            .map_err(|e| UniverseError::StoreError(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(ids)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -378,17 +420,17 @@ impl UniverseBackend for SqliteUniverseBackend<'_> {
 // ---------------------------------------------------------------------------
 
 /// SQLite-backed federation database.
-pub struct SqliteFederationDb<'a> {
-    db: &'a SqliteDb,
+pub struct SqliteFederationDb {
+    db: std::sync::Arc<SqliteDb>,
 }
 
-impl<'a> SqliteFederationDb<'a> {
-    pub fn new(db: &'a SqliteDb) -> Self {
+impl SqliteFederationDb {
+    pub fn new(db: std::sync::Arc<SqliteDb>) -> Self {
         SqliteFederationDb { db }
     }
 }
 
-impl FederationDb for SqliteFederationDb<'_> {
+impl FederationDb for SqliteFederationDb {
     fn universe_servers(&self) -> Result<Vec<ServerAddr>, UniverseError> {
         let conn = self.db.conn.lock().unwrap();
         let mut stmt = conn
@@ -443,6 +485,7 @@ impl FederationDb for SqliteFederationDb<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tap_universe::MemoryUniverseBackend;
 
     fn test_id() -> UniverseId {
@@ -472,8 +515,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_universe_upsert_and_fetch() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteUniverseBackend::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteUniverseBackend::new(Arc::clone(&db));
         let id = test_id();
         let (key, leaf) = test_leaf(0);
 
@@ -485,8 +528,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_universe_root_node() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteUniverseBackend::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteUniverseBackend::new(Arc::clone(&db));
         let id = test_id();
         let (key, leaf) = test_leaf(0);
 
@@ -499,8 +542,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_universe_fetch_keys() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteUniverseBackend::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteUniverseBackend::new(Arc::clone(&db));
         let id = test_id();
 
         let (k0, l0) = test_leaf(0);
@@ -516,8 +559,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_universe_delete() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteUniverseBackend::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteUniverseBackend::new(Arc::clone(&db));
         let id = test_id();
         let (key, leaf) = test_leaf(0);
 
@@ -529,15 +572,15 @@ mod tests {
 
     #[test]
     fn test_sqlite_universe_not_found() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let store = SqliteUniverseBackend::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let store = SqliteUniverseBackend::new(Arc::clone(&db));
         assert!(store.root_node(&test_id()).is_err());
     }
 
     #[test]
     fn test_sqlite_matches_memory_backend() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut sqlite = SqliteUniverseBackend::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut sqlite = SqliteUniverseBackend::new(Arc::clone(&db));
         let mut memory = MemoryUniverseBackend::new();
         let id = test_id();
 
@@ -558,8 +601,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_federation_db() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut fed = SqliteFederationDb::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut fed = SqliteFederationDb::new(Arc::clone(&db));
 
         let addr = ServerAddr::new("localhost:10029".into());
         fed.add_servers(&[addr.clone()]).unwrap();

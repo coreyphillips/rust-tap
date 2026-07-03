@@ -14,6 +14,8 @@ use std::sync::mpsc;
 use tap_onchain::mint::BatchState;
 use tap_primitives::asset::{AssetId, OutPoint, SerializedKey};
 
+use crate::tasks::TickSummary;
+
 /// Events emitted by a [`TapNode`](crate::TapNode).
 #[derive(Clone, Debug)]
 pub enum TapEvent {
@@ -28,7 +30,16 @@ pub enum TapEvent {
         amount: u64,
         outpoint: OutPoint,
     },
-    /// An asset transfer was confirmed on-chain.
+    /// An asset transfer's anchor transaction was broadcast. The
+    /// `txid` is in display byte order (as printed by explorers).
+    TransferBroadcast {
+        asset_id: AssetId,
+        amount: u64,
+        txid: [u8; 32],
+    },
+    /// An asset transfer was confirmed on-chain (emitted by the
+    /// confirmation watcher, see [`TapNode::tick`](crate::TapNode::tick)).
+    /// The `txid` is in display byte order.
     TransferConfirmed {
         asset_id: AssetId,
         amount: u64,
@@ -64,6 +75,17 @@ pub enum TapEvent {
     },
     /// Universe sync completed.
     UniverseSyncCompleted { new_assets_discovered: usize },
+    /// A background tick finished having done work or hit errors.
+    /// Emitted by [`TapNode::tick`](crate::TapNode::tick) only when
+    /// the tick confirmed anchors, ran a universe sync, or recorded
+    /// errors; quiet ticks (nothing pending resolved, nothing due)
+    /// emit nothing, so a short tick interval does not flood the bus.
+    /// Non-fatal errors ride along in
+    /// [`TickSummary::errors`](crate::TickSummary); the same summary
+    /// is also available via
+    /// [`TapNode::last_tick_summary`](crate::TapNode::last_tick_summary)
+    /// for embedders that do not consume events.
+    TickCompleted { summary: TickSummary },
 }
 
 /// Internal event bus using std::sync::mpsc.

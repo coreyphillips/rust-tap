@@ -166,6 +166,23 @@ pub trait WitnessValidator {
         witness: &Witness,
         prev_asset: &Asset,
     ) -> Result<(), VmError>;
+
+    /// Validates a script-path (tapscript) spend by executing the full
+    /// input spend of the virtual transaction, mirroring Go running the
+    /// btcd txscript engine on the virtual tx (vm/vm.go:340,
+    /// `validateWitnessV0` -> `txscript.NewEngine(...).Execute()`).
+    ///
+    /// `virtual_tx` is the per-input virtual transaction copy
+    /// (`VirtualTxWithInput`) with the input witness already attached at
+    /// input 0, and `prev_out` is the synthetic prevout being spent
+    /// (`OP_1 <32-byte script key>`, value = input amount).
+    fn validate_script_spend(
+        &self,
+        virtual_tx: &bitcoin::Transaction,
+        prev_out: &bitcoin::TxOut,
+        witness: &Witness,
+        prev_asset: &Asset,
+    ) -> Result<(), VmError>;
 }
 
 /// A no-op witness validator that skips signature verification.
@@ -178,6 +195,16 @@ impl WitnessValidator for SkipWitnessValidator {
     fn validate_witness(
         &self,
         _sighash: &[u8; 32],
+        _witness: &Witness,
+        _prev_asset: &Asset,
+    ) -> Result<(), VmError> {
+        Ok(())
+    }
+
+    fn validate_script_spend(
+        &self,
+        _virtual_tx: &bitcoin::Transaction,
+        _prev_out: &bitcoin::TxOut,
         _witness: &Witness,
         _prev_asset: &Asset,
     ) -> Result<(), VmError> {
@@ -281,11 +308,22 @@ impl<'a, W: WitnessValidator> Engine<'a, W> {
                     VmError::InvalidTransferWitness(e.to_string())
                 })?;
 
+        // Honor an explicit sighash byte on the signature, as btcd's
+        // engine does (see validate_state_transition).
+        let sig_hash_type = witness
+            .tx_witness
+            .first()
+            .and_then(|sig| {
+                crate::crypto::schnorr::taproot_witness_sig_hash_type(sig)
+                    .ok()
+            })
+            .unwrap_or(bitcoin::sighash::TapSighashType::Default);
+
         let sighash =
             crate::crypto::virtual_tx::input_group_genesis_key_spend_sighash(
                 &base_tx,
                 self.new_asset,
-                bitcoin::sighash::TapSighashType::Default,
+                sig_hash_type,
             )
             .map_err(|e| VmError::WitnessValidationFailed(e.to_string()))?;
 
@@ -371,7 +409,10 @@ impl<'a, W: WitnessValidator> Engine<'a, W> {
         split_no_witness.lock_time = self.new_asset.lock_time;
         split_no_witness.relative_lock_time =
             self.new_asset.relative_lock_time;
-        let split_leaf = crate::commitment::asset_leaf(&split_no_witness);
+        let split_leaf = crate::commitment::asset_leaf(&split_no_witness)
+            .map_err(|e| {
+                VmError::InvalidTransferWitness(e.to_string())
+            })?;
 
         // Verify the merkle proof against the split commitment root.
         let root_node = mssmt::Node::Computed(mssmt::ComputedNode::new(
@@ -449,48 +490,73 @@ impl<'a, W: WitnessValidator> Engine<'a, W> {
                 return Err(VmError::InvalidScriptVersion);
             }
 
-            // Determine if this is a script-path or key-path spend and
-            // compute the appropriate sighash.
-            let sighash = if crate::crypto::tapscript::is_script_path_witness(
+            // Determine if this is a script-path or key-path spend.
+            if crate::crypto::tapscript::is_script_path_witness(
                 &witness.tx_witness,
             ) {
-                // Script-path: extract the script from the witness and
-                // compute a BIP-342 script-path sighash.
-                let (script, _control_block) =
-                    crate::crypto::tapscript::extract_script_path(
-                        &witness.tx_witness,
-                    )
-                    .ok_or(VmError::InvalidTransferWitness(
-                        "malformed script-path witness".into(),
-                    ))?;
-                let leaf = crate::crypto::tapscript::TapscriptLeaf::new(script);
-                crate::crypto::tapscript::input_script_spend_sighash(
+                // Script-path: execute the full input spend against the
+                // synthetic prevout, exactly like Go running the
+                // txscript engine over the virtual transaction
+                // (vm/vm.go:340 validateWitnessV0).
+                let mut btc_witness = bitcoin::Witness::new();
+                for elem in &witness.tx_witness {
+                    btc_witness.push(elem);
+                }
+                let tx = crate::crypto::virtual_tx::virtual_tx_with_input(
                     &base_tx,
-                    prev_asset,
-                    self.new_asset,
+                    self.new_asset.lock_time,
+                    self.new_asset.relative_lock_time,
                     idx as u32,
-                    &leaf,
-                    bitcoin::sighash::TapSighashType::Default,
-                )
-                .map_err(|e| VmError::WitnessValidationFailed(e.to_string()))?
+                    btc_witness,
+                );
+                let prev_out =
+                    crate::crypto::virtual_tx::input_prev_out(prev_asset)
+                        .map_err(|e| {
+                            VmError::WitnessValidationFailed(e.to_string())
+                        })?;
+                self.witness_validator.validate_script_spend(
+                    &tx, &prev_out, witness, prev_asset,
+                )?;
             } else {
-                // Key-path: compute a BIP-341 key-spend sighash.
-                crate::crypto::virtual_tx::input_key_spend_sighash(
-                    &base_tx,
-                    prev_asset,
-                    self.new_asset,
-                    idx as u32,
-                    bitcoin::sighash::TapSighashType::Default,
-                )
-                .map_err(|e| VmError::WitnessValidationFailed(e.to_string()))?
-            };
+                // Key-path: compute a BIP-341 key-spend sighash with
+                // the sighash type carried by the signature's trailing
+                // byte (btcd's parseTaprootSigAndPubKey semantics: 64
+                // bytes = default, 65 bytes = explicit non-zero type).
+                // A missing or malformed signature falls back to the
+                // default type here; the witness validator re-checks
+                // the signature shape and rejects it with a precise
+                // error (mirroring btcd, where parse and verify happen
+                // together inside the engine).
+                let sig_hash_type = witness
+                    .tx_witness
+                    .first()
+                    .and_then(|sig| {
+                        crate::crypto::schnorr::taproot_witness_sig_hash_type(
+                            sig,
+                        )
+                        .ok()
+                    })
+                    .unwrap_or(bitcoin::sighash::TapSighashType::Default);
+                let sighash =
+                    crate::crypto::virtual_tx::input_key_spend_sighash(
+                        &base_tx,
+                        prev_asset,
+                        self.new_asset,
+                        idx as u32,
+                        sig_hash_type,
+                    )
+                    .map_err(|e| {
+                        VmError::WitnessValidationFailed(e.to_string())
+                    })?;
 
-            // Delegate to external witness validator with the computed sighash.
-            self.witness_validator.validate_witness(
-                &sighash,
-                witness,
-                prev_asset,
-            )?;
+                // Delegate to the external witness validator with the
+                // computed sighash.
+                self.witness_validator.validate_witness(
+                    &sighash,
+                    witness,
+                    prev_asset,
+                )?;
+            }
         }
 
         Ok(())

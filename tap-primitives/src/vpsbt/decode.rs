@@ -212,6 +212,14 @@ fn validate_x_only_key(value: &[u8], what: &str) -> Result<(), VPsbtError> {
 /// Go's `asset.PrevIDDecoder`.
 fn decode_prev_id(value: &[u8]) -> Result<PrevId, VPsbtError> {
     expect_len(value, 101, "prev ID")?;
+    // Go's PrevIDDecoder decodes the script key with
+    // SerializedKeyDecoder (btcec.ParsePubKey), rejecting off-curve
+    // keys at decode time.
+    let script_key =
+        SerializedKey(value[68..101].try_into().expect("33 bytes"));
+    script_key.validate_on_curve().map_err(|e| {
+        decode_err(format!("prev ID script key: {}", e))
+    })?;
     Ok(PrevId {
         out_point: OutPoint {
             txid: value[..32].try_into().expect("32 bytes"),
@@ -220,9 +228,7 @@ fn decode_prev_id(value: &[u8]) -> Result<PrevId, VPsbtError> {
             ),
         },
         id: AssetId(value[36..68].try_into().expect("32 bytes")),
-        script_key: SerializedKey(
-            value[68..101].try_into().expect("33 bytes"),
-        ),
+        script_key,
     })
 }
 

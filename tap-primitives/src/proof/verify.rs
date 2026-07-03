@@ -246,8 +246,13 @@ fn validate_asset_name(name: &str) -> Result<(), ProofError> {
             MAX_ASSET_NAME_LENGTH
         )));
     }
-    // Rust strings are always valid UTF-8; check printability.
-    if name.chars().any(|c| c.is_control()) {
+    // Rust strings are always valid UTF-8; check printability with
+    // Go's unicode.IsPrint semantics (categories L, M, N, P, S plus
+    // the ASCII space), not just control characters: format characters
+    // like zero width spaces and non-ASCII whitespace are rejected by
+    // Go and must be rejected here too, or we mint assets (and asset
+    // IDs) that Go nodes refuse.
+    if !name.chars().all(is_go_print) {
         return Err(verify_err(
             "asset name cannot contain unprintable character",
         ));
@@ -256,6 +261,46 @@ fn validate_asset_name(name: &str) -> Result<(), ProofError> {
         return Err(verify_err("asset name cannot contain only spaces"));
     }
     Ok(())
+}
+
+/// Mirrors Go's `unicode.IsPrint`: true for letters, marks, numbers,
+/// punctuation, symbols, and the ASCII space.
+///
+/// Unicode versions may differ slightly between Go's bundled tables and
+/// the unicode-general-category crate for newly assigned code points;
+/// both reject unassigned, control, format, surrogate, private use,
+/// and non-ASCII separator characters.
+fn is_go_print(c: char) -> bool {
+    use unicode_general_category::{get_general_category, GeneralCategory};
+
+    if c == ' ' {
+        return true;
+    }
+    matches!(
+        get_general_category(c),
+        GeneralCategory::UppercaseLetter
+            | GeneralCategory::LowercaseLetter
+            | GeneralCategory::TitlecaseLetter
+            | GeneralCategory::ModifierLetter
+            | GeneralCategory::OtherLetter
+            | GeneralCategory::NonspacingMark
+            | GeneralCategory::SpacingMark
+            | GeneralCategory::EnclosingMark
+            | GeneralCategory::DecimalNumber
+            | GeneralCategory::LetterNumber
+            | GeneralCategory::OtherNumber
+            | GeneralCategory::ConnectorPunctuation
+            | GeneralCategory::DashPunctuation
+            | GeneralCategory::OpenPunctuation
+            | GeneralCategory::ClosePunctuation
+            | GeneralCategory::InitialPunctuation
+            | GeneralCategory::FinalPunctuation
+            | GeneralCategory::OtherPunctuation
+            | GeneralCategory::MathSymbol
+            | GeneralCategory::CurrencySymbol
+            | GeneralCategory::ModifierSymbol
+            | GeneralCategory::OtherSymbol
+    )
 }
 
 /// Returns true if the optional preimage is absent or empty, mirroring
@@ -355,7 +400,8 @@ fn derive_by_asset_inclusion(
         asset.script_key.serialized(),
         asset.group_key.is_some(),
     );
-    let leaf = crate::commitment::asset_leaf(asset);
+    let leaf = crate::commitment::asset_leaf(asset)
+        .map_err(|e| verify_err(e.to_string()))?;
 
     // The asset commitment is rebuilt from the proof's own tap key
     // (Go's AssetCommitment{TapKey: p.AssetProof.TapKey}).
@@ -1806,5 +1852,38 @@ mod tests {
             "unexpected ignore error: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_asset_name_go_print_semantics() {
+        // Accepted: letters, numbers, punctuation, symbols (including
+        // emoji, category So), and the ASCII space.
+        for name in ["USD Coin", "asset-1_2.3", "emoji \u{1F600}", "caf\u{e9}"] {
+            assert!(
+                validate_asset_name(name).is_ok(),
+                "expected {:?} to be accepted",
+                name
+            );
+        }
+
+        // Rejected like Go's !unicode.IsPrint: control, format (zero
+        // width space, soft hyphen, zero width joiner), and non-ASCII
+        // separators (no-break space, ideographic space).
+        for name in [
+            "bad\u{0007}name",
+            "zero\u{200B}width",
+            "soft\u{00AD}hyphen",
+            "joiner\u{200D}x",
+            "nbsp\u{00A0}x",
+            "wide\u{3000}space",
+            "tab\tname",
+            "line\nname",
+        ] {
+            assert!(
+                validate_asset_name(name).is_err(),
+                "expected {:?} to be rejected",
+                name
+            );
+        }
     }
 }

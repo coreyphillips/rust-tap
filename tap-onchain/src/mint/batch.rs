@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 
+use tap_primitives::asset::Asset;
 use tap_primitives::commitment::TapCommitmentTree;
 
 use super::seedling::Seedling;
@@ -98,6 +99,12 @@ pub struct MintingBatch {
     /// Committed). Retains its MS-SMT trees so genesis inclusion
     /// proofs can be derived after confirmation.
     pub root_asset_commitment: Option<TapCommitmentTree>,
+    /// The assets sprouted from the batch's seedlings (set during
+    /// Committed, alongside `root_asset_commitment`). Each asset
+    /// carries the real genesis (including the seedling's meta hash)
+    /// and the real script key (the seedling override, or the BIP-86
+    /// tweaked batch key). Transient: not persisted by batch stores.
+    pub sprouted_assets: Vec<Asset>,
     /// Signed genesis transaction bytes (set during Broadcast).
     pub signed_tx: Option<Vec<u8>>,
     /// The genesis outpoint after signing (set during Broadcast).
@@ -119,6 +126,7 @@ impl MintingBatch {
             seedlings: HashMap::new(),
             genesis_psbt: None,
             root_asset_commitment: None,
+            sprouted_assets: Vec::new(),
             signed_tx: None,
             genesis_outpoint: None,
             confirmation: None,

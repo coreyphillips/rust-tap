@@ -368,9 +368,16 @@ pub fn decode_taproot_proof(data: &[u8]) -> Result<TaprootProof, ProofError> {
             }
             taproot_tlv::INTERNAL_KEY => {
                 expect_len(record, 33, "internal key")?;
-                proof.internal_key = SerializedKey(
+                let key = SerializedKey(
                     record.value[..].try_into().unwrap(),
                 );
+                // Go's TaprootProofInternalKeyRecord decodes with
+                // asset.CompressedPubKeyDecoder (btcec.ParsePubKey),
+                // rejecting off-curve keys at decode time.
+                key.validate_on_curve().map_err(|e| {
+                    decode_err(format!("internal key: {}", e))
+                })?;
+                proof.internal_key = key;
             }
             taproot_tlv::COMMITMENT_PROOF => {
                 proof.commitment_proof =
@@ -678,8 +685,16 @@ pub fn decode_group_key_reveal(
         if data.len() < KEY_LEN {
             return Err(decode_err("group key reveal too short"));
         }
+        // Go's GroupKeyRevealV0.Decode reads the raw key with
+        // SerializedKeyDecoder (btcec.ParsePubKey), rejecting off-curve
+        // keys at decode time.
+        let raw_key =
+            SerializedKey(data[..KEY_LEN].try_into().unwrap());
+        raw_key.validate_on_curve().map_err(|e| {
+            decode_err(format!("group key reveal raw key: {}", e))
+        })?;
         return Ok(GroupKeyReveal::V0(GroupKeyRevealV0 {
-            raw_key: SerializedKey(data[..KEY_LEN].try_into().unwrap()),
+            raw_key,
             tapscript_root: data[KEY_LEN..].to_vec(),
         }));
     }
@@ -704,6 +719,11 @@ pub fn decode_group_key_reveal(
             }
             asset::tlv_types::GKR_INTERNAL_KEY => {
                 expect_len(record, 33, "group key reveal internal key")?;
+                // Deliberately NOT curve-validated: Go decodes the V1
+                // internal key as a raw 33-byte primitive record
+                // (asset/group_key.go:322, tlv.MakePrimitiveRecord)
+                // and only parses it later in Reveal(). Keep raw for
+                // parity.
                 internal_key = Some(SerializedKey(
                     record.value[..].try_into().unwrap(),
                 ));
@@ -839,7 +859,7 @@ mod tests {
         let mut alt_leaf = default_asset();
         alt_leaf.script_version = ScriptVersion(1);
         alt_leaf.script_key =
-            ScriptKey::from_pub_key(SerializedKey([0x03; 33]));
+            ScriptKey::from_pub_key(SerializedKey({ let mut k = [0x22; 33]; k[0] = 0x03; k }));
         proof.alt_leaves = vec![alt_leaf];
 
         let encoded = encode_proof(&proof);
@@ -909,7 +929,7 @@ mod tests {
         use crate::proof::encode::encode_group_key_reveal;
 
         let reveal = GroupKeyReveal::V0(GroupKeyRevealV0 {
-            raw_key: SerializedKey([0x03; 33]),
+            raw_key: SerializedKey({ let mut k = [0x22; 33]; k[0] = 0x03; k }),
             tapscript_root: vec![0x04; 32],
         });
         let encoded = encode_group_key_reveal(&reveal);
@@ -918,7 +938,7 @@ mod tests {
 
         // Empty tapscript root variant.
         let reveal = GroupKeyReveal::V0(GroupKeyRevealV0 {
-            raw_key: SerializedKey([0x03; 33]),
+            raw_key: SerializedKey({ let mut k = [0x22; 33]; k[0] = 0x03; k }),
             tapscript_root: vec![],
         });
         let encoded = encode_group_key_reveal(&reveal);
@@ -932,11 +952,72 @@ mod tests {
 
         let reveal = GroupKeyReveal::V1(GroupKeyRevealV1 {
             version: 2,
-            internal_key: SerializedKey([0x03; 33]),
+            internal_key: SerializedKey({ let mut k = [0x22; 33]; k[0] = 0x03; k }),
             tapscript: GroupKeyRevealTapscript {
                 version: 2,
                 root: vec![0x05; 32],
                 custom_subtree_root: Some([0x06; 32]),
+            },
+        });
+        let encoded = encode_group_key_reveal(&reveal);
+        let decoded = decode_group_key_reveal(&encoded).unwrap();
+        assert_eq!(decoded, reveal);
+    }
+
+    /// A 33-byte key with a valid compressed prefix whose x coordinate
+    /// (0x03 repeated) is not on the curve.
+    fn off_curve_key() -> SerializedKey {
+        let mut k = [0x03; 33];
+        k[0] = 0x02;
+        SerializedKey(k)
+    }
+
+    #[test]
+    fn test_decode_taproot_proof_rejects_off_curve_internal_key() {
+        let proof = TaprootProof {
+            output_index: 1,
+            internal_key: off_curve_key(),
+            commitment_proof: None,
+            tapscript_proof: Some(TapscriptProof {
+                tap_preimage_1: None,
+                tap_preimage_2: None,
+                bip86: true,
+                unknown_odd_types: BTreeMap::new(),
+            }),
+            unknown_odd_types: BTreeMap::new(),
+        };
+        let encoded = encode_taproot_proof(&proof);
+        assert!(decode_taproot_proof(&encoded).is_err());
+    }
+
+    #[test]
+    fn test_group_key_reveal_v0_rejects_off_curve_key() {
+        use crate::proof::encode::encode_group_key_reveal;
+
+        // V0 validates the raw key on-curve at decode time (Go's
+        // SerializedKeyDecoder).
+        let reveal = GroupKeyReveal::V0(GroupKeyRevealV0 {
+            raw_key: off_curve_key(),
+            tapscript_root: vec![0x04; 32],
+        });
+        let encoded = encode_group_key_reveal(&reveal);
+        assert!(decode_group_key_reveal(&encoded).is_err());
+    }
+
+    #[test]
+    fn test_group_key_reveal_v1_keeps_raw_internal_key() {
+        use crate::proof::encode::encode_group_key_reveal;
+
+        // V1 stores the internal key RAW at decode time, like Go's
+        // primitive [33]byte record (asset/group_key.go:322); an
+        // off-curve key must decode successfully.
+        let reveal = GroupKeyReveal::V1(GroupKeyRevealV1 {
+            version: 2,
+            internal_key: off_curve_key(),
+            tapscript: GroupKeyRevealTapscript {
+                version: 2,
+                root: vec![0x05; 32],
+                custom_subtree_root: None,
             },
         });
         let encoded = encode_group_key_reveal(&reveal);

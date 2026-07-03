@@ -68,6 +68,14 @@ pub struct TransitionProofParams {
 ///
 /// This is the transfer equivalent of `generate_genesis_proof` — it links
 /// the new asset state to a confirmed Bitcoin transaction and block.
+#[deprecated(
+    since = "0.1.0",
+    note = "use the suffix API instead \
+            (`create_proof_suffix`/`create_proof_suffix_with_options` + \
+            `update_proof_chain_data`), which derives inclusion, \
+            exclusion, split-root, and STXO proofs from the output \
+            commitments like Go's tapsend.CreateProofSuffix"
+)]
 pub fn generate_transition_proof(
     params: TransitionProofParams,
 ) -> Result<proof::Proof, String> {
@@ -123,82 +131,36 @@ pub fn generate_transition_proof(
 
 /// Appends a transition proof to an existing proof file.
 ///
-/// Validates that the new proof's `prev_out` matches the last proof's
-/// anchor outpoint, then appends it to the file's hash chain.
+/// The proof is encoded with the full proof encoder
+/// ([`tap_primitives::proof::encode::encode_proof`]), so every field of
+/// the generated proof (inclusion proof commitment data, exclusion
+/// proofs, split root proof, alt leaves, ...) round-trips losslessly.
+#[deprecated(
+    since = "0.1.0",
+    note = "use the suffix API instead \
+            (`create_proof_suffix`/`create_proof_suffix_with_options` + \
+            `update_proof_chain_data` + `File::append_proof`), which \
+            derives complete proofs from the output commitments like \
+            Go's tapsend.CreateProofSuffix"
+)]
+#[allow(deprecated)]
 pub fn append_transition(
     file: &mut proof::File,
     params: TransitionProofParams,
 ) -> Result<(), String> {
     let proof = generate_transition_proof(params)?;
 
-    // Encode the proof for the file.
-    // The File's append_proof method handles hash chain validation.
-    let proof_bytes = encode_proof(&proof);
+    // Encode with the complete proof encoder (the same one the suffix
+    // API and tap-node use); an earlier local encoder here dropped the
+    // commitment proof, exclusion proofs, split root proof, and alt
+    // leaves, producing proofs that could never verify.
+    let proof_bytes = tap_primitives::proof::encode::encode_proof(&proof);
     file.append_proof(proof_bytes);
     Ok(())
 }
 
-/// Encodes a proof to bytes for file storage using TLV format.
-///
-/// TLV types match Go's proof encoding for cross-implementation compatibility.
-fn encode_proof(proof: &proof::Proof) -> Vec<u8> {
-    use tap_primitives::encoding::tlv::{TlvRecord, TlvStream};
-
-    let mut stream = TlvStream::new();
-
-    // Type 0: Version.
-    stream.push(TlvRecord::u8(0, proof.version as u8));
-
-    // Type 1: PrevOut (txid + vout).
-    let mut prevout_bytes = Vec::with_capacity(36);
-    prevout_bytes.extend_from_slice(&proof.prev_out.txid);
-    prevout_bytes.extend_from_slice(&proof.prev_out.vout.to_be_bytes());
-    stream.push(TlvRecord::bytes(1, &prevout_bytes));
-
-    // Type 2: Block header (80 bytes).
-    stream.push(TlvRecord::bytes(2, &proof.block_header.0));
-
-    // Type 3: Block height.
-    stream.push(TlvRecord::varint(3, proof.block_height as u64));
-
-    // Type 4: Anchor transaction.
-    stream.push(TlvRecord::bytes(4, &proof.anchor_tx.to_bytes()));
-
-    // Type 5: Tx merkle proof (nodes + direction bits).
-    let mut merkle_bytes = Vec::new();
-    // Encode node count + nodes + bits.
-    merkle_bytes.extend_from_slice(&(proof.tx_merkle_proof.nodes.len() as u32).to_be_bytes());
-    for node in &proof.tx_merkle_proof.nodes {
-        merkle_bytes.extend_from_slice(node);
-    }
-    for &bit in &proof.tx_merkle_proof.bits {
-        merkle_bytes.push(if bit { 1 } else { 0 });
-    }
-    stream.push(TlvRecord::bytes(5, &merkle_bytes));
-
-    // Type 6: Asset (full TLV encoding).
-    let asset_bytes = tap_primitives::encoding::asset::encode_asset(
-        &proof.asset,
-        tap_primitives::asset::EncodeType::Normal,
-    );
-    stream.push(TlvRecord::bytes(6, &asset_bytes));
-
-    // Type 7: Inclusion proof (output_index + internal_key).
-    let mut incl_bytes = Vec::new();
-    incl_bytes.extend_from_slice(&proof.inclusion_proof.output_index.to_be_bytes());
-    incl_bytes.extend_from_slice(proof.inclusion_proof.internal_key.as_bytes());
-    stream.push(TlvRecord::bytes(7, &incl_bytes));
-
-    // Type 9: Genesis reveal (odd = optional).
-    if let Some(ref genesis) = proof.genesis_reveal {
-        let genesis_bytes = tap_primitives::encoding::asset::encode_genesis(genesis);
-        stream.push(TlvRecord::bytes(9, &genesis_bytes));
-    }
-
-    stream.encode()
-}
-
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use tap_primitives::asset::*;
@@ -274,5 +236,102 @@ mod tests {
         assert_eq!(proof.block_height, 800_001);
         assert!(proof.genesis_reveal.is_none());
         assert!(!proof.asset.is_genesis_asset());
+    }
+
+    #[test]
+    fn test_append_transition_is_lossless() {
+        // append_transition must encode with the full proof encoder:
+        // the appended bytes decode back to the exact generated proof
+        // (an earlier local encoder dropped the commitment proof,
+        // exclusion proofs, and more).
+        let genesis = test_genesis();
+        let prev_key = SerializedKey([0x02; 33]);
+        let prev_id = PrevId {
+            out_point: OutPoint { txid: [0xBB; 32], vout: 0 },
+            id: genesis.id(),
+            script_key: prev_key,
+        };
+
+        // An on-curve script key (x = 0xAA repeated is a valid x
+        // coordinate); decode now validates keys like Go.
+        let mut new_key = [0xAA; 33];
+        new_key[0] = 0x02;
+        let new_asset = Asset {
+            version: AssetVersion::V0,
+            genesis: genesis.clone(),
+            amount: 100,
+            lock_time: 0,
+            relative_lock_time: 0,
+            prev_witnesses: vec![Witness {
+                prev_id: Some(prev_id),
+                tx_witness: vec![vec![0x01; 64]],
+                split_commitment: None,
+            }],
+            split_commitment_root: None,
+            script_version: ScriptVersion::V0,
+            script_key: ScriptKey::from_pub_key(SerializedKey(new_key)),
+            group_key: None,
+            unknown_odd_types: BTreeMap::new(),
+        };
+
+        // Build a commitment tree holding the asset so the generated
+        // proof carries a real inclusion commitment proof.
+        let ac = tap_primitives::commitment::AssetCommitmentTree::new(&[
+            &new_asset,
+        ])
+        .unwrap();
+        let tc = tap_primitives::commitment::TapCommitmentTree::new(
+            tap_primitives::commitment::TapCommitmentVersion::V0,
+            vec![ac],
+        )
+        .unwrap();
+
+        let make_params = || TransitionProofParams {
+            base: BaseProofParams {
+                block_header: [0u8; 80],
+                block_height: 800_001,
+                anchor_tx_bytes: bitcoin::consensus::encode::serialize(
+                    &bitcoin::Transaction {
+                        version: bitcoin::transaction::Version(2),
+                        lock_time: bitcoin::absolute::LockTime::ZERO,
+                        input: vec![bitcoin::TxIn::default()],
+                        output: vec![],
+                    },
+                ),
+                tx_index: 1,
+                block_tx_hashes: vec![[0xCC; 32], [0xDD; 32]],
+                output_index: 0,
+                internal_key: SerializedKey([0x02; 33]),
+            },
+            prev_out: OutPoint { txid: [0xBB; 32], vout: 0 },
+            new_asset: new_asset.clone(),
+            commitment: Some(tc.clone()),
+            commitment_proof: None,
+            exclusion_proofs: vec![],
+            split_root_proof: None,
+            additional_inputs: vec![],
+        };
+
+        let expected = generate_transition_proof(make_params()).unwrap();
+        assert!(
+            expected.inclusion_proof.commitment_proof.is_some(),
+            "test setup must produce a commitment proof"
+        );
+
+        let mut file = tap_primitives::proof::file::File::new();
+        append_transition(&mut file, make_params()).unwrap();
+
+        let appended = file.proofs.last().unwrap();
+        let decoded = tap_primitives::proof::decode::decode_proof(
+            &appended.proof_bytes,
+        )
+        .unwrap();
+
+        // Byte-for-byte identical re-encoding proves nothing was lost.
+        assert_eq!(
+            tap_primitives::proof::encode::encode_proof(&decoded),
+            tap_primitives::proof::encode::encode_proof(&expected),
+        );
+        assert!(decoded.inclusion_proof.commitment_proof.is_some());
     }
 }

@@ -11,10 +11,11 @@
 
 use std::collections::HashMap;
 
-use tap_primitives::asset::{AssetId, OutPoint, SerializedKey};
+use tap_onchain::chain::KeyDescriptor;
+use tap_primitives::asset::{AssetId, AssetType, OutPoint, SerializedKey};
 
 /// A tracked asset with its on-chain location and proof.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnedAsset {
     /// The asset ID.
     pub asset_id: AssetId,
@@ -28,6 +29,52 @@ pub struct OwnedAsset {
     pub spent: bool,
     /// Block height at which this asset was confirmed.
     pub block_height: u32,
+    /// Key descriptor (family, index, raw key) behind the script key,
+    /// when the script key is derived from a local wallet key.
+    pub script_key_desc: Option<KeyDescriptor>,
+    /// The taproot internal key of the anchor output, when known.
+    pub internal_key: Option<KeyDescriptor>,
+    /// The genesis outpoint (`Genesis::first_prev_out`, the first
+    /// input of the genesis transaction), when known. Together with
+    /// the other genesis fields this allows reconstructing the
+    /// `tap_primitives::asset::Genesis` of the asset.
+    pub genesis_point: Option<OutPoint>,
+    /// The genesis tag (asset name), when known.
+    pub genesis_tag: Option<String>,
+    /// The genesis meta hash, when known.
+    pub genesis_meta_hash: Option<[u8; 32]>,
+    /// The genesis output index, when known.
+    pub genesis_output_index: Option<u32>,
+    /// The asset type (normal/collectible), when known.
+    pub genesis_asset_type: Option<AssetType>,
+}
+
+impl OwnedAsset {
+    /// Creates an owned asset with the required fields; the optional
+    /// key descriptors and genesis fields default to `None`.
+    pub fn new(
+        asset_id: AssetId,
+        amount: u64,
+        anchor_outpoint: OutPoint,
+        script_key: SerializedKey,
+        block_height: u32,
+    ) -> Self {
+        OwnedAsset {
+            asset_id,
+            amount,
+            anchor_outpoint,
+            script_key,
+            spent: false,
+            block_height,
+            script_key_desc: None,
+            internal_key: None,
+            genesis_point: None,
+            genesis_tag: None,
+            genesis_meta_hash: None,
+            genesis_output_index: None,
+            genesis_asset_type: None,
+        }
+    }
 }
 
 /// A record of a completed asset burn.
@@ -57,11 +104,43 @@ pub struct BurnRecord {
 
 /// Trait for persisting owned assets.
 pub trait AssetStore {
-    /// Stores a newly received/minted asset.
+    /// Stores a newly received/minted asset. A single anchor outpoint
+    /// can carry several assets (e.g. a multi-asset mint batch);
+    /// implementations must key on at least (outpoint, asset ID,
+    /// script key).
     fn insert_asset(&mut self, asset: OwnedAsset) -> Result<(), String>;
 
-    /// Marks an asset as spent.
-    fn mark_spent(&mut self, outpoint: &OutPoint) -> Result<(), String>;
+    /// Marks the single asset identified by (outpoint, asset ID, script
+    /// key) as spent. Only the exact asset being spent is flipped: a
+    /// sibling asset sharing the anchor UTXO (a multi-asset mint batch,
+    /// or the change of a prior transfer) must be re-anchored into a new
+    /// output rather than silently dropped, so it must never be flipped
+    /// here. Errors if no such asset exists.
+    fn mark_spent(
+        &mut self,
+        outpoint: &OutPoint,
+        asset_id: &AssetId,
+        script_key: &SerializedKey,
+    ) -> Result<(), String>;
+
+    /// Returns all unspent assets anchored at the given outpoint,
+    /// regardless of asset ID or script key. Used to discover the
+    /// "passive" assets that share an anchor with a spent input and must
+    /// be re-anchored (Go's passive-asset set).
+    fn unspent_at_outpoint(&self, outpoint: &OutPoint) -> Vec<OwnedAsset>;
+
+    /// Sets the confirmed block height on every asset anchored at the
+    /// given outpoint (a mint or transfer anchor output can carry
+    /// several assets). Assets broadcast by this node are first
+    /// persisted with block height 0; the confirmation watcher records
+    /// the real height once the anchor transaction confirms. An
+    /// outpoint with no stored assets is a no-op, not an error, so the
+    /// update is idempotent and safe to retry.
+    fn set_anchor_block_height(
+        &mut self,
+        outpoint: &OutPoint,
+        block_height: u32,
+    ) -> Result<(), String>;
 
     /// Returns all unspent assets for a given asset ID.
     fn get_unspent(&self, asset_id: &AssetId) -> Vec<OwnedAsset>;
@@ -80,9 +159,12 @@ pub trait AssetStore {
 }
 
 /// In-memory asset store for testing.
+///
+/// Keyed by (anchor outpoint, asset ID, script key): a single anchor
+/// output's TAP commitment can carry several assets.
 #[derive(Default)]
 pub struct MemoryAssetStore {
-    assets: HashMap<OutPoint, OwnedAsset>,
+    assets: HashMap<(OutPoint, AssetId, SerializedKey), OwnedAsset>,
     burns: Vec<BurnRecord>,
 }
 
@@ -94,17 +176,47 @@ impl MemoryAssetStore {
 
 impl AssetStore for MemoryAssetStore {
     fn insert_asset(&mut self, asset: OwnedAsset) -> Result<(), String> {
-        self.assets.insert(asset.anchor_outpoint, asset);
+        self.assets.insert(
+            (asset.anchor_outpoint, asset.asset_id, asset.script_key),
+            asset,
+        );
         Ok(())
     }
 
-    fn mark_spent(&mut self, outpoint: &OutPoint) -> Result<(), String> {
-        if let Some(asset) = self.assets.get_mut(outpoint) {
-            asset.spent = true;
-            Ok(())
-        } else {
-            Err("asset not found".into())
+    fn mark_spent(
+        &mut self,
+        outpoint: &OutPoint,
+        asset_id: &AssetId,
+        script_key: &SerializedKey,
+    ) -> Result<(), String> {
+        match self.assets.get_mut(&(*outpoint, *asset_id, *script_key)) {
+            Some(asset) => {
+                asset.spent = true;
+                Ok(())
+            }
+            None => Err("asset not found".into()),
         }
+    }
+
+    fn unspent_at_outpoint(&self, outpoint: &OutPoint) -> Vec<OwnedAsset> {
+        self.assets
+            .values()
+            .filter(|a| a.anchor_outpoint == *outpoint && !a.spent)
+            .cloned()
+            .collect()
+    }
+
+    fn set_anchor_block_height(
+        &mut self,
+        outpoint: &OutPoint,
+        block_height: u32,
+    ) -> Result<(), String> {
+        for asset in self.assets.values_mut() {
+            if asset.anchor_outpoint == *outpoint {
+                asset.block_height = block_height;
+            }
+        }
+        Ok(())
     }
 
     fn get_unspent(&self, asset_id: &AssetId) -> Vec<OwnedAsset> {
@@ -146,17 +258,57 @@ mod tests {
     use super::*;
 
     fn test_asset(id_byte: u8, amount: u64, vout: u32) -> OwnedAsset {
-        OwnedAsset {
-            asset_id: AssetId([id_byte; 32]),
+        OwnedAsset::new(
+            AssetId([id_byte; 32]),
             amount,
-            anchor_outpoint: OutPoint {
+            OutPoint {
                 txid: [0xAA; 32],
                 vout,
             },
-            script_key: SerializedKey([0x02; 33]),
-            spent: false,
-            block_height: 800_000,
-        }
+            SerializedKey([0x02; 33]),
+            800_000,
+        )
+    }
+
+    /// An asset with all optional key descriptor and genesis fields set.
+    fn test_asset_full(vout: u32) -> OwnedAsset {
+        let mut asset = test_asset(0xAA, 100, vout);
+        asset.script_key_desc = Some(KeyDescriptor {
+            family: 212,
+            index: 7,
+            pub_key: SerializedKey([0x02; 33]),
+        });
+        asset.internal_key = Some(KeyDescriptor {
+            family: 212,
+            index: 8,
+            pub_key: SerializedKey([0x03; 33]),
+        });
+        asset.genesis_point = Some(OutPoint {
+            txid: [0x55; 32],
+            vout: 2,
+        });
+        asset.genesis_tag = Some("test-coin".to_string());
+        asset.genesis_meta_hash = Some([0x44; 32]);
+        asset.genesis_output_index = Some(1);
+        asset.genesis_asset_type = Some(AssetType::Normal);
+        asset
+    }
+
+    #[test]
+    fn test_asset_optional_fields_round_trip() {
+        let mut store = MemoryAssetStore::new();
+        let full = test_asset_full(0);
+        store.insert_asset(full.clone()).unwrap();
+
+        // Bare asset (all optional fields None) alongside.
+        let bare = test_asset(0xAA, 50, 1);
+        store.insert_asset(bare.clone()).unwrap();
+
+        let mut assets = store.get_unspent(&AssetId([0xAA; 32]));
+        assets.sort_by_key(|a| a.anchor_outpoint.vout);
+        assert_eq!(assets.len(), 2);
+        assert_eq!(assets[0], full);
+        assert_eq!(assets[1], bare);
     }
 
     #[test]
@@ -178,10 +330,117 @@ mod tests {
             txid: [0xAA; 32],
             vout: 0,
         };
-        store.mark_spent(&outpoint).unwrap();
+        store
+            .mark_spent(
+                &outpoint,
+                &AssetId([0xAA; 32]),
+                &SerializedKey([0x02; 33]),
+            )
+            .unwrap();
 
         assert_eq!(store.balance(&AssetId([0xAA; 32])), 0);
         assert!(store.get_unspent(&AssetId([0xAA; 32])).is_empty());
+    }
+
+    /// mark_spent must flip only the exact (outpoint, asset id, script
+    /// key) asset, leaving siblings sharing the anchor outpoint unspent
+    /// (the passive-asset preservation invariant).
+    #[test]
+    fn test_mark_spent_scoped_to_identity() {
+        let mut store = MemoryAssetStore::new();
+        let outpoint = OutPoint {
+            txid: [0xAA; 32],
+            vout: 0,
+        };
+
+        // Two sibling assets at the same anchor outpoint, distinct
+        // asset ids and script keys.
+        let mut a = test_asset(0xAA, 100, 0);
+        a.script_key = SerializedKey([0x02; 33]);
+        let mut b = test_asset(0xBB, 200, 0);
+        b.script_key = SerializedKey([0x03; 33]);
+        store.insert_asset(a).unwrap();
+        store.insert_asset(b).unwrap();
+
+        // Spend only asset A.
+        store
+            .mark_spent(
+                &outpoint,
+                &AssetId([0xAA; 32]),
+                &SerializedKey([0x02; 33]),
+            )
+            .unwrap();
+
+        // A is gone; B (the passive sibling) is untouched.
+        assert_eq!(store.balance(&AssetId([0xAA; 32])), 0);
+        assert_eq!(store.balance(&AssetId([0xBB; 32])), 200);
+
+        // unspent_at_outpoint returns only the surviving sibling.
+        let survivors = store.unspent_at_outpoint(&outpoint);
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].asset_id, AssetId([0xBB; 32]));
+    }
+
+    #[test]
+    fn test_mark_spent_wrong_identity_not_found() {
+        let mut store = MemoryAssetStore::new();
+        store.insert_asset(test_asset(0xAA, 100, 0)).unwrap();
+        let outpoint = OutPoint {
+            txid: [0xAA; 32],
+            vout: 0,
+        };
+        // Right outpoint, wrong script key: no such asset.
+        assert!(store
+            .mark_spent(
+                &outpoint,
+                &AssetId([0xAA; 32]),
+                &SerializedKey([0x09; 33]),
+            )
+            .is_err());
+        // The real asset stays unspent.
+        assert_eq!(store.balance(&AssetId([0xAA; 32])), 100);
+    }
+
+    /// set_anchor_block_height updates every asset at the outpoint
+    /// (multi-asset anchors), leaves other outpoints alone, and is a
+    /// no-op for unknown outpoints.
+    #[test]
+    fn test_set_anchor_block_height() {
+        let mut store = MemoryAssetStore::new();
+        let mut a = test_asset(0xAA, 100, 0);
+        a.block_height = 0;
+        let mut b = test_asset(0xBB, 200, 0);
+        b.script_key = SerializedKey([0x03; 33]);
+        b.block_height = 0;
+        let c = test_asset(0xCC, 300, 1);
+        store.insert_asset(a).unwrap();
+        store.insert_asset(b).unwrap();
+        store.insert_asset(c).unwrap();
+
+        let outpoint = OutPoint {
+            txid: [0xAA; 32],
+            vout: 0,
+        };
+        store.set_anchor_block_height(&outpoint, 812_000).unwrap();
+
+        let mut assets = store.list_unspent();
+        assets.sort_by_key(|x| x.anchor_outpoint.vout);
+        assert_eq!(assets.len(), 3);
+        assert_eq!(assets[0].block_height, 812_000);
+        assert_eq!(assets[1].block_height, 812_000);
+        // The asset at the other outpoint keeps its original height.
+        assert_eq!(assets[2].block_height, 800_000);
+
+        // Unknown outpoint: idempotent no-op.
+        store
+            .set_anchor_block_height(
+                &OutPoint {
+                    txid: [0xFF; 32],
+                    vout: 9,
+                },
+                1,
+            )
+            .unwrap();
     }
 
     fn test_burn(id_byte: u8, amount: u64, vout: u32) -> BurnRecord {

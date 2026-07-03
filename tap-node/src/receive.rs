@@ -25,8 +25,8 @@ use tap_primitives::address::{
     self, AddressVersion, NewAddressParams, TapAddress,
 };
 use tap_primitives::asset::{
-    derive_unique_script_key, AssetId, AssetType, OutPoint,
-    SerializedKey, TAPROOT_ASSETS_KEY_FAMILY,
+    derive_unique_script_key, AssetId, AssetType, Genesis, OutPoint,
+    ScriptKey, SerializedKey, TAPROOT_ASSETS_KEY_FAMILY,
 };
 use tap_primitives::proof;
 
@@ -75,9 +75,14 @@ where
     L: LdkChannelOps + Send + Sync + 'static,
     P: PriceOracle + Send + Sync + 'static,
 {
-    // Derive a new script key.
+    // Derive a new script key. The address carries the BIP-86 tweak
+    // of the derived key (Go's NewScriptKeyBip86), matching the
+    // mint/change convention, so an asset received on it can later be
+    // signed through the AssetSigner seam (whose contract is the
+    // BIP-86 key-spend tweak of the stored raw key).
     let script_key_desc =
         node.keys.derive_next_key(TAPROOT_ASSETS_KEY_FAMILY)?;
+    let script_key = ScriptKey::bip86(script_key_desc.pub_key);
     // Derive a new internal key.
     let internal_key_desc =
         node.keys.derive_next_key(TAPROOT_ASSETS_KEY_FAMILY)?;
@@ -92,7 +97,7 @@ where
         version: AddressVersion::V0,
         asset_version: 0,
         asset_id: Some(asset_id),
-        script_key: script_key_desc.pub_key,
+        script_key: script_key.pub_key,
         internal_key: internal_key_desc.pub_key,
         amount,
         network: node.config.network,
@@ -101,6 +106,25 @@ where
         tapscript_sibling: None,
         unknown_odd_types: BTreeMap::new(),
     };
+
+    // Record the address and the descriptors behind its keys in the
+    // address book, so the proof import path can attach the signing
+    // context to assets received on it. Without the stored descriptor
+    // a received asset could never be sent onward (the signer would
+    // fail with UnknownScriptKey even though this node derived the
+    // key).
+    {
+        let mut store =
+            node.mailbox_store.lock().expect("mailbox store lock");
+        store.insert_address(&addr).map_err(TapNodeError::Storage)?;
+        store
+            .set_key_descriptors(
+                &addr.script_key,
+                &script_key_desc,
+                &internal_key_desc,
+            )
+            .map_err(TapNodeError::Storage)?;
+    }
 
     Ok(addr)
 }
@@ -152,11 +176,22 @@ where
         tapscript_sibling: None,
     })?;
 
-    node.mailbox_store
-        .lock()
-        .expect("mailbox store lock")
-        .insert_address(&addr)
-        .map_err(TapNodeError::Storage)?;
+    // Persist the address plus the descriptors behind its keys: the
+    // unique per-asset script keys of incoming sends are derived from
+    // the address script key, so the descriptor is the signing context
+    // for every asset received on this address.
+    {
+        let mut store =
+            node.mailbox_store.lock().expect("mailbox store lock");
+        store.insert_address(&addr).map_err(TapNodeError::Storage)?;
+        store
+            .set_key_descriptors(
+                &addr.script_key,
+                &script_key_desc,
+                &internal_key_desc,
+            )
+            .map_err(TapNodeError::Storage)?;
+    }
 
     Ok(addr)
 }
@@ -191,6 +226,12 @@ where
     L: LdkChannelOps + Send + Sync + 'static,
     P: PriceOracle + Send + Sync + 'static,
 {
+    // Serialize with the other asset-store-writing flows (see
+    // `TapNode::send_lock`): the cursor read/advance and the proof and
+    // asset imports below are not atomic, so a concurrent poll (or
+    // send) must not interleave.
+    let _send_guard = node.send_lock.lock().expect("send lock");
+
     // No transport configured: documented no-op.
     let transport = match &node.mailbox_transport {
         Some(t) => t.as_ref(),
@@ -219,6 +260,19 @@ where
         // For V2 addresses the mailbox receiver key is the address
         // script key (Go: SendManifest.Receiver = addr.ScriptKey).
         let receiver_key = addr.script_key;
+
+        // The wallet key descriptors stored when the address was
+        // generated: the signing context attached to every asset
+        // imported for this address. The unique per-asset script keys
+        // below are tweaks of the address script key, so its
+        // descriptor is the raw key behind them; the address internal
+        // key is the anchor output internal key the sender used.
+        let key_descs = node
+            .mailbox_store
+            .lock()
+            .expect("mailbox store lock")
+            .key_descriptors(&receiver_key)
+            .map_err(TapNodeError::Storage)?;
 
         let cursor = node
             .mailbox_store
@@ -314,14 +368,12 @@ where
                         }
                     };
 
-                if let Err(e) = check_received_proof(
+                let genesis = check_received_proof(
                     &annotated.proof_file,
                     asset_id,
                     &script_key,
                     output.amount,
-                ) {
-                    return Err(e);
-                }
+                )?;
 
                 fragment_assets.push((
                     ReceivedAsset {
@@ -332,6 +384,7 @@ where
                         block_height: fragment.block_height,
                     },
                     annotated.proof_file,
+                    genesis,
                 ));
             }
 
@@ -340,7 +393,7 @@ where
             }
 
             // All outputs of this fragment check out: import them.
-            for (asset, proof_file) in fragment_assets {
+            for (asset, proof_file, genesis) in fragment_assets {
                 node.proof_store
                     .lock()
                     .expect("proof store lock")
@@ -353,17 +406,41 @@ where
                     )
                     .map_err(TapNodeError::Storage)?;
 
+                // Persist the asset with its full context: the block
+                // height from the chain-verified fragment, the genesis
+                // fields from the verified proof (needed to
+                // reconstruct the Genesis when spending), and the key
+                // descriptors stored with the address (the signing
+                // context; see the `key_descs` lookup above).
+                //
+                // NOTE: the unique per-asset script key is a
+                // Pedersen-leaf tapscript tweak of the address key.
+                // The current AssetSigner seam cannot apply that
+                // tweak, so `send_asset` refuses these assets with a
+                // precise error (see `ensure_seam_signable` in
+                // `send.rs`) until the signer seam grows tapscript
+                // tweak support. The descriptor is persisted anyway so
+                // the context is not lost.
+                let mut owned = OwnedAsset::new(
+                    asset.asset_id,
+                    asset.amount,
+                    asset.anchor_outpoint,
+                    asset.script_key,
+                    asset.block_height,
+                );
+                if let Some((script_desc, internal_desc)) = &key_descs {
+                    owned.script_key_desc = Some(script_desc.clone());
+                    owned.internal_key = Some(internal_desc.clone());
+                }
+                owned.genesis_point = Some(genesis.first_prev_out);
+                owned.genesis_tag = Some(genesis.tag.clone());
+                owned.genesis_meta_hash = Some(genesis.meta_hash);
+                owned.genesis_output_index = Some(genesis.output_index);
+                owned.genesis_asset_type = Some(genesis.asset_type);
                 node.asset_store
                     .lock()
                     .expect("asset store lock")
-                    .insert_asset(OwnedAsset {
-                        asset_id: asset.asset_id,
-                        amount: asset.amount,
-                        anchor_outpoint: asset.anchor_outpoint,
-                        script_key: asset.script_key,
-                        spent: false,
-                        block_height: asset.block_height,
-                    })
+                    .insert_asset(owned)
                     .map_err(TapNodeError::Storage)?;
 
                 node.event_bus.emit(
@@ -418,6 +495,9 @@ where
 /// Checks a proof file received for a V2 mailbox transfer: the hash
 /// chain must verify and the final proof's asset must match the
 /// fragment output (asset ID, derived script key, and amount).
+/// Returns the asset's [`Genesis`] from the verified proof so the
+/// import can persist the genesis fields (needed to reconstruct the
+/// `Genesis` when the asset is later spent).
 ///
 /// NOTE: this performs structural validation plus asset binding; full
 /// chain verification of every transition (`File::verify` with a
@@ -428,7 +508,7 @@ fn check_received_proof(
     asset_id: &AssetId,
     script_key: &SerializedKey,
     amount: u64,
-) -> Result<(), TapNodeError> {
+) -> Result<Genesis, TapNodeError> {
     if !proof_file.verify_hash_chain() {
         return Err(TapNodeError::Storage(
             "received proof file has an invalid hash chain".into(),
@@ -457,10 +537,21 @@ fn check_received_proof(
         ));
     }
 
-    Ok(())
+    Ok(decoded.asset.genesis)
 }
 
-/// Imports a proof file, persisting the contained asset.
+/// Imports a proof file, persisting the contained asset (the V0/V1
+/// address receive path; V2 authmailbox receives go through
+/// [`poll_mailbox`]).
+///
+/// The final proof of the file identifies the received output: its
+/// asset (ID, amount, genesis), script key, and anchor outpoint (the
+/// anchor transaction plus the inclusion proof's output index). The
+/// proof file is stored under that locator and the asset is persisted
+/// with its genesis fields and the verified block height. When the
+/// script key belongs to an address this node generated (it is in the
+/// address book, see [`new_address`]), the stored key descriptors are
+/// attached so the asset can be signed and sent onward.
 pub(crate) fn import_proof<C, W, K, L, P>(
     node: &TapNode<C, W, K, L, P>,
     proof_file: proof::file::File,
@@ -472,6 +563,10 @@ where
     L: LdkChannelOps + Send + Sync + 'static,
     P: PriceOracle + Send + Sync + 'static,
 {
+    // Serialize with the other asset-store-writing flows (see
+    // `TapNode::send_lock`).
+    let _send_guard = node.send_lock.lock().expect("send lock");
+
     // Verify the proof file hash chain.
     if !proof_file.verify_hash_chain() {
         return Err(TapNodeError::Storage(
@@ -479,27 +574,73 @@ where
         ));
     }
 
-    let has_proofs = proof_file.num_proofs() > 0;
+    // The final proof carries the asset output being imported.
+    let last = proof_file.proofs.last().ok_or_else(|| {
+        TapNodeError::Storage(
+            "imported proof file contains no proofs".into(),
+        )
+    })?;
+    let decoded = proof::decode::decode_proof(&last.proof_bytes)
+        .map_err(|e| {
+            TapNodeError::Storage(format!("final proof decode: {}", e))
+        })?;
 
-    // Store the proof. A proper implementation would extract the asset
-    // outpoint and script key from the decoded proof TLV.
-    let locator = ProofLocator {
-        outpoint: OutPoint::default(),
-        script_key: SerializedKey([0u8; 33]),
-    };
+    let asset_id = decoded.asset.id();
+    let amount = decoded.asset.amount;
+    let script_key = decoded.asset.script_key.pub_key;
+    let outpoint = decoded.out_point();
+
     node.proof_store
         .lock()
-        .unwrap()
-        .insert_proof(locator, proof_file)
-        .map_err(|e| TapNodeError::Storage(e))?;
+        .expect("proof store lock")
+        .insert_proof(
+            ProofLocator {
+                outpoint,
+                script_key,
+            },
+            proof_file,
+        )
+        .map_err(TapNodeError::Storage)?;
 
-    if has_proofs {
-        node.event_bus.emit(crate::event::TapEvent::AssetReceived {
-            asset_id: tap_primitives::asset::AssetId::ZERO,
-            amount: 0,
-            outpoint: OutPoint::default(),
-        });
+    // If the proof pays an address this node generated, attach the key
+    // descriptors stored with it (the signing context); a proof for a
+    // foreign/watch-only key imports without them and simply cannot be
+    // spent from here.
+    let key_descs = node
+        .mailbox_store
+        .lock()
+        .expect("mailbox store lock")
+        .key_descriptors(&script_key)
+        .map_err(TapNodeError::Storage)?;
+
+    let mut owned = OwnedAsset::new(
+        asset_id,
+        amount,
+        outpoint,
+        script_key,
+        decoded.block_height,
+    );
+    if let Some((script_desc, internal_desc)) = key_descs {
+        owned.script_key_desc = Some(script_desc);
+        owned.internal_key = Some(internal_desc);
     }
+    let genesis = &decoded.asset.genesis;
+    owned.genesis_point = Some(genesis.first_prev_out);
+    owned.genesis_tag = Some(genesis.tag.clone());
+    owned.genesis_meta_hash = Some(genesis.meta_hash);
+    owned.genesis_output_index = Some(genesis.output_index);
+    owned.genesis_asset_type = Some(genesis.asset_type);
+    node.asset_store
+        .lock()
+        .expect("asset store lock")
+        .insert_asset(owned)
+        .map_err(TapNodeError::Storage)?;
+
+    node.event_bus.emit(crate::event::TapEvent::AssetReceived {
+        asset_id,
+        amount,
+        outpoint,
+    });
 
     Ok(())
 }
@@ -521,7 +662,7 @@ where
         outpoint: *outpoint,
         script_key: *script_key,
     };
-    let store = node.proof_store.lock().unwrap();
+    let store = node.proof_store.lock().expect("proof store lock");
     store
         .get_proof(&locator)
         .map_err(|e| TapNodeError::Storage(e))?
@@ -1010,6 +1151,74 @@ mod tests {
         assert_eq!(received[0].block_height, height);
 
         // The asset landed in the asset store.
+        assert_eq!(node.get_balance(&asset_id).unwrap(), amount);
+
+        // The imported asset carries its signing and genesis context:
+        // the descriptor behind the ADDRESS script key (the raw key
+        // the unique per-asset script key is derived from), the
+        // address internal key (the anchor output internal key), the
+        // genesis fields from the verified proof, and the verified
+        // block height.
+        let assets = node.list_assets().unwrap();
+        assert_eq!(assets.len(), 1);
+        let owned = &assets[0];
+        let script_desc =
+            owned.script_key_desc.as_ref().expect("descriptor stored");
+        assert_eq!(script_desc.pub_key, addr.script_key);
+        let internal_desc =
+            owned.internal_key.as_ref().expect("internal key stored");
+        assert_eq!(internal_desc.pub_key, addr.internal_key);
+        assert_eq!(owned.genesis_tag.as_deref(), Some("mailbox-test"));
+        assert_eq!(
+            owned.genesis_point,
+            Some(OutPoint {
+                txid: [0x01; 32],
+                vout: 0,
+            })
+        );
+        assert_eq!(owned.block_height, height);
+
+        // Sending a V2-received asset onward is refused with a precise
+        // error about the Pedersen-tweaked unique script key (NOT a
+        // misleading UnknownScriptKey): the AssetSigner seam cannot
+        // apply the tapscript tweak needed to sign it yet.
+        let onward = TapAddress {
+            version: AddressVersion::V0,
+            asset_version: 0,
+            asset_id: Some(asset_id),
+            script_key: SerializedKey(
+                secp256k1::SecretKey::from_slice(&[0x21; 32])
+                    .unwrap()
+                    .public_key(&secp256k1::Secp256k1::new())
+                    .serialize(),
+            ),
+            internal_key: SerializedKey(
+                secp256k1::SecretKey::from_slice(&[0x22; 32])
+                    .unwrap()
+                    .public_key(&secp256k1::Secp256k1::new())
+                    .serialize(),
+            ),
+            amount,
+            network: tap_primitives::address::TapNetwork::Regtest,
+            proof_courier_addr: None,
+            group_key: None,
+            tapscript_sibling: None,
+            unknown_odd_types: BTreeMap::new(),
+        };
+        let err =
+            node.send_asset(asset_id, amount, &onward).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("V2 unique script key"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("unknown script key"),
+            "must not degrade to UnknownScriptKey: {}",
+            msg
+        );
+        // The refused send left the asset untouched.
         assert_eq!(node.get_balance(&asset_id).unwrap(), amount);
 
         // The proof landed in the proof store.

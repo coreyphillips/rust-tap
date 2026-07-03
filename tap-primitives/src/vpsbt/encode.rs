@@ -453,14 +453,17 @@ fn typed_key(type_byte: u8, key_data: &[u8]) -> Vec<u8> {
     key
 }
 
-/// Encodes an asset with the leaf encoding used by Go's
-/// `asset.LeafEncoder` (V1 assets use segwit encoding).
+/// Encodes an asset the way Go's tappsbt custom fields do.
+///
+/// Go's `assetEncoder` uses `asset.LeafEncoder`, which despite its
+/// name calls `Asset.Encode` and therefore always uses Normal encoding
+/// (asset/encoding.go:657 delegating to asset.go EncodeRecords with
+/// EncodeNormal). The segwit-for-V1 rule applies only to MS-SMT tree
+/// leaves built via `Asset.Leaf()`, not to tappsbt fields; using it
+/// here would silently drop the TxWitness of V1 assets from virtual
+/// packets.
 fn encode_asset_leaf_like_go(asset: &Asset) -> Vec<u8> {
-    use crate::asset::AssetVersion;
-    match asset.version {
-        AssetVersion::V1 => encode_asset(asset, EncodeType::Segwit),
-        _ => encode_asset(asset, EncodeType::Normal),
-    }
+    encode_asset(asset, EncodeType::Normal)
 }
 
 // ---------------------------------------------------------------------

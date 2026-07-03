@@ -32,6 +32,6 @@ pub use executor::{
     execute_transfer, execute_transfer_with_options,
     execute_transfer_with_version, TransferOptions, TransferResult,
 };
-pub use sign::{sign_transfer, VirtualSigner};
+pub use sign::{sign_passive_transition, sign_transfer, VirtualSigner};
 pub use split_proof::populate_split_proofs;
 pub use transfer::{PreparedTransfer, SendError, SendState, TransferBuilder};

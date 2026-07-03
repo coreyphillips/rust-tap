@@ -192,6 +192,7 @@ fn run_transfer(no_stxo_proofs: bool) -> Setup {
         &TransferOptions {
             commitment_version: Some(TapCommitmentVersion::V2),
             no_stxo_proofs,
+            ..TransferOptions::default()
         },
     )
     .expect("transfer pipeline");
@@ -632,6 +633,7 @@ fn v1_full_value_send_proofs_verify() {
         &TransferOptions {
             commitment_version: Some(TapCommitmentVersion::V2),
             no_stxo_proofs: false,
+            ..TransferOptions::default()
         },
     )
     .expect("transfer pipeline");
@@ -639,14 +641,15 @@ fn v1_full_value_send_proofs_verify() {
     assert!(!prepared.is_split);
     assert_eq!(prepared.change_commitment.fetch_alt_leaves().len(), 1);
 
-    // Anchor transaction: one commitment output plus one BIP-86 P2TR
-    // output.
-    let mut anchor_tx = bitcoin::Transaction {
-        version: bitcoin::transaction::Version(2),
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: result.template.tx.input.clone(),
-        output: vec![result.template.tx.output[0].clone()],
-    };
+    // A full-value send emits exactly ONE TAP-committed output (the
+    // recipient's); there is no duplicate change commitment at index 0
+    // (mirrors Go's interactive full-value send).
+    assert_eq!(result.template.tx.output.len(), 1);
+    assert_eq!(result.template.tap_outputs.len(), 1);
+
+    // Anchor transaction: the template's single commitment output plus
+    // one BIP-86 P2TR output (wallet BTC change).
+    let mut anchor_tx = result.template.tx.clone();
     anchor_tx.output.push(bitcoin::TxOut {
         value: bitcoin::Amount::from_sat(5_000),
         script_pubkey: bitcoin::ScriptBuf::new_p2tr(
@@ -660,7 +663,7 @@ fn v1_full_value_send_proofs_verify() {
         asset: &prepared.root_asset,
         anchor_output_index: 0,
         internal_key: internal0_key,
-        commitment: &prepared.change_commitment,
+        commitment: &prepared.output_commitments[0],
         tapscript_sibling: None,
     }];
     let bip86 = vec![Bip86Output {

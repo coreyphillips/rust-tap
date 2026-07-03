@@ -58,6 +58,16 @@ pub struct TransferOptions {
     /// the default (false) matches Go, which merges STXO alt leaves
     /// for every regular send.
     pub no_stxo_proofs: bool,
+    /// Fully signed passive assets to re-anchor into the sender's change
+    /// output, mirroring Go's passive assets (`tapfreighter`). Each is a
+    /// full-value 1-in-1-out transition of an asset that shared an anchor
+    /// UTXO with a spent input but was not selected. When non-empty, the
+    /// transfer is forced to a split (a zero-amount tombstone root is
+    /// created for a full-value send) so a sender-owned change output
+    /// exists to carry them, and they are merged into that output's
+    /// commitment before the anchor scripts are computed. Empty for a
+    /// plain transfer.
+    pub passive_assets: Vec<tap_primitives::asset::Asset>,
 }
 
 /// Executes an end-to-end asset transfer.
@@ -141,12 +151,17 @@ pub fn execute_transfer_with_options(
 ) -> Result<TransferResult, SendError> {
     // Step 1: Prepare outputs (allocations + split commitments). This
     // fixes the split commitment root the signatures will commit to.
-    let mut prepared = TransferBuilder::prepare_outputs_with_version(
+    // Passive assets force a split so a sender-owned change/tombstone
+    // output exists to re-anchor them into.
+    let force_split = !options.passive_assets.is_empty();
+    let mut prepared = TransferBuilder::prepare_outputs_forced(
         inputs,
         outputs,
         genesis,
         options.commitment_version,
+        force_split,
     )?;
+    prepared.passive_assets = options.passive_assets.clone();
 
     // Step 2: Sign virtual transactions.
     sign_transfer(&mut prepared, prev_assets, signer)?;
@@ -169,18 +184,33 @@ pub fn execute_transfer_with_options(
     // Step 5: Build anchor transaction template.
     let mut output_descriptors = Vec::new();
 
-    // Change output (index 0) with the root asset's commitment.
     if internal_keys.is_empty() {
         return Err(SendError::InvalidState("no internal keys provided".into()));
     }
-    output_descriptors.push(OutputDescriptor {
-        internal_key: internal_keys[0],
-        commitment: prepared.change_commitment.commitment().clone(),
-        value: Amount::from_sat(330),
-        sibling_script: None,
-    });
 
-    // Recipient outputs.
+    // Change/tombstone output (index 0) with the root asset's
+    // commitment - only for split transfers. A full-value send (no
+    // split, no passives - passives force a split) has exactly ONE
+    // asset output: the recipient's. Go's interactive full-value send
+    // produces a single vOutput, so the anchor has a single
+    // TAP-committed output and any BTC change is a plain output added
+    // later by the funding wallet (tapsend/allocation.go allocatePiece:
+    // no tombstone for interactive full-value sends; tapsend/send.go
+    // CreateAnchorTx). Emitting the root commitment again at index 0
+    // would duplicate the recipient commitment in the anchor and make
+    // a complete exclusion-proof set for the recipient impossible.
+    if prepared.is_split {
+        output_descriptors.push(OutputDescriptor {
+            internal_key: internal_keys[0],
+            commitment: prepared.change_commitment.commitment().clone(),
+            value: Amount::from_sat(330),
+            sibling_script: None,
+        });
+    }
+
+    // Recipient outputs. The key indexing is unchanged from the split
+    // case: internal_keys[0] belongs to the change output, recipients
+    // use the following keys (clamped to the last provided key).
     for (i, commitment) in prepared.output_commitments.iter().enumerate() {
         let key_idx = (i + 1).min(internal_keys.len() - 1);
         output_descriptors.push(OutputDescriptor {
@@ -313,8 +343,13 @@ mod tests {
         assert!(!result.prepared.root_asset.prev_witnesses[0].tx_witness.is_empty());
         assert_eq!(result.prepared.root_asset.prev_witnesses[0].tx_witness[0].len(), 64);
 
-        // Template should have inputs and outputs.
+        // Template should have inputs and outputs. A full-value send
+        // has exactly ONE TAP-committed output (the recipient's); any
+        // BTC change is a plain output added by the funding wallet
+        // (mirrors Go's interactive full-value send).
         assert_eq!(result.template.tx.input.len(), 1);
-        assert!(!result.template.tx.output.is_empty());
+        assert_eq!(result.template.tx.output.len(), 1);
+        assert_eq!(result.template.tap_outputs.len(), 1);
+        assert!(!result.prepared.is_split);
     }
 }

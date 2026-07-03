@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection};
 
@@ -75,23 +75,39 @@ impl SqliteDb {
 // ---------------------------------------------------------------------------
 
 /// SQLite-backed asset store.
-pub struct SqliteAssetStore<'a> {
-    db: &'a SqliteDb,
+///
+/// Owns a shared handle to the database so it can be constructed as a
+/// default store without lifetime constraints.
+pub struct SqliteAssetStore {
+    db: Arc<SqliteDb>,
 }
 
-impl<'a> SqliteAssetStore<'a> {
-    pub fn new(db: &'a SqliteDb) -> Self {
+impl SqliteAssetStore {
+    pub fn new(db: Arc<SqliteDb>) -> Self {
         SqliteAssetStore { db }
     }
 }
 
-impl AssetStore for SqliteAssetStore<'_> {
+/// The columns of `owned_assets` selected for [`OwnedAsset`] rows, in
+/// the order expected by `row_to_owned_asset`.
+const OWNED_ASSET_COLS: &str = "asset_id, amount, anchor_txid, \
+     anchor_vout, script_key, spent, block_height, \
+     script_key_family, script_key_index, script_key_raw, \
+     internal_key_family, internal_key_index, internal_key_raw, \
+     genesis_tag, genesis_meta_hash, genesis_output_index, \
+     genesis_asset_type, genesis_point_txid, genesis_point_vout";
+
+impl AssetStore for SqliteAssetStore {
     fn insert_asset(&mut self, asset: OwnedAsset) -> Result<(), String> {
         let conn = self.db.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO owned_assets \
-             (asset_id, amount, anchor_txid, anchor_vout, script_key, spent, block_height) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (asset_id, amount, anchor_txid, anchor_vout, script_key, spent, block_height, \
+              script_key_family, script_key_index, script_key_raw, \
+              internal_key_family, internal_key_index, internal_key_raw, \
+              genesis_tag, genesis_meta_hash, genesis_output_index, genesis_asset_type, \
+              genesis_point_txid, genesis_point_vout) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 &asset.asset_id.0[..],
                 asset.amount as i64,
@@ -100,19 +116,45 @@ impl AssetStore for SqliteAssetStore<'_> {
                 &asset.script_key.0[..],
                 asset.spent as i32,
                 asset.block_height,
+                asset.script_key_desc.as_ref().map(|k| k.family as i64),
+                asset.script_key_desc.as_ref().map(|k| k.index as i64),
+                asset
+                    .script_key_desc
+                    .as_ref()
+                    .map(|k| k.pub_key.0.to_vec()),
+                asset.internal_key.as_ref().map(|k| k.family as i64),
+                asset.internal_key.as_ref().map(|k| k.index as i64),
+                asset.internal_key.as_ref().map(|k| k.pub_key.0.to_vec()),
+                asset.genesis_tag.as_deref(),
+                asset.genesis_meta_hash.as_ref().map(|h| h.to_vec()),
+                asset.genesis_output_index,
+                asset.genesis_asset_type.map(|t| t.to_u8()),
+                asset.genesis_point.as_ref().map(|op| op.txid.to_vec()),
+                asset.genesis_point.as_ref().map(|op| op.vout),
             ],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    fn mark_spent(&mut self, outpoint: &OutPoint) -> Result<(), String> {
+    fn mark_spent(
+        &mut self,
+        outpoint: &OutPoint,
+        asset_id: &AssetId,
+        script_key: &SerializedKey,
+    ) -> Result<(), String> {
         let conn = self.db.conn.lock().unwrap();
         let rows = conn
             .execute(
                 "UPDATE owned_assets SET spent = 1 \
-                 WHERE anchor_txid = ?1 AND anchor_vout = ?2",
-                params![&outpoint.txid[..], outpoint.vout],
+                 WHERE anchor_txid = ?1 AND anchor_vout = ?2 \
+                 AND asset_id = ?3 AND script_key = ?4",
+                params![
+                    &outpoint.txid[..],
+                    outpoint.vout,
+                    &asset_id.0[..],
+                    &script_key.0[..],
+                ],
             )
             .map_err(|e| e.to_string())?;
 
@@ -122,38 +164,69 @@ impl AssetStore for SqliteAssetStore<'_> {
         Ok(())
     }
 
+    fn unspent_at_outpoint(&self, outpoint: &OutPoint) -> Vec<OwnedAsset> {
+        let conn = self.db.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(&format!(
+            "SELECT {} FROM owned_assets \
+             WHERE anchor_txid = ?1 AND anchor_vout = ?2 AND spent = 0",
+            OWNED_ASSET_COLS
+        )) {
+            Ok(stmt) => stmt,
+            Err(_) => return vec![],
+        };
+
+        stmt.query_map(
+            params![&outpoint.txid[..], outpoint.vout],
+            row_to_owned_asset,
+        )
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    fn set_anchor_block_height(
+        &mut self,
+        outpoint: &OutPoint,
+        block_height: u32,
+    ) -> Result<(), String> {
+        let conn = self.db.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE owned_assets SET block_height = ?1 \
+             WHERE anchor_txid = ?2 AND anchor_vout = ?3",
+            params![block_height, &outpoint.txid[..], outpoint.vout],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     fn get_unspent(&self, asset_id: &AssetId) -> Vec<OwnedAsset> {
         let conn = self.db.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT asset_id, amount, anchor_txid, anchor_vout, \
-                 script_key, spent, block_height \
-                 FROM owned_assets WHERE asset_id = ?1 AND spent = 0",
-            )
-            .unwrap();
+        let mut stmt = match conn.prepare(&format!(
+            "SELECT {} FROM owned_assets \
+             WHERE asset_id = ?1 AND spent = 0",
+            OWNED_ASSET_COLS
+        )) {
+            Ok(stmt) => stmt,
+            Err(_) => return vec![],
+        };
 
-        stmt.query_map(params![&asset_id.0[..]], |row| {
-            Ok(row_to_owned_asset(row))
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
+        stmt.query_map(params![&asset_id.0[..]], row_to_owned_asset)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
     }
 
     fn list_unspent(&self) -> Vec<OwnedAsset> {
         let conn = self.db.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT asset_id, amount, anchor_txid, anchor_vout, \
-                 script_key, spent, block_height \
-                 FROM owned_assets WHERE spent = 0",
-            )
-            .unwrap();
+        let mut stmt = match conn.prepare(&format!(
+            "SELECT {} FROM owned_assets WHERE spent = 0",
+            OWNED_ASSET_COLS
+        )) {
+            Ok(stmt) => stmt,
+            Err(_) => return vec![],
+        };
 
-        stmt.query_map([], |row| Ok(row_to_owned_asset(row)))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+        stmt.query_map([], row_to_owned_asset)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
     }
 
     fn balance(&self, asset_id: &AssetId) -> u64 {
@@ -223,14 +296,49 @@ impl AssetStore for SqliteAssetStore<'_> {
     }
 }
 
-fn row_to_owned_asset(row: &rusqlite::Row) -> OwnedAsset {
-    let asset_id_bytes: Vec<u8> = row.get(0).unwrap();
-    let amount: i64 = row.get(1).unwrap();
-    let txid_bytes: Vec<u8> = row.get(2).unwrap();
-    let vout: u32 = row.get(3).unwrap();
-    let script_key_bytes: Vec<u8> = row.get(4).unwrap();
-    let spent: i32 = row.get(5).unwrap();
-    let block_height: u32 = row.get(6).unwrap();
+/// Builds an optional [`KeyDescriptor`] from its three nullable
+/// columns. Returns `None` unless all three are present and the raw
+/// key is 33 bytes.
+fn key_desc_from_cols(
+    family: Option<i64>,
+    index: Option<i64>,
+    raw: Option<Vec<u8>>,
+) -> Option<KeyDescriptor> {
+    let (family, index, raw) = (family?, index?, raw?);
+    let mut pub_key = [0u8; 33];
+    if raw.len() != 33 {
+        return None;
+    }
+    pub_key.copy_from_slice(&raw);
+    Some(KeyDescriptor {
+        family: family as u16,
+        index: index as u32,
+        pub_key: SerializedKey(pub_key),
+    })
+}
+
+fn row_to_owned_asset(
+    row: &rusqlite::Row,
+) -> Result<OwnedAsset, rusqlite::Error> {
+    let asset_id_bytes: Vec<u8> = row.get(0)?;
+    let amount: i64 = row.get(1)?;
+    let txid_bytes: Vec<u8> = row.get(2)?;
+    let vout: u32 = row.get(3)?;
+    let script_key_bytes: Vec<u8> = row.get(4)?;
+    let spent: i32 = row.get(5)?;
+    let block_height: u32 = row.get(6)?;
+    let sk_family: Option<i64> = row.get(7)?;
+    let sk_index: Option<i64> = row.get(8)?;
+    let sk_raw: Option<Vec<u8>> = row.get(9)?;
+    let ik_family: Option<i64> = row.get(10)?;
+    let ik_index: Option<i64> = row.get(11)?;
+    let ik_raw: Option<Vec<u8>> = row.get(12)?;
+    let genesis_tag: Option<String> = row.get(13)?;
+    let genesis_meta_hash_bytes: Option<Vec<u8>> = row.get(14)?;
+    let genesis_output_index: Option<u32> = row.get(15)?;
+    let genesis_asset_type_byte: Option<u8> = row.get(16)?;
+    let genesis_point_txid_bytes: Option<Vec<u8>> = row.get(17)?;
+    let genesis_point_vout: Option<u32> = row.get(18)?;
 
     let mut asset_id = [0u8; 32];
     asset_id.copy_from_slice(&asset_id_bytes);
@@ -239,14 +347,44 @@ fn row_to_owned_asset(row: &rusqlite::Row) -> OwnedAsset {
     let mut script_key = [0u8; 33];
     script_key.copy_from_slice(&script_key_bytes);
 
-    OwnedAsset {
+    let genesis_meta_hash = genesis_meta_hash_bytes.and_then(|bytes| {
+        let mut hash = [0u8; 32];
+        if bytes.len() != 32 {
+            return None;
+        }
+        hash.copy_from_slice(&bytes);
+        Some(hash)
+    });
+
+    let genesis_point = match (genesis_point_txid_bytes, genesis_point_vout)
+    {
+        (Some(bytes), Some(vout)) if bytes.len() == 32 => {
+            let mut gp_txid = [0u8; 32];
+            gp_txid.copy_from_slice(&bytes);
+            Some(OutPoint {
+                txid: gp_txid,
+                vout,
+            })
+        }
+        _ => None,
+    };
+
+    Ok(OwnedAsset {
         asset_id: AssetId(asset_id),
         amount: amount as u64,
         anchor_outpoint: OutPoint { txid, vout },
         script_key: SerializedKey(script_key),
         spent: spent != 0,
         block_height,
-    }
+        script_key_desc: key_desc_from_cols(sk_family, sk_index, sk_raw),
+        internal_key: key_desc_from_cols(ik_family, ik_index, ik_raw),
+        genesis_point,
+        genesis_tag,
+        genesis_meta_hash,
+        genesis_output_index,
+        genesis_asset_type: genesis_asset_type_byte
+            .and_then(|b| AssetType::from_u8(b).ok()),
+    })
 }
 
 fn row_to_burn_record(row: &rusqlite::Row) -> BurnRecord {
@@ -295,17 +433,17 @@ fn row_to_burn_record(row: &rusqlite::Row) -> BurnRecord {
 // ---------------------------------------------------------------------------
 
 /// SQLite-backed minting batch store.
-pub struct SqliteBatchStore<'a> {
-    db: &'a SqliteDb,
+pub struct SqliteBatchStore {
+    db: Arc<SqliteDb>,
 }
 
-impl<'a> SqliteBatchStore<'a> {
-    pub fn new(db: &'a SqliteDb) -> Self {
+impl SqliteBatchStore {
+    pub fn new(db: Arc<SqliteDb>) -> Self {
         SqliteBatchStore { db }
     }
 }
 
-impl BatchStore for SqliteBatchStore<'_> {
+impl BatchStore for SqliteBatchStore {
     fn save_batch(&mut self, batch: &MintingBatch) -> Result<(), String> {
         let conn = self.db.conn.lock().unwrap();
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -606,6 +744,10 @@ fn row_to_batch_header(row: &rusqlite::Row) -> (i64, MintingBatch) {
                 block_height: height,
                 tx_index: tx_idx,
                 tx,
+                // The block header and tx hash list are transient
+                // confirmation-watch data and are not persisted.
+                block_header: [0u8; 80],
+                block_tx_hashes: Vec::new(),
             })
         }
         _ => None,
@@ -623,6 +765,7 @@ fn row_to_batch_header(row: &rusqlite::Row) -> (i64, MintingBatch) {
             seedlings: HashMap::new(),
             genesis_psbt,
             root_asset_commitment: None,
+            sprouted_assets: Vec::new(),
             signed_tx,
             genesis_outpoint,
             confirmation,
@@ -637,17 +780,17 @@ fn row_to_batch_header(row: &rusqlite::Row) -> (i64, MintingBatch) {
 // ---------------------------------------------------------------------------
 
 /// SQLite-backed proof file store.
-pub struct SqliteProofStore<'a> {
-    db: &'a SqliteDb,
+pub struct SqliteProofStore {
+    db: Arc<SqliteDb>,
 }
 
-impl<'a> SqliteProofStore<'a> {
-    pub fn new(db: &'a SqliteDb) -> Self {
+impl SqliteProofStore {
+    pub fn new(db: Arc<SqliteDb>) -> Self {
         SqliteProofStore { db }
     }
 }
 
-impl ProofStore for SqliteProofStore<'_> {
+impl ProofStore for SqliteProofStore {
     fn insert_proof(
         &mut self,
         locator: ProofLocator,
@@ -761,19 +904,40 @@ impl<T> OptionalExt<T> for Result<T, rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn test_asset(id_byte: u8, amount: u64, vout: u32) -> OwnedAsset {
-        OwnedAsset {
-            asset_id: AssetId([id_byte; 32]),
+        OwnedAsset::new(
+            AssetId([id_byte; 32]),
             amount,
-            anchor_outpoint: OutPoint {
+            OutPoint {
                 txid: [0xAA; 32],
                 vout,
             },
-            script_key: SerializedKey([0x02; 33]),
-            spent: false,
-            block_height: 800_000,
-        }
+            SerializedKey([0x02; 33]),
+            800_000,
+        )
+    }
+
+    /// An asset with all optional key descriptor and genesis fields set.
+    fn test_asset_full(vout: u32) -> OwnedAsset {
+        let mut asset = test_asset(0xAA, 100, vout);
+        asset.script_key_desc = Some(KeyDescriptor {
+            family: 212,
+            index: 7,
+            pub_key: SerializedKey([0x02; 33]),
+        });
+        asset.internal_key = Some(KeyDescriptor {
+            family: 212,
+            index: 8,
+            pub_key: SerializedKey([0x03; 33]),
+        });
+        asset.genesis_tag = Some("test-coin".to_string());
+        asset.genesis_meta_hash = Some([0x44; 32]);
+        asset.genesis_output_index = Some(1);
+        asset.genesis_asset_type =
+            Some(tap_primitives::asset::AssetType::Collectible);
+        asset
     }
 
     fn test_batch() -> MintingBatch {
@@ -808,8 +972,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_asset_insert_and_query() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteAssetStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteAssetStore::new(Arc::clone(&db));
 
         store.insert_asset(test_asset(0xAA, 100, 0)).unwrap();
         store.insert_asset(test_asset(0xAA, 200, 1)).unwrap();
@@ -820,8 +984,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_asset_mark_spent() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteAssetStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteAssetStore::new(Arc::clone(&db));
 
         store.insert_asset(test_asset(0xAA, 100, 0)).unwrap();
 
@@ -829,16 +993,57 @@ mod tests {
             txid: [0xAA; 32],
             vout: 0,
         };
-        store.mark_spent(&outpoint).unwrap();
+        store
+            .mark_spent(
+                &outpoint,
+                &AssetId([0xAA; 32]),
+                &SerializedKey([0x02; 33]),
+            )
+            .unwrap();
 
         assert_eq!(store.balance(&AssetId([0xAA; 32])), 0);
         assert!(store.get_unspent(&AssetId([0xAA; 32])).is_empty());
     }
 
+    /// mark_spent on SQLite flips only the exact identity; a sibling
+    /// asset at the same anchor outpoint stays unspent and is returned
+    /// by unspent_at_outpoint.
+    #[test]
+    fn test_sqlite_mark_spent_scoped_to_identity() {
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteAssetStore::new(Arc::clone(&db));
+
+        let outpoint = OutPoint {
+            txid: [0xAA; 32],
+            vout: 0,
+        };
+        let mut a = test_asset(0xAA, 100, 0);
+        a.script_key = SerializedKey([0x02; 33]);
+        let mut b = test_asset(0xBB, 200, 0);
+        b.script_key = SerializedKey([0x03; 33]);
+        store.insert_asset(a).unwrap();
+        store.insert_asset(b).unwrap();
+
+        store
+            .mark_spent(
+                &outpoint,
+                &AssetId([0xAA; 32]),
+                &SerializedKey([0x02; 33]),
+            )
+            .unwrap();
+
+        assert_eq!(store.balance(&AssetId([0xAA; 32])), 0);
+        assert_eq!(store.balance(&AssetId([0xBB; 32])), 200);
+
+        let survivors = store.unspent_at_outpoint(&outpoint);
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].asset_id, AssetId([0xBB; 32]));
+    }
+
     #[test]
     fn test_sqlite_asset_multiple_types() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteAssetStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteAssetStore::new(Arc::clone(&db));
 
         store.insert_asset(test_asset(0xAA, 100, 0)).unwrap();
         store.insert_asset(test_asset(0xBB, 200, 1)).unwrap();
@@ -848,16 +1053,87 @@ mod tests {
         assert_eq!(store.list_unspent().len(), 2);
     }
 
+    /// New optional fields (key descriptors + genesis data) round-trip
+    /// through the migration 006 columns; legacy rows read back as
+    /// `None`.
+    #[test]
+    fn test_sqlite_asset_optional_fields_round_trip() {
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteAssetStore::new(Arc::clone(&db));
+
+        let full = test_asset_full(0);
+        store.insert_asset(full.clone()).unwrap();
+
+        // A bare asset (all optional fields None) alongside.
+        let bare = test_asset(0xAA, 50, 1);
+        store.insert_asset(bare.clone()).unwrap();
+
+        let mut assets = store.get_unspent(&AssetId([0xAA; 32]));
+        assets.sort_by_key(|a| a.anchor_outpoint.vout);
+        assert_eq!(assets.len(), 2);
+        assert_eq!(assets[0], full);
+        assert_eq!(assets[1], bare);
+    }
+
     #[test]
     fn test_sqlite_asset_mark_spent_not_found() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteAssetStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteAssetStore::new(Arc::clone(&db));
 
         let outpoint = OutPoint {
             txid: [0xFF; 32],
             vout: 99,
         };
-        assert!(store.mark_spent(&outpoint).is_err());
+        assert!(store
+            .mark_spent(
+                &outpoint,
+                &AssetId([0xAA; 32]),
+                &SerializedKey([0x02; 33]),
+            )
+            .is_err());
+    }
+
+    /// set_anchor_block_height updates every asset at the outpoint,
+    /// leaves other outpoints alone, and is a no-op for unknown
+    /// outpoints.
+    #[test]
+    fn test_sqlite_set_anchor_block_height() {
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteAssetStore::new(Arc::clone(&db));
+
+        let mut a = test_asset(0xAA, 100, 0);
+        a.block_height = 0;
+        let mut b = test_asset(0xBB, 200, 0);
+        b.script_key = SerializedKey([0x03; 33]);
+        b.block_height = 0;
+        let c = test_asset(0xCC, 300, 1);
+        store.insert_asset(a).unwrap();
+        store.insert_asset(b).unwrap();
+        store.insert_asset(c).unwrap();
+
+        let outpoint = OutPoint {
+            txid: [0xAA; 32],
+            vout: 0,
+        };
+        store.set_anchor_block_height(&outpoint, 812_000).unwrap();
+
+        let mut assets = store.list_unspent();
+        assets.sort_by_key(|x| x.anchor_outpoint.vout);
+        assert_eq!(assets.len(), 3);
+        assert_eq!(assets[0].block_height, 812_000);
+        assert_eq!(assets[1].block_height, 812_000);
+        assert_eq!(assets[2].block_height, 800_000);
+
+        // Unknown outpoint: idempotent no-op.
+        store
+            .set_anchor_block_height(
+                &OutPoint {
+                    txid: [0xFF; 32],
+                    vout: 9,
+                },
+                1,
+            )
+            .unwrap();
     }
 
     fn test_burn(id_byte: u8, amount: u64, vout: u32) -> BurnRecord {
@@ -878,8 +1154,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_burn_round_trip() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteAssetStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteAssetStore::new(Arc::clone(&db));
 
         let burn = test_burn(0xAA, 100, 0);
         store.insert_burn(burn.clone()).unwrap();
@@ -891,8 +1167,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_burn_filter_by_asset_id() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteAssetStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteAssetStore::new(Arc::clone(&db));
 
         store.insert_burn(test_burn(0xAA, 100, 0)).unwrap();
         store.insert_burn(test_burn(0xBB, 200, 1)).unwrap();
@@ -908,8 +1184,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_burn_optional_fields() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteAssetStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteAssetStore::new(Arc::clone(&db));
 
         let mut burn = test_burn(0xAA, 100, 0);
         burn.note = None;
@@ -924,8 +1200,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_batch_save_and_load() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteBatchStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteBatchStore::new(Arc::clone(&db));
 
         let batch = test_batch();
         store.save_batch(&batch).unwrap();
@@ -942,8 +1218,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_batch_update_state() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteBatchStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteBatchStore::new(Arc::clone(&db));
 
         store.save_batch(&test_batch()).unwrap();
         store
@@ -959,8 +1235,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_batch_list() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteBatchStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteBatchStore::new(Arc::clone(&db));
 
         store.save_batch(&test_batch()).unwrap();
         assert_eq!(store.list_batches().len(), 1);
@@ -968,8 +1244,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_batch_not_found() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let store = SqliteBatchStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let store = SqliteBatchStore::new(Arc::clone(&db));
 
         let result = store
             .load_batch(&SerializedKey([0xFF; 33]))
@@ -979,8 +1255,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_batch_with_confirmation() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteBatchStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteBatchStore::new(Arc::clone(&db));
 
         let mut batch = test_batch();
         batch.state = BatchState::Confirmed;
@@ -993,6 +1269,8 @@ mod tests {
             block_height: 850_000,
             tx_index: 3,
             tx: vec![0x01, 0x02],
+            block_header: [0u8; 80],
+            block_tx_hashes: Vec::new(),
         });
         batch.mint_output_index = Some(0);
 
@@ -1014,8 +1292,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_proof_insert_and_get() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteProofStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteProofStore::new(Arc::clone(&db));
 
         let loc = test_locator(0);
         let file = test_proof_file();
@@ -1028,8 +1306,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_proof_missing() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let store = SqliteProofStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let store = SqliteProofStore::new(Arc::clone(&db));
 
         let loc = test_locator(99);
         assert!(!store.has_proof(&loc));
@@ -1038,8 +1316,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_proof_list() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteProofStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteProofStore::new(Arc::clone(&db));
 
         store
             .insert_proof(test_locator(0), test_proof_file())
@@ -1053,8 +1331,8 @@ mod tests {
 
     #[test]
     fn test_sqlite_proof_replace() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteProofStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteProofStore::new(Arc::clone(&db));
 
         let loc = test_locator(0);
         let mut file1 = proof::File::new();
@@ -1074,11 +1352,11 @@ mod tests {
 
     #[test]
     fn test_shared_db_across_stores() {
-        let db = SqliteDb::open_in_memory().unwrap();
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
 
-        let mut asset_store = SqliteAssetStore::new(&db);
-        let mut batch_store = SqliteBatchStore::new(&db);
-        let mut proof_store = SqliteProofStore::new(&db);
+        let mut asset_store = SqliteAssetStore::new(Arc::clone(&db));
+        let mut batch_store = SqliteBatchStore::new(Arc::clone(&db));
+        let mut proof_store = SqliteProofStore::new(Arc::clone(&db));
 
         asset_store
             .insert_asset(test_asset(0xAA, 100, 0))

@@ -164,8 +164,17 @@ impl TxBuilder for TapTxBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channel::blobs::{AssetBalance, FundedAsset};
-    use tap_primitives::asset::AssetId;
+    use crate::channel::blobs::{AssetOutput, FundedAsset};
+    use tap_primitives::asset::{AssetId, SerializedKey};
+
+    fn output(amount: u64) -> AssetOutput {
+        AssetOutput {
+            asset_id: AssetId([0xAA; 32]),
+            amount,
+            script_key: SerializedKey([0x02; 33]),
+            proof: None,
+        }
+    }
 
     #[test]
     fn test_tap_tx_builder_no_asset_state() {
@@ -182,22 +191,16 @@ mod tests {
             funded_assets: vec![FundedAsset {
                 asset_id: AssetId([0xAA; 32]),
                 amount: 1000,
-                script_key: tap_primitives::asset::SerializedKey([0x02; 33]),
+                script_key: SerializedKey([0x02; 33]),
+                proof: None,
             }],
-            decimal_display: None,
+            decimal_display: 0,
             group_key: None,
         });
         builder.set_commitment_blob(CommitmentBlob {
-            local_assets: vec![AssetBalance {
-                asset_id: AssetId([0xAA; 32]),
-                amount: 600,
-            }],
-            remote_assets: vec![AssetBalance {
-                asset_id: AssetId([0xAA; 32]),
-                amount: 400,
-            }],
-            outgoing_htlc_assets: vec![],
-            incoming_htlc_assets: vec![],
+            local_assets: vec![output(600)],
+            remote_assets: vec![output(400)],
+            ..CommitmentBlob::default()
         });
 
         let aux = builder.get_aux_commitment_data(true, 0, None);

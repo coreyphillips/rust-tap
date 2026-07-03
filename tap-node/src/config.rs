@@ -26,6 +26,10 @@ pub struct TapNodeConfig {
     pub universe_servers: Vec<String>,
     /// Universe sync interval in seconds (0 = disabled).
     pub universe_sync_interval_secs: u64,
+    /// Interval between background ticks of the node's worker thread
+    /// in seconds (confirmation polling, periodic universe sync, RFQ
+    /// quote pruning). See [`TapNode::tick`](crate::TapNode::tick).
+    pub tick_interval_secs: u64,
     /// RFQ quote lifetime in seconds.
     pub rfq_quote_lifetime_secs: u64,
     /// CSV delay for force-close outputs (blocks).
@@ -42,6 +46,7 @@ impl Default for TapNodeConfig {
             courier_url: String::new(),
             universe_servers: vec![],
             universe_sync_interval_secs: 600,
+            tick_interval_secs: 30,
             rfq_quote_lifetime_secs: 3600,
             csv_delay_blocks: 144,
             default_conf_target: 6,

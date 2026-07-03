@@ -40,6 +40,9 @@ pub enum VirtualTxError {
     SighashError(String),
     /// Invalid key data.
     InvalidKey(String),
+    /// An asset leaf could not be constructed (e.g. unknown asset
+    /// version, mirroring Go's `asset.ErrUnknownVersion`).
+    InvalidLeaf(String),
 }
 
 impl std::fmt::Display for VirtualTxError {
@@ -53,6 +56,9 @@ impl std::fmt::Display for VirtualTxError {
             VirtualTxError::TreeError(msg) => write!(f, "tree error: {}", msg),
             VirtualTxError::SighashError(msg) => write!(f, "sighash error: {}", msg),
             VirtualTxError::InvalidKey(msg) => write!(f, "invalid key: {}", msg),
+            VirtualTxError::InvalidLeaf(msg) => {
+                write!(f, "invalid leaf: {}", msg)
+            }
         }
     }
 }
@@ -98,7 +104,8 @@ pub fn virtual_tx_in(
         // Key = PrevId.Hash() = SHA256(outpoint || asset_id || schnorr_key)
         let key = prev_id.hash();
         // Leaf = TLV-encoded asset with amount as sum.
-        let leaf = asset_to_leaf(prev_asset);
+        let leaf = asset_to_leaf(prev_asset)
+            .map_err(|e| VirtualTxError::InvalidLeaf(e.to_string()))?;
 
         tree.insert(key, leaf)
             .map_err(|e| VirtualTxError::TreeError(e.to_string()))?;
@@ -147,7 +154,8 @@ pub fn virtual_genesis_tx_in(
     // Genesis grouped assets always use the zero PrevId as the MS-SMT
     // key since the asset has no real PrevId.
     let key = PrevId::ZERO.hash();
-    let leaf = asset_to_leaf(&copy_no_witness);
+    let leaf = asset_to_leaf(&copy_no_witness)
+        .map_err(|e| VirtualTxError::InvalidLeaf(e.to_string()))?;
 
     let mut tree = FullTree::new(DefaultStore::new());
     tree.insert(key, leaf)
@@ -222,7 +230,8 @@ pub fn virtual_tx_out(tx_asset: &Asset) -> Result<TxOut, VirtualTxError> {
         w.tx_witness = vec![];
     }
 
-    let leaf = asset_to_leaf(&copy);
+    let leaf = asset_to_leaf(&copy)
+        .map_err(|e| VirtualTxError::InvalidLeaf(e.to_string()))?;
 
     let mut tree = FullTree::new(DefaultStore::new());
     tree.insert(key, leaf)

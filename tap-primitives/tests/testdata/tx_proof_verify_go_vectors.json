@@ -1,0 +1,342 @@
+{
+  "comment": "Go-executed vector for proof.TxProof.Verify (proof/tx.go). Deterministic block: coinbase + one segwit P2TR tx; merkle proof from proof.NewTxMerkleProof; verified with proof.DefaultMerkleVerifier. Generated against tapd v0.8.99-alpha.",
+  "expected_txid": "ab762a1ebc533bfcdfc501fbb93d68927c7f702f2eed313b2ad22b093fa540d7",
+  "test_cases": [
+    {
+      "comment": "success: BIP-86 output (vout 1), no merkle root",
+      "proof": {
+        "raw_tx": "0200000000010155555555555555555555555555555555555555555555555555555555555555550100000000fdffffff03d204000000000000160014777777777777777777777777777777777777777729090000000000002251202a64b1ee3375f3bb4b367b8cb8384a47f73cf231717f827c6c6fbbf5aecf0c36800d0000000000002251200210a11edd82cbfe10ee3b2b0906c3ddef048d45f4be6e6980ce4bdad315cbed01406666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666600000000",
+        "block_header": {
+          "version": 536870912,
+          "prev_block": "9999999999999999999999999999999999999999999999999999999999999999",
+          "merkle_root": "04d78a09ff86acde377e30eb6f6fb22b67cef60fa0c47a0360ca3e5ff454d8dd",
+          "timestamp": 1700000000,
+          "bits": 545259519,
+          "nonce": 7
+        },
+        "block_height": 654321,
+        "merkle_proof": {
+          "nodes": [
+            "101feb7f6fd9d6a94f8cc577f667453eee5b1aa35611e9031df61becc970c4bd"
+          ],
+          "bits": [
+            false
+          ]
+        },
+        "claimed_outpoint": "ab762a1ebc533bfcdfc501fbb93d68927c7f702f2eed313b2ad22b093fa540d7:1",
+        "internal_key": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+        "merkle_root": ""
+      },
+      "reject_header": false,
+      "expected_error": ""
+    },
+    {
+      "comment": "success: tapscript output (vout 2) with merkle root",
+      "proof": {
+        "raw_tx": "0200000000010155555555555555555555555555555555555555555555555555555555555555550100000000fdffffff03d204000000000000160014777777777777777777777777777777777777777729090000000000002251202a64b1ee3375f3bb4b367b8cb8384a47f73cf231717f827c6c6fbbf5aecf0c36800d0000000000002251200210a11edd82cbfe10ee3b2b0906c3ddef048d45f4be6e6980ce4bdad315cbed01406666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666600000000",
+        "block_header": {
+          "version": 536870912,
+          "prev_block": "9999999999999999999999999999999999999999999999999999999999999999",
+          "merkle_root": "04d78a09ff86acde377e30eb6f6fb22b67cef60fa0c47a0360ca3e5ff454d8dd",
+          "timestamp": 1700000000,
+          "bits": 545259519,
+          "nonce": 7
+        },
+        "block_height": 654321,
+        "merkle_proof": {
+          "nodes": [
+            "101feb7f6fd9d6a94f8cc577f667453eee5b1aa35611e9031df61becc970c4bd"
+          ],
+          "bits": [
+            false
+          ]
+        },
+        "claimed_outpoint": "ab762a1ebc533bfcdfc501fbb93d68927c7f702f2eed313b2ad22b093fa540d7:2",
+        "internal_key": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+        "merkle_root": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "reject_header": false,
+      "expected_error": ""
+    },
+    {
+      "comment": "hash mismatch: claimed outpoint txid is the coinbase txid",
+      "proof": {
+        "raw_tx": "0200000000010155555555555555555555555555555555555555555555555555555555555555550100000000fdffffff03d204000000000000160014777777777777777777777777777777777777777729090000000000002251202a64b1ee3375f3bb4b367b8cb8384a47f73cf231717f827c6c6fbbf5aecf0c36800d0000000000002251200210a11edd82cbfe10ee3b2b0906c3ddef048d45f4be6e6980ce4bdad315cbed01406666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666600000000",
+        "block_header": {
+          "version": 536870912,
+          "prev_block": "9999999999999999999999999999999999999999999999999999999999999999",
+          "merkle_root": "04d78a09ff86acde377e30eb6f6fb22b67cef60fa0c47a0360ca3e5ff454d8dd",
+          "timestamp": 1700000000,
+          "bits": 545259519,
+          "nonce": 7
+        },
+        "block_height": 654321,
+        "merkle_proof": {
+          "nodes": [
+            "101feb7f6fd9d6a94f8cc577f667453eee5b1aa35611e9031df61becc970c4bd"
+          ],
+          "bits": [
+            false
+          ]
+        },
+        "claimed_outpoint": "101feb7f6fd9d6a94f8cc577f667453eee5b1aa35611e9031df61becc970c4bd:1",
+        "internal_key": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+        "merkle_root": ""
+      },
+      "reject_header": false,
+      "expected_error": "ErrHashMismatch"
+    },
+    {
+      "comment": "output index out of range",
+      "proof": {
+        "raw_tx": "0200000000010155555555555555555555555555555555555555555555555555555555555555550100000000fdffffff03d204000000000000160014777777777777777777777777777777777777777729090000000000002251202a64b1ee3375f3bb4b367b8cb8384a47f73cf231717f827c6c6fbbf5aecf0c36800d0000000000002251200210a11edd82cbfe10ee3b2b0906c3ddef048d45f4be6e6980ce4bdad315cbed01406666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666600000000",
+        "block_header": {
+          "version": 536870912,
+          "prev_block": "9999999999999999999999999999999999999999999999999999999999999999",
+          "merkle_root": "04d78a09ff86acde377e30eb6f6fb22b67cef60fa0c47a0360ca3e5ff454d8dd",
+          "timestamp": 1700000000,
+          "bits": 545259519,
+          "nonce": 7
+        },
+        "block_height": 654321,
+        "merkle_proof": {
+          "nodes": [
+            "101feb7f6fd9d6a94f8cc577f667453eee5b1aa35611e9031df61becc970c4bd"
+          ],
+          "bits": [
+            false
+          ]
+        },
+        "claimed_outpoint": "ab762a1ebc533bfcdfc501fbb93d68927c7f702f2eed313b2ad22b093fa540d7:123",
+        "internal_key": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+        "merkle_root": ""
+      },
+      "reject_header": false,
+      "expected_error": "ErrOutputIndexInvalid"
+    },
+    {
+      "comment": "claimed output is not P2TR (vout 0 is P2WPKH)",
+      "proof": {
+        "raw_tx": "0200000000010155555555555555555555555555555555555555555555555555555555555555550100000000fdffffff03d204000000000000160014777777777777777777777777777777777777777729090000000000002251202a64b1ee3375f3bb4b367b8cb8384a47f73cf231717f827c6c6fbbf5aecf0c36800d0000000000002251200210a11edd82cbfe10ee3b2b0906c3ddef048d45f4be6e6980ce4bdad315cbed01406666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666600000000",
+        "block_header": {
+          "version": 536870912,
+          "prev_block": "9999999999999999999999999999999999999999999999999999999999999999",
+          "merkle_root": "04d78a09ff86acde377e30eb6f6fb22b67cef60fa0c47a0360ca3e5ff454d8dd",
+          "timestamp": 1700000000,
+          "bits": 545259519,
+          "nonce": 7
+        },
+        "block_height": 654321,
+        "merkle_proof": {
+          "nodes": [
+            "101feb7f6fd9d6a94f8cc577f667453eee5b1aa35611e9031df61becc970c4bd"
+          ],
+          "bits": [
+            false
+          ]
+        },
+        "claimed_outpoint": "ab762a1ebc533bfcdfc501fbb93d68927c7f702f2eed313b2ad22b093fa540d7:0",
+        "internal_key": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+        "merkle_root": ""
+      },
+      "reject_header": false,
+      "expected_error": "ErrClaimedOutputScriptMismatch"
+    },
+    {
+      "comment": "wrong internal key for BIP-86 output",
+      "proof": {
+        "raw_tx": "0200000000010155555555555555555555555555555555555555555555555555555555555555550100000000fdffffff03d204000000000000160014777777777777777777777777777777777777777729090000000000002251202a64b1ee3375f3bb4b367b8cb8384a47f73cf231717f827c6c6fbbf5aecf0c36800d0000000000002251200210a11edd82cbfe10ee3b2b0906c3ddef048d45f4be6e6980ce4bdad315cbed01406666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666600000000",
+        "block_header": {
+          "version": 536870912,
+          "prev_block": "9999999999999999999999999999999999999999999999999999999999999999",
+          "merkle_root": "04d78a09ff86acde377e30eb6f6fb22b67cef60fa0c47a0360ca3e5ff454d8dd",
+          "timestamp": 1700000000,
+          "bits": 545259519,
+          "nonce": 7
+        },
+        "block_height": 654321,
+        "merkle_proof": {
+          "nodes": [
+            "101feb7f6fd9d6a94f8cc577f667453eee5b1aa35611e9031df61becc970c4bd"
+          ],
+          "bits": [
+            false
+          ]
+        },
+        "claimed_outpoint": "ab762a1ebc533bfcdfc501fbb93d68927c7f702f2eed313b2ad22b093fa540d7:1",
+        "internal_key": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+        "merkle_root": ""
+      },
+      "reject_header": false,
+      "expected_error": "ErrClaimedOutputScriptMismatch"
+    },
+    {
+      "comment": "wrong merkle root claimed for BIP-86 output",
+      "proof": {
+        "raw_tx": "0200000000010155555555555555555555555555555555555555555555555555555555555555550100000000fdffffff03d204000000000000160014777777777777777777777777777777777777777729090000000000002251202a64b1ee3375f3bb4b367b8cb8384a47f73cf231717f827c6c6fbbf5aecf0c36800d0000000000002251200210a11edd82cbfe10ee3b2b0906c3ddef048d45f4be6e6980ce4bdad315cbed01406666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666600000000",
+        "block_header": {
+          "version": 536870912,
+          "prev_block": "9999999999999999999999999999999999999999999999999999999999999999",
+          "merkle_root": "04d78a09ff86acde377e30eb6f6fb22b67cef60fa0c47a0360ca3e5ff454d8dd",
+          "timestamp": 1700000000,
+          "bits": 545259519,
+          "nonce": 7
+        },
+        "block_height": 654321,
+        "merkle_proof": {
+          "nodes": [
+            "101feb7f6fd9d6a94f8cc577f667453eee5b1aa35611e9031df61becc970c4bd"
+          ],
+          "bits": [
+            false
+          ]
+        },
+        "claimed_outpoint": "ab762a1ebc533bfcdfc501fbb93d68927c7f702f2eed313b2ad22b093fa540d7:1",
+        "internal_key": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+        "merkle_root": "4444444444444444444444444444444444444444444444444444444444444444"
+      },
+      "reject_header": false,
+      "expected_error": "ErrClaimedOutputScriptMismatch"
+    },
+    {
+      "comment": "BIP-86 claim (no merkle root) on the tapscript output",
+      "proof": {
+        "raw_tx": "0200000000010155555555555555555555555555555555555555555555555555555555555555550100000000fdffffff03d204000000000000160014777777777777777777777777777777777777777729090000000000002251202a64b1ee3375f3bb4b367b8cb8384a47f73cf231717f827c6c6fbbf5aecf0c36800d0000000000002251200210a11edd82cbfe10ee3b2b0906c3ddef048d45f4be6e6980ce4bdad315cbed01406666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666600000000",
+        "block_header": {
+          "version": 536870912,
+          "prev_block": "9999999999999999999999999999999999999999999999999999999999999999",
+          "merkle_root": "04d78a09ff86acde377e30eb6f6fb22b67cef60fa0c47a0360ca3e5ff454d8dd",
+          "timestamp": 1700000000,
+          "bits": 545259519,
+          "nonce": 7
+        },
+        "block_height": 654321,
+        "merkle_proof": {
+          "nodes": [
+            "101feb7f6fd9d6a94f8cc577f667453eee5b1aa35611e9031df61becc970c4bd"
+          ],
+          "bits": [
+            false
+          ]
+        },
+        "claimed_outpoint": "ab762a1ebc533bfcdfc501fbb93d68927c7f702f2eed313b2ad22b093fa540d7:2",
+        "internal_key": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+        "merkle_root": ""
+      },
+      "reject_header": false,
+      "expected_error": "ErrClaimedOutputScriptMismatch"
+    },
+    {
+      "comment": "merkle proof direction bit flipped",
+      "proof": {
+        "raw_tx": "0200000000010155555555555555555555555555555555555555555555555555555555555555550100000000fdffffff03d204000000000000160014777777777777777777777777777777777777777729090000000000002251202a64b1ee3375f3bb4b367b8cb8384a47f73cf231717f827c6c6fbbf5aecf0c36800d0000000000002251200210a11edd82cbfe10ee3b2b0906c3ddef048d45f4be6e6980ce4bdad315cbed01406666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666600000000",
+        "block_header": {
+          "version": 536870912,
+          "prev_block": "9999999999999999999999999999999999999999999999999999999999999999",
+          "merkle_root": "04d78a09ff86acde377e30eb6f6fb22b67cef60fa0c47a0360ca3e5ff454d8dd",
+          "timestamp": 1700000000,
+          "bits": 545259519,
+          "nonce": 7
+        },
+        "block_height": 654321,
+        "merkle_proof": {
+          "nodes": [
+            "101feb7f6fd9d6a94f8cc577f667453eee5b1aa35611e9031df61becc970c4bd"
+          ],
+          "bits": [
+            true
+          ]
+        },
+        "claimed_outpoint": "ab762a1ebc533bfcdfc501fbb93d68927c7f702f2eed313b2ad22b093fa540d7:1",
+        "internal_key": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+        "merkle_root": ""
+      },
+      "reject_header": false,
+      "expected_error": "ErrInvalidTxMerkleProof"
+    },
+    {
+      "comment": "merkle proof sibling node corrupted",
+      "proof": {
+        "raw_tx": "0200000000010155555555555555555555555555555555555555555555555555555555555555550100000000fdffffff03d204000000000000160014777777777777777777777777777777777777777729090000000000002251202a64b1ee3375f3bb4b367b8cb8384a47f73cf231717f827c6c6fbbf5aecf0c36800d0000000000002251200210a11edd82cbfe10ee3b2b0906c3ddef048d45f4be6e6980ce4bdad315cbed01406666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666600000000",
+        "block_header": {
+          "version": 536870912,
+          "prev_block": "9999999999999999999999999999999999999999999999999999999999999999",
+          "merkle_root": "04d78a09ff86acde377e30eb6f6fb22b67cef60fa0c47a0360ca3e5ff454d8dd",
+          "timestamp": 1700000000,
+          "bits": 545259519,
+          "nonce": 7
+        },
+        "block_height": 654321,
+        "merkle_proof": {
+          "nodes": [
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          ],
+          "bits": [
+            false
+          ]
+        },
+        "claimed_outpoint": "ab762a1ebc533bfcdfc501fbb93d68927c7f702f2eed313b2ad22b093fa540d7:1",
+        "internal_key": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+        "merkle_root": ""
+      },
+      "reject_header": false,
+      "expected_error": "ErrInvalidTxMerkleProof"
+    },
+    {
+      "comment": "block header merkle root does not match the proof",
+      "proof": {
+        "raw_tx": "0200000000010155555555555555555555555555555555555555555555555555555555555555550100000000fdffffff03d204000000000000160014777777777777777777777777777777777777777729090000000000002251202a64b1ee3375f3bb4b367b8cb8384a47f73cf231717f827c6c6fbbf5aecf0c36800d0000000000002251200210a11edd82cbfe10ee3b2b0906c3ddef048d45f4be6e6980ce4bdad315cbed01406666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666600000000",
+        "block_header": {
+          "version": 536870912,
+          "prev_block": "9999999999999999999999999999999999999999999999999999999999999999",
+          "merkle_root": "abababababababababababababababababababababababababababababababab",
+          "timestamp": 1700000000,
+          "bits": 545259519,
+          "nonce": 7
+        },
+        "block_height": 654321,
+        "merkle_proof": {
+          "nodes": [
+            "101feb7f6fd9d6a94f8cc577f667453eee5b1aa35611e9031df61becc970c4bd"
+          ],
+          "bits": [
+            false
+          ]
+        },
+        "claimed_outpoint": "ab762a1ebc533bfcdfc501fbb93d68927c7f702f2eed313b2ad22b093fa540d7:1",
+        "internal_key": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+        "merkle_root": ""
+      },
+      "reject_header": false,
+      "expected_error": "ErrInvalidTxMerkleProof"
+    },
+    {
+      "comment": "header verifier rejects the block header",
+      "proof": {
+        "raw_tx": "0200000000010155555555555555555555555555555555555555555555555555555555555555550100000000fdffffff03d204000000000000160014777777777777777777777777777777777777777729090000000000002251202a64b1ee3375f3bb4b367b8cb8384a47f73cf231717f827c6c6fbbf5aecf0c36800d0000000000002251200210a11edd82cbfe10ee3b2b0906c3ddef048d45f4be6e6980ce4bdad315cbed01406666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666600000000",
+        "block_header": {
+          "version": 536870912,
+          "prev_block": "9999999999999999999999999999999999999999999999999999999999999999",
+          "merkle_root": "04d78a09ff86acde377e30eb6f6fb22b67cef60fa0c47a0360ca3e5ff454d8dd",
+          "timestamp": 1700000000,
+          "bits": 545259519,
+          "nonce": 7
+        },
+        "block_height": 654321,
+        "merkle_proof": {
+          "nodes": [
+            "101feb7f6fd9d6a94f8cc577f667453eee5b1aa35611e9031df61becc970c4bd"
+          ],
+          "bits": [
+            false
+          ]
+        },
+        "claimed_outpoint": "ab762a1ebc533bfcdfc501fbb93d68927c7f702f2eed313b2ad22b093fa540d7:1",
+        "internal_key": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+        "merkle_root": ""
+      },
+      "reject_header": true,
+      "expected_error": "header verifier error"
+    }
+  ]
+}

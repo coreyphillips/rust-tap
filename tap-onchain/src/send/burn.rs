@@ -94,6 +94,7 @@ pub fn prepare_burn(
         &[burn_output],
         genesis,
         Some(tap_primitives::commitment::TapCommitmentVersion::V2),
+        false,
     )
 }
 

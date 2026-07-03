@@ -346,19 +346,19 @@ mod sqlite_impl {
     /// SQLite-backed [`SupplyTreeStore`], persisting trees in the
     /// namespaced `mssmt_nodes`/`mssmt_roots` tables plus the
     /// `universe_supply_roots`/`universe_supply_leaves` linkage tables.
-    pub struct SqliteSupplyTreeStore<'a> {
-        db: &'a SqliteDb,
+    pub struct SqliteSupplyTreeStore {
+        db: std::sync::Arc<SqliteDb>,
     }
 
-    impl<'a> SqliteSupplyTreeStore<'a> {
-        pub fn new(db: &'a SqliteDb) -> Self {
+    impl SqliteSupplyTreeStore {
+        pub fn new(db: std::sync::Arc<SqliteDb>) -> Self {
             SqliteSupplyTreeStore { db }
         }
 
         /// Copies the persistent tree in `namespace` into a fresh
         /// in-memory tree.
         fn snapshot_tree(&self, namespace: &str) -> Result<SupplyTree, String> {
-            let store = SqliteTreeStore::new(self.db, namespace);
+            let store = SqliteTreeStore::new(std::sync::Arc::clone(&self.db), namespace);
             let mut memory = DefaultStore::new();
             copy_tree_store(&store, &mut memory).map_err(|e| e.to_string())?;
             Ok(CompactedTree::new(memory))
@@ -387,7 +387,7 @@ mod sqlite_impl {
         }
     }
 
-    impl SupplyTreeStore for SqliteSupplyTreeStore<'_> {
+    impl SupplyTreeStore for SqliteSupplyTreeStore {
         fn fetch_sub_tree(
             &self,
             group_key: &SerializedKey,
@@ -434,7 +434,7 @@ mod sqlite_impl {
 
                 let namespace = sub_tree_namespace(group_key, tree_type);
                 let mut tree = CompactedTree::new(SqliteTreeStore::new(
-                    self.db, namespace,
+                    std::sync::Arc::clone(&self.db), namespace,
                 ));
 
                 let leaf =
@@ -452,7 +452,7 @@ mod sqlite_impl {
             for tree_type in touched {
                 let sub_namespace = sub_tree_namespace(group_key, tree_type);
                 let sub_tree = CompactedTree::new(SqliteTreeStore::new(
-                    self.db,
+                    std::sync::Arc::clone(&self.db),
                     sub_namespace.clone(),
                 ));
                 let sub_root = sub_tree.root().map_err(|e| e.to_string())?;
@@ -461,7 +461,7 @@ mod sqlite_impl {
                 }
 
                 let mut root_tree = CompactedTree::new(SqliteTreeStore::new(
-                    self.db,
+                    std::sync::Arc::clone(&self.db),
                     root_namespace.clone(),
                 ));
                 root_tree
@@ -494,7 +494,7 @@ mod sqlite_impl {
             }
 
             let root_tree = CompactedTree::new(SqliteTreeStore::new(
-                self.db,
+                std::sync::Arc::clone(&self.db),
                 root_namespace,
             ));
             let root = root_tree.root().map_err(|e| e.to_string())?;
@@ -503,12 +503,12 @@ mod sqlite_impl {
     }
 
     /// SQLite-backed [`SupplyCommitStore`].
-    pub struct SqliteSupplyCommitStore<'a> {
-        db: &'a SqliteDb,
+    pub struct SqliteSupplyCommitStore {
+        db: std::sync::Arc<SqliteDb>,
     }
 
-    impl<'a> SqliteSupplyCommitStore<'a> {
-        pub fn new(db: &'a SqliteDb) -> Self {
+    impl SqliteSupplyCommitStore {
+        pub fn new(db: std::sync::Arc<SqliteDb>) -> Self {
             SqliteSupplyCommitStore { db }
         }
     }
@@ -620,7 +620,7 @@ mod sqlite_impl {
         block_hash, block_header, tx_index, merkle_proof, chain_fees, \
         spent_commitment_txid, spent_commitment_vout";
 
-    impl SupplyCommitStore for SqliteSupplyCommitStore<'_> {
+    impl SupplyCommitStore for SqliteSupplyCommitStore {
         fn insert_commitment(
             &mut self,
             group_key: &SerializedKey,
@@ -863,6 +863,7 @@ mod sqlite_impl {
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::sha256d;
@@ -983,8 +984,8 @@ mod tests {
     /// Memory and SQLite tree stores produce identical supply roots.
     #[test]
     fn test_supply_tree_store_backends_agree() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut sqlite_store = SqliteSupplyTreeStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut sqlite_store = SqliteSupplyTreeStore::new(Arc::clone(&db));
         let mut memory_store = MemorySupplyTreeStore::new();
 
         let updates =
@@ -1027,8 +1028,8 @@ mod tests {
     /// Incremental updates accumulate across calls.
     #[test]
     fn test_supply_tree_store_incremental() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut store = SqliteSupplyTreeStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteSupplyTreeStore::new(Arc::clone(&db));
 
         let (_, sum1) = store
             .apply_supply_updates(&group_key(), &[ignore_update(0, 100)])
@@ -1050,8 +1051,8 @@ mod tests {
     /// Commitments round-trip through both store backends.
     #[test]
     fn test_supply_commit_store_round_trip() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut sqlite_store = SqliteSupplyCommitStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut sqlite_store = SqliteSupplyCommitStore::new(Arc::clone(&db));
         let mut memory_store = MemorySupplyCommitStore::new();
 
         let first = test_commitment(1, true);
@@ -1118,8 +1119,8 @@ mod tests {
     /// both backends.
     #[test]
     fn test_pre_commit_round_trip() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        let mut sqlite_store = SqliteSupplyCommitStore::new(&db);
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut sqlite_store = SqliteSupplyCommitStore::new(Arc::clone(&db));
         let mut memory_store = MemorySupplyCommitStore::new();
 
         let pre_commit = PreCommitment {

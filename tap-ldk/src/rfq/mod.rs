@@ -24,5 +24,8 @@
 pub mod math;
 pub mod manager;
 
-pub use math::FixedPoint;
-pub use manager::{QuoteManager, AcceptedQuote, PriceOracle, RfqError};
+pub use math::{FixedPoint, FixedPointError};
+pub use manager::{
+    AcceptSigner, AcceptedQuote, PendingRequest, PriceOracle, QuoteManager,
+    RfqError, DEFAULT_QUOTE_LIFETIME_SECS,
+};

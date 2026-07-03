@@ -36,6 +36,39 @@ fn err(msg: impl Into<String>) -> ProofError {
     ProofError::VerificationFailed(msg.into())
 }
 
+/// The secp256k1 group order `n`, big-endian.
+const CURVE_ORDER_N: [u8; 32] = [
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFE, 0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B,
+    0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
+];
+
+/// Reduces a 32-byte big-endian value modulo the secp256k1 group order
+/// `n`, matching Go's `ModNScalar.SetByteSlice` semantics used by
+/// `asset.GenChallengeNUMS`. Since `2^256 < 2n`, a single conditional
+/// subtraction suffices.
+fn reduce_mod_n(bytes: [u8; 32]) -> [u8; 32] {
+    // Big-endian byte-wise comparison equals numeric comparison.
+    if bytes < CURVE_ORDER_N {
+        return bytes;
+    }
+
+    let mut out = [0u8; 32];
+    let mut borrow = 0u16;
+    for i in (0..32).rev() {
+        let lhs = u16::from(bytes[i]);
+        let rhs = u16::from(CURVE_ORDER_N[i]) + borrow;
+        if lhs >= rhs {
+            out[i] = (lhs - rhs) as u8;
+            borrow = 0;
+        } else {
+            out[i] = (lhs + 256 - rhs) as u8;
+            borrow = 1;
+        }
+    }
+    out
+}
+
 /// Generates a variant of the NUMS script key that is modified by the
 /// provided challenge, mirroring Go's `asset.GenChallengeNUMS`
 /// (asset/witness.go:47):
@@ -56,10 +89,15 @@ pub fn gen_challenge_nums(
     let nums = PublicKey::from_slice(&NUMS_BYTES)
         .map_err(|e| err(format!("invalid NUMS key: {}", e)))?;
 
-    // Go's ModNScalar.SetByteSlice reduces mod n; values >= n are
-    // astronomically unlikely for real challenges, so we reject them
-    // instead of implementing the reduction.
-    let scalar = Scalar::from_be_bytes(challenge_bytes)
+    // Go's ModNScalar.SetByteSlice reduces the challenge mod n, so
+    // challenges >= n are valid and wrap around; mirror that here. A
+    // challenge that reduces to zero leaves the NUMS key untweaked,
+    // which matches Go (0*G is the identity).
+    let reduced = reduce_mod_n(challenge_bytes);
+    if reduced == [0u8; 32] {
+        return Ok(ScriptKey::from_pub_key(NUMS_KEY));
+    }
+    let scalar = Scalar::from_be_bytes(reduced)
         .map_err(|e| err(format!("invalid challenge scalar: {}", e)))?;
 
     let result = nums
@@ -190,5 +228,57 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_ne!(*a.serialized(), NUMS_KEY);
+    }
+
+    /// Adds one to a big-endian 32-byte value (wrapping).
+    fn be_add_one(mut bytes: [u8; 32]) -> [u8; 32] {
+        for i in (0..32).rev() {
+            let (v, overflow) = bytes[i].overflowing_add(1);
+            bytes[i] = v;
+            if !overflow {
+                break;
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn test_gen_challenge_nums_reduces_mod_n() {
+        // Go's ModNScalar.SetByteSlice reduces mod n, so a challenge of
+        // exactly n reduces to zero and leaves the NUMS key untweaked.
+        let key = gen_challenge_nums(Some(CURVE_ORDER_N)).unwrap();
+        assert_eq!(*key.serialized(), NUMS_KEY);
+
+        // n + 1 reduces to 1, matching an explicit challenge of 1.
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        let from_wrapped =
+            gen_challenge_nums(Some(be_add_one(CURVE_ORDER_N))).unwrap();
+        let from_one = gen_challenge_nums(Some(one)).unwrap();
+        assert_eq!(from_wrapped, from_one);
+
+        // The all-ones challenge (>= n) is accepted, not rejected.
+        assert!(gen_challenge_nums(Some([0xFF; 32])).is_ok());
+    }
+
+    #[test]
+    fn test_reduce_mod_n() {
+        assert_eq!(reduce_mod_n([0u8; 32]), [0u8; 32]);
+        assert_eq!(reduce_mod_n(CURVE_ORDER_N), [0u8; 32]);
+
+        // n - 1 stays unchanged.
+        let mut n_minus_one = CURVE_ORDER_N;
+        n_minus_one[31] -= 1;
+        assert_eq!(reduce_mod_n(n_minus_one), n_minus_one);
+
+        // 2^256 - 1 reduces to 2^256 - 1 - n
+        // = 0x14551231950b75fc4402da1732fc9bebe.
+        let reduced = reduce_mod_n([0xFF; 32]);
+        let mut expected = [0u8; 32];
+        expected[15..].copy_from_slice(&[
+            0x01, 0x45, 0x51, 0x23, 0x19, 0x50, 0xB7, 0x5F, 0xC4, 0x40,
+            0x2D, 0xA1, 0x73, 0x2F, 0xC9, 0xBE, 0xBE,
+        ]);
+        assert_eq!(reduced, expected);
     }
 }

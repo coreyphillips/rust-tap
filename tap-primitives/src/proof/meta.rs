@@ -230,7 +230,17 @@ impl MetaReveal {
                     } else if record.value.len() == 33 {
                         let mut key = [0u8; 33];
                         key.copy_from_slice(&record.value);
-                        reveal.delegation_key = Some(SerializedKey(key));
+                        // Go's PublicKeyOptionDecoder parses the key
+                        // with asset.CompressedPubKeyDecoder
+                        // (btcec.ParsePubKey), rejecting off-curve
+                        // keys at decode time.
+                        let key = SerializedKey(key);
+                        key.validate_on_curve().map_err(|e| {
+                            super::ProofError::InvalidMetaReveal(
+                                format!("delegation key: {}", e),
+                            )
+                        })?;
+                        reveal.delegation_key = Some(key);
                     } else {
                         return Err(super::ProofError::InvalidMetaReveal(
                             "delegation key must be 33 bytes".into(),

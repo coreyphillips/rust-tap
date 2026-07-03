@@ -6,6 +6,7 @@ members = [
     "tap-persist",
     "tap-universe",
     "tap-node",
+    "tap-server",
     "examples/quickstart",
 ]
 exclude = [

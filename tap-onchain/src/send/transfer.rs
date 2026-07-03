@@ -46,6 +46,9 @@ pub enum SendError {
     InvalidState(String),
     /// Burn preparation or validation error.
     BurnError(String),
+    /// The signer does not know the key behind an input's script key
+    /// (no stored key descriptor for it).
+    UnknownScriptKey(tap_primitives::asset::SerializedKey),
 }
 
 impl std::fmt::Display for SendError {
@@ -79,6 +82,13 @@ impl std::fmt::Display for SendError {
             }
             SendError::BurnError(msg) => {
                 write!(f, "burn error: {}", msg)
+            }
+            SendError::UnknownScriptKey(key) => {
+                write!(
+                    f,
+                    "unknown script key: no key descriptor stored for {:02x?}",
+                    &key.0[..4]
+                )
             }
         }
     }
@@ -136,6 +146,14 @@ pub struct PreparedTransfer {
     pub output_commitments: Vec<TapCommitmentTree>,
     /// Whether a split was required (partial send).
     pub is_split: bool,
+    /// Passive assets re-anchored into the change output alongside the
+    /// sender's change/tombstone asset (Go's passive assets). Each is a
+    /// fully signed full-value 1-in-1-out transition of an asset that
+    /// shared an anchor UTXO with a spent input but was not itself
+    /// selected. Empty for a plain transfer. Merged into
+    /// [`Self::change_commitment`] by
+    /// [`Self::rebuild_root_commitment_with_options`].
+    pub passive_assets: Vec<Asset>,
 }
 
 impl PreparedTransfer {
@@ -178,23 +196,84 @@ impl PreparedTransfer {
         // the output carrying the transfer root asset. Genesis assets
         // and split leaves produce no markers.
         if !no_stxo_proofs {
-            let stxo_leaves = collect_stxo(&self.root_asset)
+            let mut stxo_leaves = collect_stxo(&self.root_asset)
                 .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+            // Each re-anchored passive asset is itself a transfer root,
+            // so its own spent-asset markers must be committed to in the
+            // change output for its STXO inclusion proofs to verify
+            // (Go commits every output asset's STXO leaves together).
+            for passive in &self.passive_assets {
+                let passive_stxo = collect_stxo(passive)
+                    .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+                stxo_leaves.extend(passive_stxo);
+            }
             tc.merge_alt_leaves(&stxo_leaves)
                 .map_err(|e| SendError::CommitmentError(e.to_string()))?;
         }
 
+        // Merge each re-anchored passive asset (its own asset id, hence
+        // its own asset commitment sub-tree) into the change output's
+        // commitment, mirroring Go's `commitPacket`, which merges the
+        // passive packets' commitments into the change output's
+        // TapCommitment (tapsend/send.go).
+        for passive in &self.passive_assets {
+            let pac = AssetCommitmentTree::new(&[passive])
+                .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+            tc.upsert(pac)
+                .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+        }
+
         if !self.is_split {
-            // Full send: the transfer asset itself is the root asset,
-            // and the single output commitment mirrors the change
-            // commitment.
+            // Full send: the transfer asset itself is the root asset. Its
+            // recipient (single) output commitment must carry ONLY the
+            // recipient asset (plus its STXO markers), never the passive
+            // assets — those stay at the sender's change output. Rebuild
+            // it from the root asset alone.
+            let recipient_ac = AssetCommitmentTree::new(&[&self.root_asset])
+                .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+            let mut recipient_tc = TapCommitmentTree::new(
+                version,
+                vec![recipient_ac],
+            )
+            .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+            if !no_stxo_proofs {
+                let stxo_leaves = collect_stxo(&self.root_asset)
+                    .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+                recipient_tc
+                    .merge_alt_leaves(&stxo_leaves)
+                    .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+            }
             if let Some(first) = self.output_commitments.first_mut() {
-                *first = tc.clone();
+                *first = recipient_tc;
             }
         }
         self.change_commitment = tc;
         Ok(())
     }
+}
+
+/// Returns the "spend template" copy of a split root asset used as the
+/// root locator leaf of the split MS-SMT tree: the root asset with its
+/// witnesses replaced by a single zero-`PrevID`, witnessless witness and
+/// no split commitment root. Mirrors the leaf Go's
+/// `commitment.NewSplitCommitment` inserts for the root locator (built
+/// from `CopySpendTemplate`), which is distinct from the returned
+/// `RootAsset` that carries the real input `PrevID`s.
+///
+/// Used by both [`TransferBuilder::prepare_split_outputs`] (when the
+/// tree is first built) and
+/// [`crate::send::split_proof::populate_split_proofs`] (when the tree is
+/// rebuilt to derive the split proofs) so both derive the identical
+/// `split_commitment_root`.
+pub(crate) fn root_spend_template(root_asset: &Asset) -> Asset {
+    let mut template = root_asset.clone();
+    template.split_commitment_root = None;
+    template.prev_witnesses = vec![Witness {
+        prev_id: Some(PrevId::ZERO),
+        tx_witness: vec![],
+        split_commitment: None,
+    }];
+    template
 }
 
 /// Builds asset transfers from inputs and output allocations.
@@ -231,6 +310,27 @@ impl TransferBuilder {
         genesis: &Genesis,
         commitment_version: Option<TapCommitmentVersion>,
     ) -> Result<PreparedTransfer, SendError> {
+        Self::prepare_outputs_forced(
+            inputs,
+            outputs,
+            genesis,
+            commitment_version,
+            false,
+        )
+    }
+
+    /// Prepares output assets with the burn-key guard and an explicit
+    /// `force_split` flag. When `force_split` is set, a split (with a
+    /// zero-amount tombstone root when there is no change) is produced
+    /// even for a full-value single-recipient send, so the sender still
+    /// owns a change output to re-anchor passive assets into.
+    pub fn prepare_outputs_forced(
+        inputs: &[SelectedInput],
+        outputs: &[TransferOutput],
+        genesis: &Genesis,
+        commitment_version: Option<TapCommitmentVersion>,
+        force_split: bool,
+    ) -> Result<PreparedTransfer, SendError> {
         // Burn keys can only be funded through `prepare_burn`; a normal
         // transfer must never pay to a key that provably burns the assets.
         // Mirrors Go, which only derives burn script keys inside FundBurn.
@@ -247,7 +347,13 @@ impl TransferBuilder {
             }
         }
 
-        Self::prepare_outputs_inner(inputs, outputs, genesis, commitment_version)
+        Self::prepare_outputs_inner(
+            inputs,
+            outputs,
+            genesis,
+            commitment_version,
+            force_split,
+        )
     }
 
     /// Prepares output assets without the burn-key guard. Used by both
@@ -258,6 +364,7 @@ impl TransferBuilder {
         outputs: &[TransferOutput],
         genesis: &Genesis,
         commitment_version: Option<TapCommitmentVersion>,
+        force_split: bool,
     ) -> Result<PreparedTransfer, SendError> {
         if inputs.is_empty() {
             return Err(SendError::NoInputs);
@@ -277,7 +384,7 @@ impl TransferBuilder {
         }
 
         let change_amount = input_sum - output_sum;
-        let is_split = change_amount > 0 || outputs.len() > 1;
+        let is_split = change_amount > 0 || outputs.len() > 1 || force_split;
 
         if is_split {
             Self::prepare_split_outputs(
@@ -343,6 +450,7 @@ impl TransferBuilder {
             change_commitment: tc.clone(),
             output_commitments: vec![tc],
             is_split: false,
+            passive_assets: vec![],
         })
     }
 
@@ -425,7 +533,18 @@ impl TransferBuilder {
             script_key: *root_asset.script_key.serialized(),
             amount: change_amount,
         };
-        let root_leaf = asset_leaf(&root_asset);
+        // The root locator leaf inserted into the split tree must be a
+        // "spend template" copy of the root asset: a single
+        // zero-`PrevID`, witnessless witness, exactly as Go's
+        // `commitment.NewSplitCommitment` inserts (it builds every leaf,
+        // including the root, from `CopySpendTemplate`, and only writes
+        // the real input `PrevID`s onto a separate `RootAsset` copy that
+        // is never re-inserted). The V0 leaf hash covers the witness
+        // `PrevID`s, so inserting the real input `PrevID`s here would
+        // make `split_commitment_root` (and the signature over it)
+        // diverge from Go for every split send.
+        let root_leaf = asset_leaf(&root_spend_template(&root_asset))
+            .map_err(|e| SendError::SplitError(e.to_string()))?;
         split_tree
             .insert(root_locator.hash(), root_leaf)
             .map_err(|e| SendError::SplitError(e.to_string()))?;
@@ -438,7 +557,8 @@ impl TransferBuilder {
                 script_key: *split.asset.script_key.serialized(),
                 amount: split.asset.amount,
             };
-            let leaf = asset_leaf(&split.asset);
+            let leaf = asset_leaf(&split.asset)
+                .map_err(|e| SendError::SplitError(e.to_string()))?;
             split_tree
                 .insert(locator.hash(), leaf)
                 .map_err(|e| SendError::SplitError(e.to_string()))?;
@@ -480,6 +600,7 @@ impl TransferBuilder {
             change_commitment: change_tc,
             output_commitments,
             is_split: true,
+            passive_assets: vec![],
         })
     }
 }
@@ -648,6 +769,203 @@ mod tests {
         let result =
             TransferBuilder::prepare_outputs(&inputs, &[], &genesis);
         assert!(matches!(result, Err(SendError::NoOutputs)));
+    }
+
+    #[test]
+    fn test_root_locator_leaf_is_spend_template() {
+        // The split_commitment_root must be computed from a split tree
+        // whose ROOT locator leaf is the spend-template shape of the
+        // change asset (a single zero-PrevID, witnessless witness), NOT
+        // the change asset carrying the real input PrevIDs. This pins
+        // the prover to Go's commitment.NewSplitCommitment convention
+        // (commitment/split.go), where the inserted root leaf is a
+        // CopySpendTemplate copy and the real-witness RootAsset is never
+        // re-inserted.
+        use tap_primitives::commitment::asset_leaf;
+        use tap_primitives::mssmt;
+
+        let genesis = test_genesis();
+        let asset_id = genesis.id();
+        let inputs = vec![test_input(100)];
+        let outputs = vec![test_output(60, 1)];
+
+        let result =
+            TransferBuilder::prepare_outputs(&inputs, &outputs, &genesis)
+                .unwrap();
+        assert!(result.is_split);
+        let (committed_hash, committed_sum) =
+            result.root_asset.split_commitment_root.unwrap();
+
+        // Rebuild the expected tree by hand: the root leaf is the
+        // spend-template of the change asset, the split leaf is the
+        // recipient asset without its split witness.
+        let mut tree =
+            mssmt::FullTree::new(mssmt::DefaultStore::new());
+
+        let template = root_spend_template(&result.root_asset);
+        // The template must carry exactly one zero-PrevID, witnessless
+        // witness and no split commitment root.
+        assert_eq!(template.prev_witnesses.len(), 1);
+        assert_eq!(
+            template.prev_witnesses[0].prev_id,
+            Some(PrevId::ZERO)
+        );
+        assert!(template.prev_witnesses[0].tx_witness.is_empty());
+        assert!(template.prev_witnesses[0].split_commitment.is_none());
+        assert!(template.split_commitment_root.is_none());
+
+        let root_locator = SplitLocator {
+            output_index: 0,
+            asset_id,
+            script_key: *result.root_asset.script_key.serialized(),
+            amount: result.root_asset.amount,
+        };
+        tree.insert(root_locator.hash(), asset_leaf(&template).unwrap())
+            .unwrap();
+
+        for split in &result.recipient_assets {
+            let locator = SplitLocator {
+                output_index: split.output_index,
+                asset_id,
+                script_key: *split.asset.script_key.serialized(),
+                amount: split.asset.amount,
+            };
+            let mut leaf_asset = split.asset.clone();
+            if let Some(w) = leaf_asset.prev_witnesses.first_mut() {
+                w.split_commitment = None;
+            }
+            tree.insert(locator.hash(), asset_leaf(&leaf_asset).unwrap())
+                .unwrap();
+        }
+
+        let expected = tree.root().unwrap();
+        assert_eq!(expected.node_hash(), committed_hash);
+        assert_eq!(expected.node_sum(), committed_sum);
+
+        // A sanity check that the shape actually matters: building the
+        // root leaf from the real-witness change asset (with the input
+        // PrevID) must yield a DIFFERENT root, confirming the leaf hash
+        // covers the witness PrevIDs.
+        let mut wrong_tree =
+            mssmt::FullTree::new(mssmt::DefaultStore::new());
+        let mut real_root = result.root_asset.clone();
+        real_root.split_commitment_root = None;
+        wrong_tree
+            .insert(root_locator.hash(), asset_leaf(&real_root).unwrap())
+            .unwrap();
+        for split in &result.recipient_assets {
+            let locator = SplitLocator {
+                output_index: split.output_index,
+                asset_id,
+                script_key: *split.asset.script_key.serialized(),
+                amount: split.asset.amount,
+            };
+            let mut leaf_asset = split.asset.clone();
+            if let Some(w) = leaf_asset.prev_witnesses.first_mut() {
+                w.split_commitment = None;
+            }
+            wrong_tree
+                .insert(locator.hash(), asset_leaf(&leaf_asset).unwrap())
+                .unwrap();
+        }
+        let wrong = wrong_tree.root().unwrap();
+        assert_ne!(wrong.node_hash(), committed_hash);
+    }
+
+    /// Byte-for-byte parity with Go's `commitment.NewSplitCommitment`.
+    /// The expected root was produced by executing Go (v0.8.99) against
+    /// the local taproot-assets checkout for a fixed split: a 100-unit
+    /// asset (genesis outpoint 0xAB..0xAB:0, tag "vec-split") split into
+    /// 40 change (script key = secp pubkey of secret 0x11..) and 60 to a
+    /// recipient (script key = secp pubkey of secret 0x22..). This pins
+    /// the prover's split_commitment_root to Go, closing the byte-parity
+    /// gap the review called out (the root leaf must be the zero-PrevID
+    /// spend template, not the real-witness root asset).
+    #[test]
+    fn test_split_commitment_root_matches_go_vector() {
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+
+        let to_hex = |bytes: &[u8]| -> String {
+            bytes.iter().map(|b| format!("{:02x}", b)).collect()
+        };
+
+        let secp = Secp256k1::new();
+        // Taproot script keys are BIP-340 x-only (even-Y); Go encodes
+        // them normalized to the even-Y form in asset leaves. Build the
+        // same even-Y SerializedKeys (0x02 prefix + x coordinate) so the
+        // leaves are byte-identical to Go's.
+        let pk = |b: u8| -> SerializedKey {
+            let sk = SecretKey::from_slice(&[b; 32]).unwrap();
+            let (x_only, _) = sk.public_key(&secp).x_only_public_key();
+            let mut ser = [0u8; 33];
+            ser[0] = 0x02;
+            ser[1..].copy_from_slice(&x_only.serialize());
+            SerializedKey(ser)
+        };
+        let pk1 = pk(0x11);
+        let pk2 = pk(0x22);
+        assert_eq!(
+            to_hex(&pk1.0),
+            "024f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa"
+        );
+        assert_eq!(
+            to_hex(&pk2.0),
+            "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27"
+        );
+
+        let genesis = Genesis {
+            first_prev_out: OutPoint {
+                txid: [0xAB; 32],
+                vout: 0,
+            },
+            tag: "vec-split".to_string(),
+            meta_hash: [0u8; 32],
+            output_index: 0,
+            asset_type: AssetType::Normal,
+        };
+
+        // Sanity: the asset id must match Go's gen.ID().
+        assert_eq!(
+            to_hex(genesis.id().as_bytes()),
+            "ceb439f322c5d4287335dc48950b32a1dcdf71bcf19e95598053322492f2bba3"
+        );
+
+        let inputs = vec![SelectedInput {
+            prev_id: PrevId {
+                out_point: OutPoint {
+                    txid: [0xAB; 32],
+                    vout: 0,
+                },
+                id: genesis.id(),
+                script_key: pk1,
+            },
+            anchor_point: OutPoint {
+                txid: [0xAB; 32],
+                vout: 0,
+            },
+            amount: 100,
+            asset_type: AssetType::Normal,
+            script_key: ScriptKey::from_pub_key(pk1),
+        }];
+        let outputs = vec![TransferOutput {
+            output_index: 1,
+            amount: 60,
+            script_key: ScriptKey::from_pub_key(pk2),
+            asset_version: AssetVersion::V0,
+            interactive: false,
+        }];
+
+        let result =
+            TransferBuilder::prepare_outputs(&inputs, &outputs, &genesis)
+                .unwrap();
+        let (hash, sum) =
+            result.root_asset.split_commitment_root.unwrap();
+
+        assert_eq!(
+            to_hex(&hash.0),
+            "78944740a368904291b2b27cfbdcef2053ca367900113fd661ec52e9b933ecdf"
+        );
+        assert_eq!(sum, 100);
     }
 
     #[test]

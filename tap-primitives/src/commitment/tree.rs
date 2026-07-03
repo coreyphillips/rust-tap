@@ -86,7 +86,7 @@ impl AssetCommitmentTree {
                 asset.script_key.serialized(),
                 asset.group_key.is_some(),
             );
-            let leaf = asset_leaf(asset);
+            let leaf = asset_leaf(asset)?;
             tree.insert(key, leaf)
                 .map_err(|e| CommitmentError::TreeError(format!("{}", e)))?;
             asset_map.insert(key, (*asset).clone());
@@ -141,7 +141,7 @@ impl AssetCommitmentTree {
             asset.script_key.serialized(),
             asset.group_key.is_some(),
         );
-        let leaf = asset_leaf(&asset);
+        let leaf = asset_leaf(&asset)?;
         self.tree
             .insert(key, leaf)
             .map_err(|e| CommitmentError::TreeError(format!("{}", e)))?;
@@ -534,7 +534,7 @@ mod tests {
         let (found, proof) = tct.proof(&tck, &ack).unwrap();
         assert!(found.is_some());
 
-        let leaf = asset_leaf(&asset);
+        let leaf = asset_leaf(&asset).unwrap();
         let derived = proof
             .derive_by_asset_inclusion(&ack, &leaf, &tck)
             .unwrap();
@@ -694,7 +694,7 @@ mod tests {
         assert!(proof.asset_proof.is_some());
 
         let derived = proof
-            .derive_by_asset_inclusion(&ack, &asset_leaf(&leaf), &tck)
+            .derive_by_asset_inclusion(&ack, &asset_leaf(&leaf).unwrap(), &tck)
             .unwrap();
         assert_eq!(derived.node_hash(), tct.commitment().root_hash());
 
