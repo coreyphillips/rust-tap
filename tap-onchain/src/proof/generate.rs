@@ -68,6 +68,7 @@ pub fn generate_genesis_proof(
         internal_key: params.internal_key,
         commitment_proof: None, // For genesis, the commitment proof can
         // be derived from the asset and commitment structure.
+        tapscript_proof: None,
         unknown_odd_types: BTreeMap::new(),
     };
 
@@ -84,8 +85,10 @@ pub fn generate_genesis_proof(
         split_root_proof: None,
         meta_reveal: params.meta_reveal,
         additional_inputs: vec![],
+        challenge_witness: None,
         genesis_reveal: Some(params.genesis_reveal),
         group_key_reveal: params.group_key_reveal,
+        alt_leaves: vec![],
         unknown_odd_types: BTreeMap::new(),
     })
 }

@@ -76,6 +76,7 @@ pub fn generate_transition_proof(
         output_index: params.base.output_index,
         internal_key: params.base.internal_key,
         commitment_proof: params.commitment_proof,
+        tapscript_proof: None,
         unknown_odd_types: BTreeMap::new(),
     };
 
@@ -92,8 +93,10 @@ pub fn generate_transition_proof(
         split_root_proof: params.split_root_proof,
         meta_reveal: None,
         additional_inputs: params.additional_inputs,
+        challenge_witness: None,
         genesis_reveal: None,
         group_key_reveal: None,
+        alt_leaves: vec![],
         unknown_odd_types: BTreeMap::new(),
     })
 }

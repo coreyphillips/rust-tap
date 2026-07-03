@@ -153,10 +153,18 @@ impl TlvRecord {
     }
 }
 
-/// Maximum allowed length for a single TLV value (4 MiB).
+/// Default maximum allowed length for a single TLV value.
 ///
-/// This prevents memory exhaustion from maliciously crafted inputs.
-pub const MAX_TLV_VALUE_LENGTH: u64 = 4 * 1024 * 1024;
+/// This prevents memory exhaustion from maliciously crafted inputs. The
+/// default matches Go's `MaxAssetEncodeSizeBytes` (the maximum block
+/// weight, 4,000,000 bytes). Contexts with larger legitimate values
+/// (e.g. proofs, which Go caps at 128 MiB) should use
+/// `TlvStream::decode_with_limit`.
+pub const MAX_TLV_VALUE_LENGTH: u64 = 4_000_000;
+
+/// Maximum size of a single proof TLV value (128 MiB), matching Go's
+/// `FileMaxProofSizeBytes`.
+pub const MAX_PROOF_TLV_VALUE_LENGTH: u64 = 128 * 1024 * 1024;
 
 /// An ordered sequence of TLV records.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -219,12 +227,21 @@ impl TlvStream {
         buf
     }
 
-    /// Decodes a TLV stream from bytes.
+    /// Decodes a TLV stream from bytes with the default value size limit.
     ///
     /// Validates that types are strictly ascending (no duplicates).
     /// Unknown even (required) types cause an error.
     /// Unknown odd (optional) types are preserved.
     pub fn decode(data: &[u8]) -> Result<Self, TlvError> {
+        Self::decode_with_limit(data, MAX_TLV_VALUE_LENGTH)
+    }
+
+    /// Decodes a TLV stream from bytes, rejecting any single value
+    /// longer than `max_value_len` bytes.
+    pub fn decode_with_limit(
+        data: &[u8],
+        max_value_len: u64,
+    ) -> Result<Self, TlvError> {
         let mut stream = TlvStream::new();
         let mut offset = 0;
         let mut last_type: Option<u64> = None;
@@ -239,7 +256,7 @@ impl TlvStream {
             offset += consumed;
 
             // Reject excessively large values to prevent memory exhaustion.
-            if length > MAX_TLV_VALUE_LENGTH {
+            if length > max_value_len {
                 return Err(TlvError::ValueTooLarge {
                     type_num,
                     len: length,

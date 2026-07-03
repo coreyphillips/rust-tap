@@ -142,9 +142,10 @@ impl TapCommitment {
     /// Checks if the given bytes look like a TAP commitment script.
     ///
     /// Checks for the presence of the marker (V0/V1) or tag (V2) at the
-    /// expected offset.
+    /// expected offset. The script must be exactly 73 bytes, matching
+    /// Go's `IsTaprootAssetCommitmentScript`.
     pub fn is_tap_commitment_script(script: &[u8]) -> bool {
-        if script.len() < 73 {
+        if script.len() != 73 {
             return false;
         }
 

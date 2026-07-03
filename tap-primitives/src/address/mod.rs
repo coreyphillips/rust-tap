@@ -37,11 +37,15 @@ use crate::asset::{AssetId, SerializedKey};
 use crate::encoding::bigsize::{decode_bigsize, encode_bigsize};
 
 /// Human-readable parts for different networks.
-pub const HRP_MAINNET: &str = "tap";
+///
+/// These must match Go's `address/params.go`: mainnet is "tapbc" and
+/// testnet3, testnet4, and signet all share "taptb".
+pub const HRP_MAINNET: &str = "tapbc";
 pub const HRP_TESTNET: &str = "taptb";
 pub const HRP_REGTEST: &str = "taprt";
 pub const HRP_SIMNET: &str = "tapsb";
-pub const HRP_TESTNET4: &str = "tapbc";
+pub const HRP_TESTNET4: &str = "taptb";
+pub const HRP_SIGNET: &str = "taptb";
 
 /// TLV type numbers for address fields.
 mod tlv_types {
@@ -91,6 +95,7 @@ pub enum TapNetwork {
     Regtest,
     Simnet,
     Testnet4,
+    Signet,
 }
 
 impl TapNetwork {
@@ -102,17 +107,21 @@ impl TapNetwork {
             TapNetwork::Regtest => HRP_REGTEST,
             TapNetwork::Simnet => HRP_SIMNET,
             TapNetwork::Testnet4 => HRP_TESTNET4,
+            TapNetwork::Signet => HRP_SIGNET,
         }
     }
 
     /// Parses a network from an HRP string.
+    ///
+    /// Testnet3, testnet4, and signet share the "taptb" HRP; this
+    /// returns `Testnet` for it, matching Go's `Net()` which resolves
+    /// the shared HRP to testnet3 first.
     pub fn from_hrp(hrp: &str) -> Result<Self, AddressError> {
         match hrp {
-            HRP_MAINNET => Ok(TapNetwork::Mainnet),
-            HRP_TESTNET => Ok(TapNetwork::Testnet),
-            HRP_REGTEST => Ok(TapNetwork::Regtest),
-            HRP_SIMNET => Ok(TapNetwork::Simnet),
-            HRP_TESTNET4 => Ok(TapNetwork::Testnet4),
+            "tapbc" => Ok(TapNetwork::Mainnet),
+            "taptb" => Ok(TapNetwork::Testnet),
+            "taprt" => Ok(TapNetwork::Regtest),
+            "tapsb" => Ok(TapNetwork::Simnet),
             _ => Err(AddressError::UnknownHrp(hrp.to_string())),
         }
     }
@@ -210,10 +219,10 @@ impl TapAddress {
             );
         }
 
-        // Unknown odd types (use BigSize for type numbers).
+        // Unknown odd types (BigSize type numbers and lengths).
         for (&type_num, value) in &self.unknown_odd_types {
             encode_bigsize(&mut payload, type_num);
-            payload.push(value.len() as u8);
+            encode_bigsize(&mut payload, value.len() as u64);
             payload.extend_from_slice(value);
         }
 
@@ -258,8 +267,13 @@ impl TapAddress {
                     "truncated TLV record".into(),
                 ));
             }
-            let len = payload[offset] as usize;
-            offset += 1;
+            // Length uses BigSize encoding, matching lnd's TLV format.
+            let (len_u64, len_bytes) =
+                decode_bigsize(&payload[offset..]).map_err(|e| {
+                    AddressError::InvalidPayload(e.to_string())
+                })?;
+            offset += len_bytes;
+            let len = len_u64 as usize;
 
             if offset + len > payload.len() {
                 return Err(AddressError::InvalidPayload(format!(
@@ -403,9 +417,12 @@ impl TapAddress {
 }
 
 /// Pushes a TLV record with a u8 type number.
+///
+/// Both the type and length use BigSize encoding, matching lnd's TLV
+/// format (a single byte for values below 253).
 fn push_tlv(buf: &mut Vec<u8>, typ: u8, value: &[u8]) {
-    buf.push(typ);
-    buf.push(value.len() as u8);
+    encode_bigsize(buf, typ as u64);
+    encode_bigsize(buf, value.len() as u64);
     buf.extend_from_slice(value);
 }
 
@@ -458,7 +475,31 @@ mod tests {
         let mut addr = test_address();
         addr.network = TapNetwork::Mainnet;
         let encoded = addr.encode().unwrap();
-        assert!(encoded.starts_with("tap1"));
+        assert!(encoded.starts_with("tapbc1"));
+    }
+
+    #[test]
+    fn test_signet_hrp_shared_with_testnet() {
+        let mut addr = test_address();
+        addr.network = TapNetwork::Signet;
+        let encoded = addr.encode().unwrap();
+        assert!(encoded.starts_with("taptb1"));
+        // The shared HRP resolves to testnet on decode, like Go.
+        let decoded = TapAddress::decode(&encoded).unwrap();
+        assert_eq!(decoded.network, TapNetwork::Testnet);
+    }
+
+    #[test]
+    fn test_long_courier_addr_roundtrip() {
+        // Values of 253 bytes or more exercise the multi-byte BigSize
+        // length encoding.
+        let mut addr = test_address();
+        let long_url =
+            format!("hashmail://{}.example.com", "a".repeat(300));
+        addr.proof_courier_addr = Some(long_url);
+        let encoded = addr.encode().unwrap();
+        let decoded = TapAddress::decode(&encoded).unwrap();
+        assert_eq!(addr, decoded);
     }
 
     #[test]

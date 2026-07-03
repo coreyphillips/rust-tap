@@ -112,7 +112,7 @@ impl Genesis {
         engine.input(&self.output_index.to_be_bytes());
 
         // AssetType (single byte).
-        engine.input(&[self.asset_type as u8]);
+        engine.input(&[self.asset_type.to_u8()]);
 
         let hash = sha256::Hash::from_engine(engine);
         AssetId(hash.to_byte_array())

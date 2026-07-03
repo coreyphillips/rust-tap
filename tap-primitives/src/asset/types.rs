@@ -10,48 +10,84 @@
 //! Core type definitions for Taproot Assets.
 
 /// Protocol version for an asset.
+///
+/// The wire format treats the version as an open u8: Go's decoder
+/// (`asset/encoding.go` `VersionDecoder`) accepts any byte and only
+/// rejects unknown versions when semantic operations require it (for
+/// example `asset.go` `Leaf()`). The `Unknown` variant preserves such
+/// values so decode/encode round-trips are byte-identical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
 pub enum AssetVersion {
     /// Initial version.
-    V0 = 0,
-    /// Version 1 — supports segwit-style encoding (witness can be omitted
-    /// for MS-SMT leaf encoding).
-    V1 = 1,
-    /// Version 2.
-    V2 = 2,
+    V0,
+    /// Version 1 - supports segwit-style encoding (the raw TxWitness
+    /// sub-records are omitted from the MS-SMT leaf encoding).
+    V1,
+    /// An unknown future version, preserved for wire-format passthrough.
+    /// Invariant: never 0 or 1 (use `from_u8` to construct).
+    Unknown(u8),
 }
 
 impl AssetVersion {
+    /// Parses a version byte. Never fails: unknown values are preserved
+    /// in the `Unknown` variant, matching Go's open decoding.
     pub fn from_u8(v: u8) -> Result<Self, AssetError> {
         match v {
             0 => Ok(AssetVersion::V0),
             1 => Ok(AssetVersion::V1),
-            2 => Ok(AssetVersion::V2),
-            _ => Err(AssetError::UnknownVersion(v)),
+            other => Ok(AssetVersion::Unknown(other)),
         }
+    }
+
+    /// Returns the wire byte for this version.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            AssetVersion::V0 => 0,
+            AssetVersion::V1 => 1,
+            AssetVersion::Unknown(v) => v,
+        }
+    }
+
+    /// Returns true if this is a version this implementation does not
+    /// have semantics for. Matches Go's `Asset.IsUnknownVersion`.
+    pub fn is_unknown(self) -> bool {
+        matches!(self, AssetVersion::Unknown(_))
     }
 }
 
 /// Type of asset.
+///
+/// Like [`AssetVersion`], the wire format treats this as an open u8
+/// (Go's `TypeDecoder` performs no validation), so unknown values are
+/// preserved for byte-identical round-trips.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
 pub enum AssetType {
     /// A normal (fungible) asset that can be divided.
-    Normal = 0,
-    /// A collectible (NFT) — amount is always 1.
-    Collectible = 1,
-    /// A grouped collectible.
-    GroupedCollectible = 2,
+    Normal,
+    /// A collectible (NFT) - amount is always 1.
+    Collectible,
+    /// An unknown future asset type, preserved for wire passthrough.
+    /// Invariant: never 0 or 1 (use `from_u8` to construct).
+    Unknown(u8),
 }
 
 impl AssetType {
+    /// Parses a type byte. Never fails: unknown values are preserved in
+    /// the `Unknown` variant, matching Go's open decoding.
     pub fn from_u8(v: u8) -> Result<Self, AssetError> {
         match v {
             0 => Ok(AssetType::Normal),
             1 => Ok(AssetType::Collectible),
-            2 => Ok(AssetType::GroupedCollectible),
-            _ => Err(AssetError::UnknownType(v)),
+            other => Ok(AssetType::Unknown(other)),
+        }
+    }
+
+    /// Returns the wire byte for this asset type.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            AssetType::Normal => 0,
+            AssetType::Collectible => 1,
+            AssetType::Unknown(v) => v,
         }
     }
 }
@@ -116,7 +152,7 @@ pub enum EncodeType {
 }
 
 /// A 33-byte compressed secp256k1 public key.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SerializedKey(pub [u8; 33]);
 
 impl SerializedKey {

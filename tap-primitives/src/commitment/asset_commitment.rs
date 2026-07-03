@@ -99,7 +99,7 @@ impl AssetCommitment {
             tree.insert(key, leaf)
                 .map_err(|e| CommitmentError::TreeError(format!("{}", e)))?;
 
-            if (asset.version as u8) > (version as u8) {
+            if asset.version.to_u8() > version.to_u8() {
                 version = asset.version;
             }
         }
@@ -157,7 +157,7 @@ impl AssetCommitment {
         let sum = self.tree_root.node_sum();
 
         let mut value = Vec::with_capacity(41);
-        value.push(self.version as u8);
+        value.push(self.version.to_u8());
         value.extend_from_slice(&root);
         value.extend_from_slice(&sum.to_be_bytes());
 
