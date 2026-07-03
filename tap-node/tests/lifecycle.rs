@@ -74,6 +74,93 @@ fn test_tick_none_then_some_confirmation() {
     assert_eq!(summary.pending_anchors, 0);
 }
 
+/// Tick outcomes must not be swallowed: errors (a failing confirmation
+/// lookup) surface through the returned summary, the
+/// `last_tick_summary` accessor, and a `TickCompleted` event, while
+/// quiet ticks record a summary but emit no event.
+#[test]
+fn test_tick_outcome_event_and_accessor() {
+    let harness = default_harness();
+    let node = &harness.node;
+
+    // No tick has run yet: the accessor has nothing.
+    assert!(node.last_tick_summary().is_none());
+
+    // A quiet tick records a summary but emits no TickCompleted.
+    let summary = node.tick().expect("tick");
+    assert!(summary.errors.is_empty());
+    let last = node.last_tick_summary().expect("summary recorded");
+    assert_eq!(last.pending_anchors, 0);
+    assert!(harness
+        .drain_events()
+        .iter()
+        .all(|e| !matches!(e, TapEvent::TickCompleted { .. })));
+
+    // Broadcast a mint, then make confirmation polling fail: the tick
+    // surfaces the chain error via the summary, the accessor, and a
+    // TickCompleted event, and keeps the anchor pending for a retry.
+    node.queue_mint(Seedling::new_normal("err-token".into(), 42))
+        .expect("queue");
+    let result = node.finalize_mint().expect("finalize");
+    harness.drain_events();
+
+    harness.chain.set_fail_confirmations(true);
+    let summary = node.tick().expect("tick");
+    assert_eq!(summary.confirmed_anchors, 0);
+    assert_eq!(summary.pending_anchors, 1);
+    assert_eq!(summary.errors.len(), 1);
+    assert!(
+        summary.errors[0].contains("confirmation lookup failed"),
+        "{:?}",
+        summary.errors
+    );
+
+    let last = node.last_tick_summary().expect("summary recorded");
+    assert_eq!(last.errors, summary.errors);
+
+    let tick_events: Vec<TickSummary> = harness
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            TapEvent::TickCompleted { summary } => Some(summary),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tick_events.len(), 1);
+    assert_eq!(tick_events[0].errors, summary.errors);
+
+    // Recovered but still unconfirmed: a pending-but-quiet tick emits
+    // nothing, while the accessor reflects the latest state.
+    harness.chain.set_fail_confirmations(false);
+    let summary = node.tick().expect("tick");
+    assert!(summary.errors.is_empty());
+    assert_eq!(summary.confirmed_anchors, 0);
+    assert!(harness
+        .drain_events()
+        .iter()
+        .all(|e| !matches!(e, TapEvent::TickCompleted { .. })));
+    assert_eq!(
+        node.last_tick_summary().expect("recorded").pending_anchors,
+        1
+    );
+
+    // A confirming tick emits TickCompleted with the work done.
+    harness.chain.confirm_tx(&result.signed_tx, 812_800);
+    let summary = node.tick().expect("tick");
+    assert_eq!(summary.confirmed_anchors, 1);
+    let tick_events: Vec<TickSummary> = harness
+        .drain_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            TapEvent::TickCompleted { summary } => Some(summary),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tick_events.len(), 1);
+    assert_eq!(tick_events[0].confirmed_anchors, 1);
+    assert!(tick_events[0].errors.is_empty());
+}
+
 #[test]
 fn test_start_stop_idempotency_and_join() {
     let mut config = TapNodeConfig::default();

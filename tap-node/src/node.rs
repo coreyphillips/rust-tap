@@ -116,6 +116,23 @@ where
         Mutex<Box<dyn PendingAnchorStore + Send>>,
     // When the last periodic universe sync ran.
     pub(crate) last_universe_sync: Mutex<Option<Instant>>,
+    // The outcome of the most recent tick (worker-driven or direct),
+    // for embedders that do not consume the event stream. See
+    // `last_tick_summary`.
+    pub(crate) last_tick: Mutex<Option<crate::tasks::TickSummary>>,
+
+    // Coarse per-node lock serializing the wallet-mutating flows that
+    // read the asset store and write back non-atomically:
+    // `send_asset` reads unspent assets during coin selection (and
+    // passive-asset collection) but only marks the inputs spent after
+    // broadcast, so two concurrent sends could select and double-spend
+    // the same inputs at the asset level. The receive import paths
+    // (`poll_mailbox`, `import_proof`) take the same lock so their
+    // cursor/store read-then-write sequences cannot interleave with a
+    // send or with each other. A single wallet has no send parallelism
+    // to gain, so one lock held from coin selection through
+    // spent-marking and change persistence is the pragmatic fix.
+    pub(crate) send_lock: Mutex<()>,
 
     // Lifecycle.
     pub(crate) running: AtomicBool,
@@ -170,6 +187,11 @@ where
                         if !node.running.load(Ordering::SeqCst) {
                             return;
                         }
+                        // Tick outcomes (including non-fatal errors)
+                        // are recorded in `last_tick` and surfaced via
+                        // `TapEvent::TickCompleted` by `tick()` itself,
+                        // so the Result is deliberately not propagated
+                        // out of the worker thread.
                         let _ = node.tick();
                     }
                     None => return,
@@ -233,8 +255,43 @@ where
     /// Called automatically by the worker thread spawned by
     /// [`start`](Self::start); public so embedders driving their own
     /// scheduler can call it directly without starting the thread.
+    ///
+    /// The resulting [`TickSummary`](crate::TickSummary) is recorded
+    /// (see [`last_tick_summary`](Self::last_tick_summary)) and, when
+    /// the tick did any work or hit errors, also emitted as
+    /// [`TapEvent::TickCompleted`]. Quiet ticks emit no event.
     pub fn tick(&self) -> Result<crate::TickSummary, TapNodeError> {
-        crate::tasks::tick(self)
+        let result = crate::tasks::tick(self);
+        let summary = match &result {
+            Ok(summary) => summary.clone(),
+            // `tasks::tick` reports per-anchor problems as non-fatal
+            // summary errors; a hard error still surfaces the same way
+            // so worker-driven ticks are never silently dropped.
+            Err(e) => {
+                let mut summary = crate::TickSummary::default();
+                summary.errors.push(e.to_string());
+                summary
+            }
+        };
+        *self.last_tick.lock().expect("last tick lock") =
+            Some(summary.clone());
+        let noteworthy = summary.confirmed_anchors > 0
+            || summary.universe_synced
+            || !summary.errors.is_empty();
+        if noteworthy {
+            self.event_bus.emit(TapEvent::TickCompleted { summary });
+        }
+        result
+    }
+
+    /// Returns the outcome of the most recent [`tick`](Self::tick)
+    /// (whether driven by the background worker or called directly),
+    /// or `None` if no tick has run yet. Lets embedders that do not
+    /// consume the event stream inspect confirmation progress and
+    /// non-fatal tick errors
+    /// ([`TickSummary::errors`](crate::TickSummary)).
+    pub fn last_tick_summary(&self) -> Option<crate::TickSummary> {
+        self.last_tick.lock().expect("last tick lock").clone()
     }
 
     /// Returns an event receiver for monitoring node activity.

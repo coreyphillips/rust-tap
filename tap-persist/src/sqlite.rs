@@ -183,6 +183,21 @@ impl AssetStore for SqliteAssetStore {
         .unwrap_or_default()
     }
 
+    fn set_anchor_block_height(
+        &mut self,
+        outpoint: &OutPoint,
+        block_height: u32,
+    ) -> Result<(), String> {
+        let conn = self.db.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE owned_assets SET block_height = ?1 \
+             WHERE anchor_txid = ?2 AND anchor_vout = ?3",
+            params![block_height, &outpoint.txid[..], outpoint.vout],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     fn get_unspent(&self, asset_id: &AssetId) -> Vec<OwnedAsset> {
         let conn = self.db.conn.lock().unwrap();
         let mut stmt = match conn.prepare(&format!(
@@ -1076,6 +1091,49 @@ mod tests {
                 &SerializedKey([0x02; 33]),
             )
             .is_err());
+    }
+
+    /// set_anchor_block_height updates every asset at the outpoint,
+    /// leaves other outpoints alone, and is a no-op for unknown
+    /// outpoints.
+    #[test]
+    fn test_sqlite_set_anchor_block_height() {
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteAssetStore::new(Arc::clone(&db));
+
+        let mut a = test_asset(0xAA, 100, 0);
+        a.block_height = 0;
+        let mut b = test_asset(0xBB, 200, 0);
+        b.script_key = SerializedKey([0x03; 33]);
+        b.block_height = 0;
+        let c = test_asset(0xCC, 300, 1);
+        store.insert_asset(a).unwrap();
+        store.insert_asset(b).unwrap();
+        store.insert_asset(c).unwrap();
+
+        let outpoint = OutPoint {
+            txid: [0xAA; 32],
+            vout: 0,
+        };
+        store.set_anchor_block_height(&outpoint, 812_000).unwrap();
+
+        let mut assets = store.list_unspent();
+        assets.sort_by_key(|x| x.anchor_outpoint.vout);
+        assert_eq!(assets.len(), 3);
+        assert_eq!(assets[0].block_height, 812_000);
+        assert_eq!(assets[1].block_height, 812_000);
+        assert_eq!(assets[2].block_height, 800_000);
+
+        // Unknown outpoint: idempotent no-op.
+        store
+            .set_anchor_block_height(
+                &OutPoint {
+                    txid: [0xFF; 32],
+                    vout: 9,
+                },
+                1,
+            )
+            .unwrap();
     }
 
     fn test_burn(id_byte: u8, amount: u64, vout: u32) -> BurnRecord {

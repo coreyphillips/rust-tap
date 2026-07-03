@@ -108,6 +108,11 @@ where
     L: LdkChannelOps + Send + Sync + 'static,
     P: PriceOracle + Send + Sync + 'static,
 {
+    // Concurrency note: the planter lock held for the whole flow (up
+    // to the post-broadcast take_batch) serializes concurrent
+    // finalize_mint calls, and the mint only INSERTS new asset rows
+    // (it never selects-then-spends existing ones), so it does not
+    // race with `send_asset` and needs no `send_lock`.
     let mut planter = node.planter.lock().expect("planter lock");
 
     // Step 1: Freeze the batch.
@@ -422,6 +427,16 @@ where
         txid: txid_internal,
         vout: tap_output_index,
     };
+
+    // The minted assets were persisted with block height 0 at
+    // broadcast time; record the real confirmation height on every
+    // asset at the mint anchor outpoint. Idempotent, like the other
+    // finish steps, so a retry after a partial failure is harmless.
+    node.asset_store
+        .lock()
+        .expect("asset store lock")
+        .set_anchor_block_height(&anchor_outpoint, conf.block_height)
+        .map_err(TapNodeError::Storage)?;
 
     for asset in &batch.sprouted_assets {
         let asset_id = asset.genesis.id();

@@ -16,6 +16,7 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use common::*;
 
@@ -216,6 +217,14 @@ fn test_send_end_to_end() {
     assert_eq!(change_file.num_proofs(), 2);
     assert_eq!(change.anchor_outpoint.vout, 0);
 
+    // The stored change asset's block height was updated on
+    // confirmation (it was persisted with 0 at broadcast; `change` is
+    // the pre-confirmation snapshot).
+    assert_eq!(change.block_height, 0);
+    let assets_after = node.list_assets().expect("list");
+    assert_eq!(assets_after.len(), 1);
+    assert_eq!(assets_after[0].block_height, 812_500);
+
     // The courier delivered the recipient proof file.
     let delivered = harness
         .courier
@@ -394,6 +403,13 @@ fn test_send_reanchors_passive_sibling_asset() {
         .verify(&verifier_ctx(), &verify_opts())
         .expect("asset A recipient proof must verify");
 
+    // The re-anchored passive asset's stored block height was updated
+    // on confirmation (a full-value send has no change_outpoint in the
+    // anchor, but the passive rows carry the change outpoint).
+    let assets_after = node.list_assets().expect("list");
+    assert_eq!(assets_after.len(), 1);
+    assert_eq!(assets_after[0].block_height, 812_500);
+
     // The re-anchored passive asset B has a stored proof (genesis ->
     // re-anchor transition) that passes the full verifier.
     let b_file = node
@@ -431,6 +447,84 @@ fn test_send_reanchors_passive_sibling_asset() {
     b2_file
         .verify(&verifier_ctx(), &verify_opts())
         .expect("asset B hop-2 proof must verify");
+}
+
+/// Two concurrent sends from a balance that only supports one must not
+/// double-spend: the per-node send lock serializes coin selection
+/// through spent-marking, so exactly one send succeeds and the other
+/// fails with InsufficientBalance against the post-send balance.
+#[test]
+fn test_concurrent_sends_cannot_double_spend() {
+    let harness = default_harness();
+    let node = Arc::clone(&harness.node);
+
+    let mint = mint_confirmed(&harness, "race-token", 1_000);
+    let asset_id = mint.assets[0].asset_id;
+
+    // Two concurrent sends of 600 from a 1000 balance.
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let node = Arc::clone(&node);
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            let addr = recipient_address(asset_id, 600);
+            barrier.wait();
+            node.send_asset(asset_id, 600, &addr)
+        }));
+    }
+    let results: Vec<Result<TransferHandle, TapNodeError>> = handles
+        .into_iter()
+        .map(|h| h.join().expect("thread join"))
+        .collect();
+
+    let ok = results.iter().filter(|r| r.is_ok()).count();
+    let insufficient = results
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                Err(TapNodeError::InsufficientBalance {
+                    available: 400,
+                    needed: 600,
+                    ..
+                })
+            )
+        })
+        .count();
+    let errors: Vec<String> = results
+        .iter()
+        .filter_map(|r| r.as_ref().err().map(|e| e.to_string()))
+        .collect();
+    assert_eq!(ok, 1, "exactly one send may succeed; errors: {:?}", errors);
+    assert_eq!(
+        insufficient, 1,
+        "the loser must see the post-send balance; errors: {:?}",
+        errors
+    );
+
+    // Store consistency: no double spend. The only unspent asset is
+    // the 400-unit change of the single successful send, anchored at
+    // the one broadcast transfer.
+    assert_eq!(node.get_balance(&asset_id).expect("bal"), 400);
+    let assets = node.list_assets().expect("list");
+    assert_eq!(assets.len(), 1);
+    assert_eq!(assets[0].amount, 400);
+    let winner_txid = to_internal(
+        results
+            .iter()
+            .find_map(|r| r.as_ref().ok())
+            .expect("winner")
+            .txid,
+    );
+    assert_eq!(assets[0].anchor_outpoint.txid, winner_txid);
+
+    // Exactly two transactions ever hit the chain: the mint and the
+    // single successful transfer.
+    assert_eq!(
+        harness.chain.broadcasts.lock().expect("broadcasts").len(),
+        2
+    );
 }
 
 #[test]

@@ -36,11 +36,12 @@ use tap_ldk::rfq::math::FixedPoint;
 // FakeChain
 // ---------------------------------------------------------------------------
 
-/// A chain backend with scriptable confirmations, a fixed fee, and
-/// broadcast recording.
+/// A chain backend with scriptable confirmations, a fixed fee,
+/// broadcast recording, and scriptable confirmation-lookup failures.
 pub struct FakeChain {
     pub confirmations: Mutex<HashMap<[u8; 32], TxConfirmation>>,
     pub broadcasts: Mutex<Vec<Vec<u8>>>,
+    pub fail_confirmations: std::sync::atomic::AtomicBool,
 }
 
 impl FakeChain {
@@ -48,7 +49,15 @@ impl FakeChain {
         FakeChain {
             confirmations: Mutex::new(HashMap::new()),
             broadcasts: Mutex::new(Vec::new()),
+            fail_confirmations: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Makes `get_tx_confirmation` fail with a chain error until
+    /// cleared, to exercise tick error reporting.
+    pub fn set_fail_confirmations(&self, fail: bool) {
+        self.fail_confirmations
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Scripts a confirmation for the given raw transaction: a
@@ -111,6 +120,14 @@ impl ChainBridge for FakeChain {
         &self,
         txid: &[u8; 32],
     ) -> Result<Option<TxConfirmation>, ChainError> {
+        if self
+            .fail_confirmations
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ChainError::ConfirmationFailed(
+                "scripted confirmation lookup failure".into(),
+            ));
+        }
         Ok(self
             .confirmations
             .lock()

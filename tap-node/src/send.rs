@@ -41,8 +41,9 @@ use tap_persist::asset_store::OwnedAsset;
 use tap_persist::proof_store::ProofLocator;
 use tap_primitives::address::TapAddress;
 use tap_primitives::asset::{
-    Asset, AssetId, AssetVersion, Genesis, OutPoint, PrevId, ScriptKey,
-    ScriptVersion, SerializedKey, Witness, TAPROOT_ASSETS_KEY_FAMILY,
+    derive_unique_script_key, Asset, AssetId, AssetVersion, Genesis,
+    OutPoint, PrevId, ScriptKey, ScriptKeyDerivationMethod, ScriptVersion,
+    SerializedKey, Witness, TAPROOT_ASSETS_KEY_FAMILY,
 };
 use tap_primitives::proof;
 use tap_primitives::vm::InputSet;
@@ -88,6 +89,14 @@ where
     L: LdkChannelOps + Send + Sync + 'static,
     P: PriceOracle + Send + Sync + 'static,
 {
+    // Serialize the whole send pipeline (see `TapNode::send_lock`):
+    // coin selection reads unspent assets here, but the inputs are only
+    // marked spent after broadcast (step 6), so without this lock two
+    // concurrent sends could select and double-spend the same inputs at
+    // the asset level. The passive-asset collection (step 1b) must see
+    // the same consistent snapshot, so it happens under the same lock.
+    let _send_guard = node.send_lock.lock().expect("send lock");
+
     // Step 1: Coin selection.
     let selected = coin_select(node, &asset_id, amount)?;
     let total: u64 = selected.iter().map(|a| a.amount).sum();
@@ -195,6 +204,7 @@ where
     let mut keys_by_script_key: HashMap<SerializedKey, KeyDescriptor> =
         HashMap::new();
     for owned in &selected {
+        ensure_seam_signable(owned)?;
         if let Some(desc) = &owned.script_key_desc {
             keys_by_script_key.insert(owned.script_key, desc.clone());
         }
@@ -202,6 +212,7 @@ where
     // The passive assets are signed with their own stored script key
     // descriptors, so their keys must be resolvable by the same signer.
     for owned in &passive_owned {
+        ensure_seam_signable(owned)?;
         if let Some(desc) = &owned.script_key_desc {
             keys_by_script_key.insert(owned.script_key, desc.clone());
         }
@@ -766,6 +777,32 @@ where
             .map_err(TapNodeError::Storage)?;
     }
 
+    // The change output (and any passive assets re-anchored into it)
+    // was persisted with block height 0 at broadcast time; record the
+    // real confirmation height. A full-value send with passive assets
+    // has no change_outpoint but the passives still carry the change
+    // outpoint they were re-anchored into. Idempotent, like the other
+    // finish steps.
+    {
+        let mut store = node.asset_store.lock().expect("asset store lock");
+        if let Some(change_outpoint) = anchor.change_outpoint {
+            store
+                .set_anchor_block_height(
+                    &change_outpoint,
+                    conf.block_height,
+                )
+                .map_err(TapNodeError::Storage)?;
+        }
+        for passive in &anchor.passive {
+            store
+                .set_anchor_block_height(
+                    &passive.outpoint,
+                    conf.block_height,
+                )
+                .map_err(TapNodeError::Storage)?;
+        }
+    }
+
     let mut txid_display = txid_internal;
     txid_display.reverse();
     node.event_bus.emit(TapEvent::TransferConfirmed {
@@ -800,6 +837,69 @@ where
         });
     }
 
+    Ok(())
+}
+
+/// Ensures the stored descriptor can actually sign for the asset's
+/// script key through the [`AssetSigner`] seam, whose contract is
+/// BIP-86 key-spend signing only.
+///
+/// Accepted script keys:
+/// - the raw descriptor key itself (legacy untweaked script keys), and
+/// - the BIP-86 tweak of the descriptor key (mint and change outputs,
+///   and V0/V1 address receives).
+///
+/// A V2-address receive instead holds the asset under a unique
+/// per-asset-ID script key: the address key tweaked with a
+/// Pedersen-commitment tapscript leaf
+/// ([`derive_unique_script_key`]). Signing it requires applying that
+/// leaf's tap hash as the taproot tweak, which the current
+/// [`AssetSigner`] seam cannot express (it always applies the
+/// empty-tree BIP-86 tweak), so such assets are rejected here with a
+/// precise error instead of either producing an invalid BIP-86
+/// signature or failing later with a misleading
+/// [`SendError::UnknownScriptKey`].
+///
+/// An asset with no stored descriptor passes through: it is reported
+/// as `UnknownScriptKey` by the signer, as before. A descriptor whose
+/// relationship to the script key is not recognized also passes
+/// through, preserving the existing BIP-86 signing behavior for
+/// externally managed keys.
+fn ensure_seam_signable(owned: &OwnedAsset) -> Result<(), TapNodeError> {
+    let desc = match &owned.script_key_desc {
+        Some(desc) => desc,
+        None => return Ok(()),
+    };
+    if owned.script_key == desc.pub_key {
+        return Ok(());
+    }
+    // Only compare against the BIP-86 tweak when the stored raw key is
+    // a valid point (ScriptKey::bip86 asserts validity).
+    if XOnlyPublicKey::from_slice(&desc.pub_key.0[1..]).is_ok()
+        && owned.script_key == ScriptKey::bip86(desc.pub_key).pub_key
+    {
+        return Ok(());
+    }
+    if let Ok(unique) = derive_unique_script_key(
+        desc.pub_key,
+        &owned.asset_id,
+        ScriptKeyDerivationMethod::UniquePedersen,
+    ) {
+        if unique.pub_key == owned.script_key {
+            return Err(TapNodeError::Send(SendError::InvalidState(
+                format!(
+                    "asset {} is held under a V2 unique script key (the \
+                     address key tweaked with the asset-id Pedersen \
+                     commitment leaf); the AssetSigner seam only \
+                     supports BIP-86 key-spend signing and cannot apply \
+                     the tapscript tweak, so this asset cannot be sent \
+                     yet -- extend the signer seam with tapscript tweak \
+                     support to spend V2-address receives",
+                    hex_id(&owned.asset_id)
+                ),
+            )));
+        }
+    }
     Ok(())
 }
 

@@ -75,6 +75,8 @@ fn test_mint_end_to_end() {
     );
     let script_desc = owned.script_key_desc.as_ref().expect("desc");
     assert_eq!(script_desc.pub_key, script_raw_key);
+    // Unconfirmed: persisted with block height 0 at broadcast.
+    assert_eq!(owned.block_height, 0);
     assert_eq!(node.get_balance(&minted.asset_id).expect("bal"), 1_000);
 
     // The batch was persisted as Broadcast.
@@ -153,6 +155,12 @@ fn test_mint_end_to_end() {
         Some(812_345)
     );
 
+    // The stored asset's block height was updated to the confirmation
+    // height (persisted as 0 at broadcast, see above).
+    let assets_after = node.list_assets().expect("list");
+    assert_eq!(assets_after.len(), 1);
+    assert_eq!(assets_after[0].block_height, 812_345);
+
     // The genesis proof was generated and stored under the anchor
     // outpoint + script key.
     let txid_internal = to_internal(result.txid.expect("txid"));
@@ -215,6 +223,12 @@ fn test_mint_multiple_seedlings_share_genesis_point() {
         let root =
             node.universe_root(&universe_id).expect("universe root");
         assert_eq!(root.root_sum, asset.amount);
+    }
+
+    // Every asset at the (shared) mint anchor outpoint got the
+    // confirmation height.
+    for owned in node.list_assets().expect("list") {
+        assert_eq!(owned.block_height, 812_400);
     }
 }
 

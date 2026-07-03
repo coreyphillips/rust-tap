@@ -129,6 +129,19 @@ pub trait AssetStore {
     /// be re-anchored (Go's passive-asset set).
     fn unspent_at_outpoint(&self, outpoint: &OutPoint) -> Vec<OwnedAsset>;
 
+    /// Sets the confirmed block height on every asset anchored at the
+    /// given outpoint (a mint or transfer anchor output can carry
+    /// several assets). Assets broadcast by this node are first
+    /// persisted with block height 0; the confirmation watcher records
+    /// the real height once the anchor transaction confirms. An
+    /// outpoint with no stored assets is a no-op, not an error, so the
+    /// update is idempotent and safe to retry.
+    fn set_anchor_block_height(
+        &mut self,
+        outpoint: &OutPoint,
+        block_height: u32,
+    ) -> Result<(), String>;
+
     /// Returns all unspent assets for a given asset ID.
     fn get_unspent(&self, asset_id: &AssetId) -> Vec<OwnedAsset>;
 
@@ -191,6 +204,19 @@ impl AssetStore for MemoryAssetStore {
             .filter(|a| a.anchor_outpoint == *outpoint && !a.spent)
             .cloned()
             .collect()
+    }
+
+    fn set_anchor_block_height(
+        &mut self,
+        outpoint: &OutPoint,
+        block_height: u32,
+    ) -> Result<(), String> {
+        for asset in self.assets.values_mut() {
+            if asset.anchor_outpoint == *outpoint {
+                asset.block_height = block_height;
+            }
+        }
+        Ok(())
     }
 
     fn get_unspent(&self, asset_id: &AssetId) -> Vec<OwnedAsset> {
@@ -373,6 +399,48 @@ mod tests {
             .is_err());
         // The real asset stays unspent.
         assert_eq!(store.balance(&AssetId([0xAA; 32])), 100);
+    }
+
+    /// set_anchor_block_height updates every asset at the outpoint
+    /// (multi-asset anchors), leaves other outpoints alone, and is a
+    /// no-op for unknown outpoints.
+    #[test]
+    fn test_set_anchor_block_height() {
+        let mut store = MemoryAssetStore::new();
+        let mut a = test_asset(0xAA, 100, 0);
+        a.block_height = 0;
+        let mut b = test_asset(0xBB, 200, 0);
+        b.script_key = SerializedKey([0x03; 33]);
+        b.block_height = 0;
+        let c = test_asset(0xCC, 300, 1);
+        store.insert_asset(a).unwrap();
+        store.insert_asset(b).unwrap();
+        store.insert_asset(c).unwrap();
+
+        let outpoint = OutPoint {
+            txid: [0xAA; 32],
+            vout: 0,
+        };
+        store.set_anchor_block_height(&outpoint, 812_000).unwrap();
+
+        let mut assets = store.list_unspent();
+        assets.sort_by_key(|x| x.anchor_outpoint.vout);
+        assert_eq!(assets.len(), 3);
+        assert_eq!(assets[0].block_height, 812_000);
+        assert_eq!(assets[1].block_height, 812_000);
+        // The asset at the other outpoint keeps its original height.
+        assert_eq!(assets[2].block_height, 800_000);
+
+        // Unknown outpoint: idempotent no-op.
+        store
+            .set_anchor_block_height(
+                &OutPoint {
+                    txid: [0xFF; 32],
+                    vout: 9,
+                },
+                1,
+            )
+            .unwrap();
     }
 
     fn test_burn(id_byte: u8, amount: u64, vout: u32) -> BurnRecord {

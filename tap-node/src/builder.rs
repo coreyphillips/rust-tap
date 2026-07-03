@@ -376,6 +376,8 @@ where
             event_receiver: Mutex::new(Some(event_receiver)),
             pending_anchors: Mutex::new(pending_anchors),
             last_universe_sync: Mutex::new(None),
+            last_tick: Mutex::new(None),
+            send_lock: Mutex::new(()),
             running: AtomicBool::new(false),
             worker: Mutex::new(None),
         })

@@ -22,6 +22,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (7, include_str!("../migrations/007_genesis_point.up.sql")),
     (8, include_str!("../migrations/008_multi_asset_anchor.up.sql")),
     (9, include_str!("../migrations/009_pending_anchors.up.sql")),
+    (10, include_str!("../migrations/010_address_key_descs.up.sql")),
 ];
 
 /// Runs all pending migrations against the given connection.
