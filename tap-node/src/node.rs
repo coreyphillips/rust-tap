@@ -11,6 +11,8 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use tap_ldk::ldk::{LdkChannelOps, TapChannelManager};
 use tap_ldk::rfq::PriceOracle;
@@ -101,8 +103,15 @@ where
     pub(crate) event_bus: EventBus,
     pub(crate) event_receiver: Mutex<Option<mpsc::Receiver<TapEvent>>>,
 
+    // Anchor transactions awaiting confirmation (mints and transfers
+    // broadcast by this node). Resolved by `tick()`.
+    pub(crate) pending_anchors: Mutex<Vec<crate::tasks::PendingAnchor>>,
+    // When the last periodic universe sync ran.
+    pub(crate) last_universe_sync: Mutex<Option<Instant>>,
+
     // Lifecycle.
     pub(crate) running: AtomicBool,
+    pub(crate) worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl<C, W, K, L, P> TapNode<C, W, K, L, P>
@@ -113,20 +122,111 @@ where
     L: LdkChannelOps + Send + Sync + 'static,
     P: PriceOracle + Send + Sync + 'static,
 {
-    /// Starts the node. Enables background tasks (universe sync, etc.).
-    pub fn start(&self) -> Result<(), TapNodeError> {
+    /// Starts the node's background worker thread.
+    ///
+    /// The worker calls [`tick`](Self::tick) once immediately and then
+    /// every `config.tick_interval_secs` (default 30) until
+    /// [`stop`](Self::stop) is called, driving confirmation watching
+    /// for broadcast mints/transfers, periodic universe sync, and RFQ
+    /// quote pruning.
+    ///
+    /// # Breaking change: `Arc` receiver
+    ///
+    /// `start` now takes `self: Arc<Self>` so the worker thread can
+    /// hold a (weak) handle to the node. Wrap the built node in an
+    /// [`Arc`] and start it via a clone:
+    ///
+    /// ```ignore
+    /// let node = Arc::new(builder.build()?);
+    /// node.clone().start()?;
+    /// // ... use `node` as before ...
+    /// node.stop()?;
+    /// ```
+    ///
+    /// The thread only holds a [`std::sync::Weak`] reference, so
+    /// dropping every user-held `Arc` also ends the worker.
+    pub fn start(self: Arc<Self>) -> Result<(), TapNodeError> {
         if self.running.swap(true, Ordering::SeqCst) {
             return Err(TapNodeError::AlreadyRunning);
         }
-        Ok(())
+
+        let weak = Arc::downgrade(&self);
+        let interval_secs = self.config.tick_interval_secs.max(1);
+
+        let spawned = std::thread::Builder::new()
+            .name("tap-node-worker".into())
+            .spawn(move || loop {
+                // Tick while the node is alive and running.
+                match weak.upgrade() {
+                    Some(node) => {
+                        if !node.running.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let _ = node.tick();
+                    }
+                    None => return,
+                }
+
+                // Sleep in short slices so `stop()` joins promptly.
+                let mut slept_ms = 0u64;
+                while slept_ms < interval_secs * 1000 {
+                    std::thread::sleep(Duration::from_millis(50));
+                    slept_ms += 50;
+                    match weak.upgrade() {
+                        Some(node) => {
+                            if !node.running.load(Ordering::SeqCst) {
+                                return;
+                            }
+                        }
+                        None => return,
+                    }
+                }
+            });
+
+        match spawned {
+            Ok(handle) => {
+                *self.worker.lock().expect("worker lock") = Some(handle);
+                Ok(())
+            }
+            Err(e) => {
+                self.running.store(false, Ordering::SeqCst);
+                Err(TapNodeError::Config(format!(
+                    "failed to spawn worker thread: {}",
+                    e
+                )))
+            }
+        }
     }
 
-    /// Stops the node and background tasks.
+    /// Stops the node's background worker and joins its thread.
     pub fn stop(&self) -> Result<(), TapNodeError> {
         if !self.running.swap(false, Ordering::SeqCst) {
             return Err(TapNodeError::NotRunning);
         }
+        let handle = self.worker.lock().expect("worker lock").take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
         Ok(())
+    }
+
+    /// Runs one iteration of the node's background work:
+    ///
+    /// 1. Polls the chain backend for confirmations of pending anchor
+    ///    transactions (broadcast mints and transfers). Once an anchor
+    ///    has at least one confirmation, the corresponding proofs are
+    ///    finished with real chain data, stored, registered/delivered,
+    ///    and the matching events are emitted.
+    /// 2. Runs a universe sync against the configured servers when
+    ///    `config.universe_sync_interval_secs` has elapsed since the
+    ///    last sync.
+    /// 3. Prunes expired RFQ quotes.
+    ///
+    /// Called automatically by the worker thread spawned by
+    /// [`start`](Self::start); public so embedders driving their own
+    /// scheduler can call it directly without starting the thread.
+    pub fn tick(&self) -> Result<crate::TickSummary, TapNodeError> {
+        crate::tasks::tick(self)
     }
 
     /// Returns an event receiver for monitoring node activity.
@@ -137,7 +237,7 @@ where
     ) -> Result<mpsc::Receiver<TapEvent>, TapNodeError> {
         self.event_receiver
             .lock()
-            .unwrap()
+            .expect("event receiver lock")
             .take()
             .ok_or(TapNodeError::Config(
                 "event receiver already taken".into(),
@@ -176,12 +276,20 @@ where
     pub fn list_assets(
         &self,
     ) -> Result<Vec<tap_persist::asset_store::OwnedAsset>, TapNodeError> {
-        Ok(self.asset_store.lock().unwrap().list_unspent())
+        Ok(self
+            .asset_store
+            .lock()
+            .expect("asset store lock")
+            .list_unspent())
     }
 
     /// Returns the spendable balance for an asset.
     pub fn get_balance(&self, asset_id: &AssetId) -> Result<u64, TapNodeError> {
-        Ok(self.asset_store.lock().unwrap().balance(asset_id))
+        Ok(self
+            .asset_store
+            .lock()
+            .expect("asset store lock")
+            .balance(asset_id))
     }
 
     /// Generates a new address for receiving an asset.
@@ -328,11 +436,37 @@ where
             .map_err(|e| TapNodeError::Universe(e.to_string()))
     }
 
-    /// Performs a one-shot universe sync.
+    /// Performs a one-shot universe sync against all configured
+    /// universe servers (config plus federation database).
     pub fn sync_universe(
         &self,
     ) -> Result<Vec<tap_universe::types::AssetSyncDiff>, TapNodeError> {
         crate::sync::sync_universe(self)
+    }
+
+    /// Performs a one-shot universe sync against a caller-provided
+    /// remote (any [`tap_universe::traits::DiffEngine`]), pulling
+    /// verified missing leaves into the node's local universe store.
+    /// Useful for embedders with custom transports.
+    pub fn sync_with_engine(
+        &self,
+        remote: &dyn tap_universe::traits::DiffEngine,
+    ) -> Result<Vec<tap_universe::types::AssetSyncDiff>, TapNodeError> {
+        crate::sync::sync_with_engine(self, remote)
+    }
+
+    /// Returns the root of one of the node's local universe trees, if
+    /// it exists (e.g. after a mint's issuance proof was registered on
+    /// confirmation, or after a universe sync).
+    pub fn universe_root(
+        &self,
+        id: &tap_universe::types::UniverseId,
+    ) -> Result<tap_universe::types::UniverseRoot, TapNodeError> {
+        self.universe_backend
+            .lock()
+            .expect("universe backend lock")
+            .root_node(id)
+            .map_err(|e| TapNodeError::Universe(e.to_string()))
     }
 
     /// Adds a universe federation server.
@@ -388,6 +522,15 @@ impl<C: ChainBridge> ChainBridge for ArcChain<C> {
         height: u32,
     ) -> Result<[u8; 32], tap_onchain::chain::ChainError> {
         self.0.get_block_hash(height)
+    }
+    fn get_tx_confirmation(
+        &self,
+        txid: &[u8; 32],
+    ) -> Result<
+        Option<tap_onchain::chain::TxConfirmation>,
+        tap_onchain::chain::ChainError,
+    > {
+        self.0.get_tx_confirmation(txid)
     }
 }
 

@@ -7,44 +7,72 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-//! High-level asset transfer operations.
+//! High-level asset transfer operations, mirroring Go's `tapfreighter`
+//! semantics pragmatically.
 //!
-//! Full flow: coin select → validate → prepare outputs → sign virtual tx →
-//! build anchor PSBT → fund → sign → broadcast → mark spent → deliver proof.
+//! Full flow: coin select -> reconstruct real genesis + prev assets ->
+//! sign virtual tx with the stored key descriptors -> build anchor
+//! PSBT -> fund -> sign -> broadcast -> mark inputs spent -> persist
+//! change -> watch for confirmation (via `TapNode::tick`) -> finish
+//! proofs with real chain data -> store + deliver proofs.
+
+use std::collections::HashMap;
 
 use bitcoin::secp256k1::XOnlyPublicKey;
 
 use tap_ldk::ldk::LdkChannelOps;
 use tap_ldk::rfq::PriceOracle;
-use tap_onchain::chain::{AssetSigner, ChainBridge, KeyRing, WalletAnchor};
+use tap_onchain::chain::{
+    AssetSigner, ChainBridge, KeyDescriptor, KeyRing, TxConfirmation,
+    WalletAnchor,
+};
+use tap_onchain::proof::courier::{
+    AnnotatedProof, CourierLocator, Recipient,
+};
+use tap_onchain::proof::{
+    create_proof_suffix_with_options, update_proof_chain_data,
+    BaseProofParams, OutputProofInfo, ProofSuffixOptions,
+};
 use tap_onchain::send::{
-    execute_transfer_with_version, SelectedInput, SendError, TransferOutput,
-    VirtualSigner,
+    execute_transfer_with_version, SelectedInput, SendError,
+    TransferOutput, VirtualSigner,
 };
 use tap_persist::asset_store::OwnedAsset;
+use tap_persist::proof_store::ProofLocator;
 use tap_primitives::address::TapAddress;
 use tap_primitives::asset::{
-    AssetId, AssetVersion, PrevId, ScriptKey, SerializedKey,
-    TAPROOT_ASSETS_KEY_FAMILY,
+    Asset, AssetId, AssetVersion, Genesis, OutPoint, PrevId, ScriptKey,
+    ScriptVersion, SerializedKey, Witness, TAPROOT_ASSETS_KEY_FAMILY,
 };
+use tap_primitives::proof;
 use tap_primitives::vm::InputSet;
 
 use crate::error::TapNodeError;
 use crate::event::TapEvent;
 use crate::node::TapNode;
+use crate::tasks::{AnchorKind, PendingAnchor, TransferAnchor};
 use crate::types::TransferHandle;
 
 /// Sends an asset to a TAP address.
 ///
-/// Orchestrates the complete transfer pipeline:
-/// 1. Coin select asset UTXOs
-/// 2. Build transfer inputs/outputs
-/// 3. Execute transfer (validate, prepare, sign virtual tx, build template)
-/// 4. Fund anchor transaction
-/// 5. Sign and broadcast
-/// 6. Mark inputs as spent
-/// 7. Persist new outputs
-/// 8. Emit events
+/// Orchestrates the transfer pipeline up to broadcast:
+/// 1. Coin select asset UTXOs.
+/// 2. Reconstruct the real [`Genesis`] from the stored asset (error if
+///    the genesis fields are absent) and the real previous assets
+///    (from the stored proof files where available).
+/// 3. Execute the transfer (validate, prepare, sign virtual tx with
+///    the keys behind the input script keys, build template).
+/// 4. Fund, sign, and broadcast the anchor transaction.
+/// 5. Mark inputs spent and persist the change output (with its script
+///    key descriptor and genesis fields).
+/// 6. Create the transition proof suffixes (placeholder chain data)
+///    and register the transfer with the confirmation watcher; the
+///    proofs are finished, stored, and delivered by
+///    [`TapNode::tick`](crate::TapNode::tick).
+///
+/// Emits [`TapEvent::TransferBroadcast`] at broadcast;
+/// [`TapEvent::TransferConfirmed`] and [`TapEvent::ProofDelivered`]
+/// follow from the watcher once the anchor transaction confirms.
 pub(crate) fn send_asset<C, W, K, L, P>(
     node: &TapNode<C, W, K, L, P>,
     asset_id: AssetId,
@@ -68,19 +96,28 @@ where
             needed: amount,
         });
     }
+    let change_amount = total - amount;
 
-    // Step 2: Build transfer inputs.
-    let genesis = tap_primitives::asset::Genesis {
-        first_prev_out: selected[0].anchor_outpoint,
-        tag: String::new(),
-        meta_hash: [0u8; 32],
-        output_index: 0,
-        asset_type: tap_primitives::asset::AssetType::Normal,
-    };
+    // Step 2: Reconstruct the real genesis from the stored asset. All
+    // selected inputs share the asset ID, hence the genesis.
+    let genesis = genesis_from_owned(&selected[0])?;
+    if genesis.id() != asset_id {
+        return Err(TapNodeError::Storage(
+            "stored genesis fields do not reproduce the asset id".into(),
+        ));
+    }
+
+    // The change output gets a freshly derived BIP-86 script key (the
+    // transfer builder reads it from the first input's `script_key`
+    // field).
+    let change_script_desc =
+        node.keys.derive_next_key(TAPROOT_ASSETS_KEY_FAMILY)?;
+    let change_script_key = ScriptKey::bip86(change_script_desc.pub_key);
 
     let inputs: Vec<SelectedInput> = selected
         .iter()
-        .map(|owned| {
+        .enumerate()
+        .map(|(i, owned)| {
             let prev_id = PrevId {
                 out_point: owned.anchor_outpoint,
                 id: owned.asset_id,
@@ -90,56 +127,63 @@ where
                 prev_id,
                 anchor_point: owned.anchor_outpoint,
                 amount: owned.amount,
-                asset_type: tap_primitives::asset::AssetType::Normal,
-                script_key: ScriptKey::from_pub_key(owned.script_key),
+                asset_type: owned
+                    .genesis_asset_type
+                    .unwrap_or(tap_primitives::asset::AssetType::Normal),
+                // The first input's script_key doubles as the change
+                // (root) output script key in the transfer builder.
+                script_key: if i == 0 {
+                    change_script_key.clone()
+                } else {
+                    ScriptKey::from_pub_key(owned.script_key)
+                },
             }
         })
         .collect();
 
-    // Build transfer output for recipient.
+    // Build transfer output for the recipient. Output 0 is change,
+    // output 1 is the recipient.
     let outputs = vec![TransferOutput {
-        output_index: 1, // Output 0 is change, output 1 is recipient.
+        output_index: 1,
         amount,
         script_key: ScriptKey::from_pub_key(recipient.script_key),
         asset_version: AssetVersion::V0,
         interactive: false,
     }];
 
-    // Build previous asset set for signing.
+    // Step 3: Reconstruct the real previous assets for signing.
     let mut prev_assets = InputSet::new();
     for (owned, input) in selected.iter().zip(inputs.iter()) {
-        let prev_asset = tap_primitives::asset::Asset {
-            version: AssetVersion::V0,
-            genesis: genesis.clone(),
-            amount: owned.amount,
-            lock_time: 0,
-            relative_lock_time: 0,
-            prev_witnesses: vec![tap_primitives::asset::Witness {
-                prev_id: Some(PrevId::ZERO),
-                tx_witness: vec![],
-                split_commitment: None,
-            }],
-            split_commitment_root: None,
-            script_version: tap_primitives::asset::ScriptVersion::V0,
-            script_key: ScriptKey::from_pub_key(owned.script_key),
-            group_key: None,
-            unknown_odd_types: std::collections::BTreeMap::new(),
-        };
+        let prev_asset = prev_asset_for(node, owned, &genesis)?;
         prev_assets.insert(input.prev_id.clone(), prev_asset);
     }
 
-    // Step 3: Create signer adapter.
-    let signer = NodeVirtualSigner { keys: &*node.keys };
+    // The signer maps each input's (tweaked) script key to its stored
+    // key descriptor; signing an input whose descriptor is unknown
+    // fails with `SendError::UnknownScriptKey`.
+    let mut keys_by_script_key: HashMap<SerializedKey, KeyDescriptor> =
+        HashMap::new();
+    for owned in &selected {
+        if let Some(desc) = &owned.script_key_desc {
+            keys_by_script_key.insert(owned.script_key, desc.clone());
+        }
+    }
+    let signer = NodeVirtualSigner {
+        keys: &*node.keys,
+        keys_by_script_key,
+    };
 
-    // Derive internal keys for output anchors.
-    let change_key_desc =
+    // Anchor output internal keys: a fresh key for the change output,
+    // and the RECIPIENT's internal key (from the address) for the
+    // recipient output, so the recipient controls their anchor.
+    let change_internal_desc =
         node.keys.derive_next_key(TAPROOT_ASSETS_KEY_FAMILY)?;
-    let recipient_key_desc =
-        node.keys.derive_next_key(TAPROOT_ASSETS_KEY_FAMILY)?;
-    let internal_keys = vec![
-        x_only_from_serialized(&change_key_desc.pub_key),
-        x_only_from_serialized(&recipient_key_desc.pub_key),
-    ];
+    let change_internal_x_only =
+        x_only_from_serialized(&change_internal_desc.pub_key)?;
+    let recipient_internal_x_only =
+        x_only_from_serialized(&recipient.internal_key)?;
+    let internal_keys =
+        vec![change_internal_x_only, recipient_internal_x_only];
 
     // Execute the transfer pipeline. The Taproot Asset commitment
     // version is dictated by the recipient's address version (V1 and
@@ -164,39 +208,338 @@ where
     let signed_tx_bytes = node.wallet.sign_and_finalize_psbt(&funded)?;
     node.chain.publish_transaction(&signed_tx_bytes)?;
 
-    // Extract txid.
-    let txid = if let Ok(tx) =
-        bitcoin::consensus::deserialize::<bitcoin::Transaction>(&signed_tx_bytes)
-    {
-        let id = tx.compute_txid();
-        let mut txid_bytes = [0u8; 32];
-        txid_bytes.copy_from_slice(id.as_ref());
-        txid_bytes.reverse(); // Internal → display byte order.
-        txid_bytes
-    } else {
-        [0u8; 32]
+    let anchor_tx = bitcoin::consensus::deserialize::<bitcoin::Transaction>(
+        &signed_tx_bytes,
+    )
+    .map_err(|e| {
+        TapNodeError::Storage(format!("signed tx parse: {}", e))
+    })?;
+    let mut txid_internal = [0u8; 32];
+    txid_internal.copy_from_slice(anchor_tx.compute_txid().as_ref());
+    let mut txid_display = txid_internal;
+    txid_display.reverse();
+
+    // Locate the change and recipient outputs in the final transaction
+    // by their scripts (the funding wallet may reorder outputs).
+    let (change_script, _) =
+        tap_onchain::psbt::commitment::create_tap_output_script(
+            &change_internal_x_only,
+            result.prepared.change_commitment.commitment(),
+            None,
+        )
+        .map_err(|e| TapNodeError::Storage(format!("tap output: {}", e)))?;
+    let (recipient_script, _) =
+        tap_onchain::psbt::commitment::create_tap_output_script(
+            &recipient_internal_x_only,
+            result.prepared.output_commitments[0].commitment(),
+            None,
+        )
+        .map_err(|e| TapNodeError::Storage(format!("tap output: {}", e)))?;
+
+    let change_vout = anchor_tx
+        .output
+        .iter()
+        .position(|o| o.script_pubkey == change_script)
+        .ok_or(TapNodeError::Storage(
+            "change TAP output missing from signed transaction".into(),
+        ))? as u32;
+    let recipient_vout = anchor_tx
+        .output
+        .iter()
+        .position(|o| o.script_pubkey == recipient_script)
+        .ok_or(TapNodeError::Storage(
+            "recipient TAP output missing from signed transaction".into(),
+        ))? as u32;
+
+    let change_outpoint = OutPoint {
+        txid: txid_internal,
+        vout: change_vout,
+    };
+    let recipient_outpoint = OutPoint {
+        txid: txid_internal,
+        vout: recipient_vout,
     };
 
     // Step 6: Mark inputs as spent.
     {
-        let mut store = node.asset_store.lock().unwrap();
+        let mut store = node.asset_store.lock().expect("asset store lock");
         for input in &selected {
-            let _ = store.mark_spent(&input.anchor_outpoint);
+            store
+                .mark_spent(&input.anchor_outpoint)
+                .map_err(TapNodeError::Storage)?;
         }
     }
 
-    // Step 7: Emit event.
-    node.event_bus.emit(TapEvent::TransferConfirmed {
+    // Step 7: Persist the change output as a new owned asset (never a
+    // tombstone: zero-change splits use the un-spendable NUMS key).
+    let has_change = result.prepared.is_split && change_amount > 0;
+    if has_change {
+        let mut owned = OwnedAsset::new(
+            asset_id,
+            change_amount,
+            change_outpoint,
+            result.prepared.root_asset.script_key.pub_key,
+            0,
+        );
+        owned.script_key_desc = Some(change_script_desc.clone());
+        owned.internal_key = Some(change_internal_desc.clone());
+        owned.genesis_point = Some(genesis.first_prev_out);
+        owned.genesis_tag = Some(genesis.tag.clone());
+        owned.genesis_meta_hash = Some(genesis.meta_hash);
+        owned.genesis_output_index = Some(genesis.output_index);
+        owned.genesis_asset_type = Some(genesis.asset_type);
+        node.asset_store
+            .lock()
+            .expect("asset store lock")
+            .insert_asset(owned)
+            .map_err(TapNodeError::Storage)?;
+    }
+
+    // Step 8: Create the transition proof suffixes now (all commitment
+    // data is at hand); the chain data stays a placeholder until the
+    // watcher sees the confirmation.
+    let prev_out = selected[0].anchor_outpoint;
+    let (recipient_suffix, change_suffix) = if result.prepared.is_split {
+        let asset_outputs = [
+            OutputProofInfo {
+                asset: &result.prepared.root_asset,
+                anchor_output_index: change_vout,
+                internal_key: change_internal_desc.pub_key,
+                commitment: &result.prepared.change_commitment,
+                tapscript_sibling: None,
+            },
+            OutputProofInfo {
+                asset: &result.prepared.recipient_assets[0].asset,
+                anchor_output_index: recipient_vout,
+                internal_key: recipient.internal_key,
+                commitment: &result.prepared.output_commitments[0],
+                tapscript_sibling: None,
+            },
+        ];
+        // NOTE: exclusion proofs for the wallet's BTC change output
+        // are omitted (its internal key is unknown to the node).
+        let recipient_suffix = create_proof_suffix_with_options(
+            &anchor_tx,
+            prev_out,
+            &asset_outputs,
+            1,
+            &[],
+            &ProofSuffixOptions::default(),
+        )
+        .map_err(TapNodeError::Storage)?;
+        let change_suffix = if has_change {
+            Some(
+                create_proof_suffix_with_options(
+                    &anchor_tx,
+                    prev_out,
+                    &asset_outputs,
+                    0,
+                    &[],
+                    &ProofSuffixOptions::default(),
+                )
+                .map_err(TapNodeError::Storage)?,
+            )
+        } else {
+            None
+        };
+        (recipient_suffix, change_suffix)
+    } else {
+        // Full-value send: the root asset IS the recipient asset and
+        // there is no change to prove. The duplicate commitment placed
+        // in output 0 by the transfer template prevents exclusion
+        // proofs against it, so only the recipient output is listed.
+        let asset_outputs = [OutputProofInfo {
+            asset: &result.prepared.root_asset,
+            anchor_output_index: recipient_vout,
+            internal_key: recipient.internal_key,
+            commitment: &result.prepared.output_commitments[0],
+            tapscript_sibling: None,
+        }];
+        let recipient_suffix = create_proof_suffix_with_options(
+            &anchor_tx,
+            prev_out,
+            &asset_outputs,
+            0,
+            &[],
+            &ProofSuffixOptions::default(),
+        )
+        .map_err(TapNodeError::Storage)?;
+        (recipient_suffix, None)
+    };
+
+    // The (first) input's proof file is the base the new suffixes are
+    // appended to, giving the recipient the full provenance chain.
+    let base_file = node
+        .proof_store
+        .lock()
+        .expect("proof store lock")
+        .get_proof(&ProofLocator {
+            outpoint: selected[0].anchor_outpoint,
+            script_key: selected[0].script_key,
+        })
+        .ok()
+        .flatten();
+
+    // Step 9: Register with the confirmation watcher and report the
+    // broadcast.
+    node.pending_anchors
+        .lock()
+        .expect("pending anchors lock")
+        .push(PendingAnchor {
+            txid: txid_internal,
+            kind: AnchorKind::Transfer(TransferAnchor {
+                asset_id,
+                amount,
+                recipient_script_key: recipient.script_key,
+                recipient_outpoint,
+                recipient_suffix,
+                change_script_key: has_change.then(|| {
+                    result.prepared.root_asset.script_key.pub_key
+                }),
+                change_outpoint: has_change.then_some(change_outpoint),
+                change_suffix,
+                base_file,
+                courier_url: recipient.proof_courier_addr.clone(),
+            }),
+        });
+
+    node.event_bus.emit(TapEvent::TransferBroadcast {
         asset_id,
         amount,
-        txid,
+        txid: txid_display,
     });
 
     Ok(TransferHandle {
-        txid,
+        txid: txid_display,
         asset_id,
         amount,
     })
+}
+
+/// Finishes a confirmed transfer: updates the proof suffixes with the
+/// real chain data, stores the recipient and change proof files, and
+/// delivers the recipient proof via the node's courier when the
+/// destination address carried a courier URL. Called from
+/// [`TapNode::tick`](crate::TapNode::tick).
+pub(crate) fn finish_transfer_confirmation<C, W, K, L, P>(
+    node: &TapNode<C, W, K, L, P>,
+    mut anchor: TransferAnchor,
+    txid_internal: [u8; 32],
+    conf: &TxConfirmation,
+) -> Result<(), TapNodeError>
+where
+    C: ChainBridge + Send + Sync + 'static,
+    W: WalletAnchor + Send + Sync + 'static,
+    K: KeyRing + AssetSigner + Send + Sync + 'static,
+    L: LdkChannelOps + Send + Sync + 'static,
+    P: PriceOracle + Send + Sync + 'static,
+{
+    let anchor_tx_bytes = if conf.tx.is_empty() {
+        bitcoin::consensus::serialize(&anchor.recipient_suffix.anchor_tx.0)
+    } else {
+        conf.tx.clone()
+    };
+    let block_tx_hashes = if conf.block_tx_hashes.is_empty() {
+        vec![txid_internal]
+    } else {
+        conf.block_tx_hashes.clone()
+    };
+
+    let base = BaseProofParams {
+        block_header: conf.block_header,
+        block_height: conf.block_height,
+        anchor_tx_bytes,
+        tx_index: conf.tx_index as usize,
+        block_tx_hashes,
+        output_index: anchor.recipient_outpoint.vout,
+        internal_key: anchor.recipient_script_key,
+    };
+
+    update_proof_chain_data(&mut anchor.recipient_suffix, &base)
+        .map_err(TapNodeError::Storage)?;
+    if let Some(change_suffix) = anchor.change_suffix.as_mut() {
+        update_proof_chain_data(change_suffix, &base)
+            .map_err(TapNodeError::Storage)?;
+    }
+
+    // Build and store the proof files: the input's history plus the
+    // new suffix.
+    let make_file = |suffix: &proof::Proof| {
+        let mut file = anchor
+            .base_file
+            .clone()
+            .unwrap_or_else(proof::file::File::new);
+        file.append_proof(proof::encode::encode_proof(suffix));
+        file
+    };
+
+    let recipient_file = make_file(&anchor.recipient_suffix);
+    node.proof_store
+        .lock()
+        .expect("proof store lock")
+        .insert_proof(
+            ProofLocator {
+                outpoint: anchor.recipient_outpoint,
+                script_key: anchor.recipient_script_key,
+            },
+            recipient_file.clone(),
+        )
+        .map_err(TapNodeError::Storage)?;
+
+    if let (Some(change_suffix), Some(change_outpoint), Some(change_key)) = (
+        anchor.change_suffix.as_ref(),
+        anchor.change_outpoint,
+        anchor.change_script_key,
+    ) {
+        let change_file = make_file(change_suffix);
+        node.proof_store
+            .lock()
+            .expect("proof store lock")
+            .insert_proof(
+                ProofLocator {
+                    outpoint: change_outpoint,
+                    script_key: change_key,
+                },
+                change_file,
+            )
+            .map_err(TapNodeError::Storage)?;
+    }
+
+    let mut txid_display = txid_internal;
+    txid_display.reverse();
+    node.event_bus.emit(TapEvent::TransferConfirmed {
+        asset_id: anchor.asset_id,
+        amount: anchor.amount,
+        txid: txid_display,
+    });
+
+    // Deliver the recipient proof via the node's courier when the
+    // destination address carried a courier URL.
+    if anchor.courier_url.as_deref().is_some_and(|u| !u.is_empty()) {
+        let recipient = Recipient {
+            script_key: anchor.recipient_script_key,
+            asset_id: anchor.asset_id,
+            amount: anchor.amount,
+        };
+        let annotated = AnnotatedProof {
+            locator: CourierLocator {
+                asset_id: anchor.asset_id,
+                script_key: anchor.recipient_script_key,
+                outpoint: anchor.recipient_outpoint,
+            },
+            proof_file: recipient_file,
+        };
+        node.courier
+            .deliver_proof(&recipient, &annotated)
+            .map_err(TapNodeError::Courier)?;
+
+        node.event_bus.emit(TapEvent::ProofDelivered {
+            asset_id: anchor.asset_id,
+            recipient_script_key: anchor.recipient_script_key,
+        });
+    }
+
+    Ok(())
 }
 
 /// Simple largest-first coin selection.
@@ -212,7 +555,7 @@ where
     L: LdkChannelOps + Send + Sync + 'static,
     P: PriceOracle + Send + Sync + 'static,
 {
-    let store = node.asset_store.lock().unwrap();
+    let store = node.asset_store.lock().expect("asset store lock");
     let mut unspent = store.get_unspent(asset_id);
 
     if unspent.is_empty() {
@@ -235,30 +578,133 @@ where
     Ok(selected)
 }
 
-/// Adapter that implements VirtualSigner using the node's KeyRing + AssetSigner.
+/// Reconstructs the asset's [`Genesis`] from the stored owned asset,
+/// erroring when any of the genesis fields are missing.
+fn genesis_from_owned(owned: &OwnedAsset) -> Result<Genesis, TapNodeError> {
+    let missing = |field: &str| {
+        TapNodeError::Storage(format!(
+            "input asset is missing its stored genesis {}; cannot \
+             reconstruct the genesis for signing",
+            field
+        ))
+    };
+    Ok(Genesis {
+        first_prev_out: owned.genesis_point.ok_or_else(|| {
+            missing("outpoint")
+        })?,
+        tag: owned.genesis_tag.clone().ok_or_else(|| missing("tag"))?,
+        meta_hash: owned
+            .genesis_meta_hash
+            .ok_or_else(|| missing("meta hash"))?,
+        output_index: owned
+            .genesis_output_index
+            .ok_or_else(|| missing("output index"))?,
+        asset_type: owned
+            .genesis_asset_type
+            .ok_or_else(|| missing("asset type"))?,
+    })
+}
+
+/// Reconstructs the previous asset being spent.
+///
+/// Prefers the exact asset from the stored proof file (matching what
+/// any verifier reconstructs); falls back to a genesis-form asset
+/// (single zeroed prev witness), which is correct for freshly minted
+/// assets that have not transitioned yet.
+fn prev_asset_for<C, W, K, L, P>(
+    node: &TapNode<C, W, K, L, P>,
+    owned: &OwnedAsset,
+    genesis: &Genesis,
+) -> Result<Asset, TapNodeError>
+where
+    C: ChainBridge + Send + Sync + 'static,
+    W: WalletAnchor + Send + Sync + 'static,
+    K: KeyRing + AssetSigner + Send + Sync + 'static,
+    L: LdkChannelOps + Send + Sync + 'static,
+    P: PriceOracle + Send + Sync + 'static,
+{
+    let stored = node
+        .proof_store
+        .lock()
+        .expect("proof store lock")
+        .get_proof(&ProofLocator {
+            outpoint: owned.anchor_outpoint,
+            script_key: owned.script_key,
+        })
+        .ok()
+        .flatten();
+
+    if let Some(file) = stored {
+        if let Some(last) = file.proofs.last() {
+            if let Ok(decoded) =
+                proof::decode::decode_proof(&last.proof_bytes)
+            {
+                if decoded.asset.id() == owned.asset_id
+                    && decoded.asset.script_key.pub_key == owned.script_key
+                    && decoded.asset.amount == owned.amount
+                {
+                    return Ok(decoded.asset);
+                }
+            }
+        }
+    }
+
+    Ok(Asset {
+        version: AssetVersion::V0,
+        genesis: genesis.clone(),
+        amount: owned.amount,
+        lock_time: 0,
+        relative_lock_time: 0,
+        prev_witnesses: vec![Witness {
+            prev_id: Some(PrevId::ZERO),
+            tx_witness: vec![],
+            split_commitment: None,
+        }],
+        split_commitment_root: None,
+        script_version: ScriptVersion::V0,
+        script_key: ScriptKey::from_pub_key(owned.script_key),
+        group_key: None,
+        unknown_odd_types: std::collections::BTreeMap::new(),
+    })
+}
+
+/// Adapter that implements [`VirtualSigner`] with the node's
+/// [`KeyRing`] + [`AssetSigner`].
+///
+/// Holds a map from the (tweaked) input script keys to their stored
+/// raw key descriptors (from `OwnedAsset::script_key_desc`). Signing
+/// resolves the descriptor for the exact script key being spent and
+/// delegates to [`AssetSigner::sign_virtual_tx`], which by contract
+/// applies the BIP-86 taproot tweak to the raw key before signing (see
+/// the trait docs in `tap_onchain::chain`). Script keys with no stored
+/// descriptor fail with [`SendError::UnknownScriptKey`].
 struct NodeVirtualSigner<'a, K> {
     keys: &'a K,
+    keys_by_script_key: HashMap<SerializedKey, KeyDescriptor>,
 }
 
 impl<K: KeyRing + AssetSigner> VirtualSigner for NodeVirtualSigner<'_, K> {
     fn sign_virtual_tx(
         &self,
         sighash: &[u8; 32],
-        _script_key: &ScriptKey,
+        script_key: &ScriptKey,
     ) -> Result<Vec<u8>, SendError> {
-        // Find the key descriptor for this script key.
-        // For now, derive a fresh key and sign with it.
-        // A production implementation would look up the key by script_key.
-        let key_desc = self
-            .keys
-            .derive_next_key(TAPROOT_ASSETS_KEY_FAMILY)
-            .map_err(|e| SendError::Chain(e))?;
+        let desc = self
+            .keys_by_script_key
+            .get(script_key.serialized())
+            .ok_or_else(|| {
+                SendError::UnknownScriptKey(*script_key.serialized())
+            })?;
         self.keys
-            .sign_virtual_tx(&key_desc, sighash)
-            .map_err(|e| SendError::Chain(e))
+            .sign_virtual_tx(desc, sighash)
+            .map_err(SendError::Chain)
     }
 }
 
-fn x_only_from_serialized(key: &SerializedKey) -> XOnlyPublicKey {
-    XOnlyPublicKey::from_slice(&key.0[1..]).expect("valid 32-byte x-only key")
+fn x_only_from_serialized(
+    key: &SerializedKey,
+) -> Result<XOnlyPublicKey, TapNodeError> {
+    XOnlyPublicKey::from_slice(&key.0[1..]).map_err(|e| {
+        TapNodeError::Storage(format!("invalid x-only key: {}", e))
+    })
 }

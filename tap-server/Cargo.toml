@@ -1,0 +1,28 @@
+[package]
+name = "tap-server"
+version = "0.1.0"
+edition = "2021"
+description = "Universe REST server for Taproot Assets (tapd gateway compatible)"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tap-primitives = { path = "../tap-primitives" }
+tap-universe = { path = "../tap-universe", default-features = false, features = ["serde", "serde_json"] }
+tap-persist = { path = "../tap-persist", optional = true, default-features = false, features = ["sqlite"] }
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
+tap-universe = { path = "../tap-universe", features = ["http-client"] }
+
+[features]
+default = []
+sqlite = ["tap-persist"]
+
+[[bin]]
+name = "tap-universe-server"
+path = "src/main.rs"
+required-features = ["sqlite"]

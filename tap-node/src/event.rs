@@ -28,7 +28,16 @@ pub enum TapEvent {
         amount: u64,
         outpoint: OutPoint,
     },
-    /// An asset transfer was confirmed on-chain.
+    /// An asset transfer's anchor transaction was broadcast. The
+    /// `txid` is in display byte order (as printed by explorers).
+    TransferBroadcast {
+        asset_id: AssetId,
+        amount: u64,
+        txid: [u8; 32],
+    },
+    /// An asset transfer was confirmed on-chain (emitted by the
+    /// confirmation watcher, see [`TapNode::tick`](crate::TapNode::tick)).
+    /// The `txid` is in display byte order.
     TransferConfirmed {
         asset_id: AssetId,
         amount: u64,

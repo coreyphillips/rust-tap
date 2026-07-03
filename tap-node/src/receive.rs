@@ -488,9 +488,9 @@ where
     };
     node.proof_store
         .lock()
-        .unwrap()
+        .expect("proof store lock")
         .insert_proof(locator, proof_file)
-        .map_err(|e| TapNodeError::Storage(e))?;
+        .map_err(TapNodeError::Storage)?;
 
     if has_proofs {
         node.event_bus.emit(crate::event::TapEvent::AssetReceived {
@@ -520,7 +520,7 @@ where
         outpoint: *outpoint,
         script_key: *script_key,
     };
-    let store = node.proof_store.lock().unwrap();
+    let store = node.proof_store.lock().expect("proof store lock");
     store
         .get_proof(&locator)
         .map_err(|e| TapNodeError::Storage(e))?

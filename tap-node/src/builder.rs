@@ -70,6 +70,22 @@ impl Courier for NoCourier {
 /// - [`set_key_ring`](TapNodeBuilder::set_key_ring)
 /// - [`set_ldk_ops`](TapNodeBuilder::set_ldk_ops)
 /// - [`set_price_oracle`](TapNodeBuilder::set_price_oracle)
+///
+/// # Starting the node (breaking change)
+///
+/// [`TapNode::start`] now takes `self: Arc<Self>` so its background
+/// worker thread can hold a weak handle to the node. Wrap the built
+/// node in an [`Arc`] and start it via a clone:
+///
+/// ```ignore
+/// let node = Arc::new(builder.build()?);
+/// node.clone().start()?;
+/// // ...
+/// node.stop()?;
+/// ```
+///
+/// Embedders that drive their own scheduler can skip `start()`
+/// entirely and call [`TapNode::tick`] directly.
 pub struct TapNodeBuilder<C, W, K, L, P> {
     config: TapNodeConfig,
     chain: Option<C>,
@@ -259,9 +275,21 @@ where
             None => default_batch_store(&default_db),
         };
 
-        // Create courier.
-        let courier: Box<dyn Courier + Send + Sync> =
-            self.courier.unwrap_or_else(|| Box::new(NoCourier));
+        // Create the courier. Without an explicit courier, a
+        // configured `courier_url` gets an HTTP courier using the URL
+        // as its REST base; only an empty URL falls back to the
+        // always-failing placeholder.
+        let courier: Box<dyn Courier + Send + Sync> = match self.courier {
+            Some(courier) => courier,
+            None if !self.config.courier_url.is_empty() => {
+                Box::new(tap_onchain::proof::http_courier::HttpCourier::new(
+                    tap_onchain::proof::http_courier::HttpCourierCfg::new(
+                        self.config.courier_url.clone(),
+                    ),
+                ))
+            }
+            None => Box::new(NoCourier),
+        };
 
         // Mailbox store (defaults to in-memory).
         let mailbox_store: Box<dyn MailboxStore + Send> = self
@@ -313,7 +341,10 @@ where
             federation_db: Mutex::new(federation_db),
             event_bus,
             event_receiver: Mutex::new(Some(event_receiver)),
+            pending_anchors: Mutex::new(Vec::new()),
+            last_universe_sync: Mutex::new(None),
             running: AtomicBool::new(false),
+            worker: Mutex::new(None),
         })
     }
 }

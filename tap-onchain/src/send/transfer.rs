@@ -46,6 +46,9 @@ pub enum SendError {
     InvalidState(String),
     /// Burn preparation or validation error.
     BurnError(String),
+    /// The signer does not know the key behind an input's script key
+    /// (no stored key descriptor for it).
+    UnknownScriptKey(tap_primitives::asset::SerializedKey),
 }
 
 impl std::fmt::Display for SendError {
@@ -79,6 +82,13 @@ impl std::fmt::Display for SendError {
             }
             SendError::BurnError(msg) => {
                 write!(f, "burn error: {}", msg)
+            }
+            SendError::UnknownScriptKey(key) => {
+                write!(
+                    f,
+                    "unknown script key: no key descriptor stored for {:02x?}",
+                    &key.0[..4]
+                )
             }
         }
     }

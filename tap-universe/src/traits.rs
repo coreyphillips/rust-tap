@@ -55,6 +55,15 @@ pub trait UniverseBackend {
         &mut self,
         id: &UniverseId,
     ) -> Result<(), UniverseError>;
+
+    /// Lists the IDs of all universes stored in this backend.
+    ///
+    /// Used to serve multiverse root listings (e.g. by a universe
+    /// server). The default implementation returns an empty list for
+    /// backends that cannot enumerate their universes.
+    fn universe_ids(&self) -> Result<Vec<UniverseId>, UniverseError> {
+        Ok(vec![])
+    }
 }
 
 /// Aggregate view across multiple universes.

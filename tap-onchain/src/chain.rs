@@ -93,6 +93,18 @@ pub struct TxConfirmation {
     pub tx_index: u32,
     /// The confirmed transaction (raw bytes).
     pub tx: Vec<u8>,
+    /// The raw 80-byte header of the block containing the transaction.
+    ///
+    /// Needed to finish transition/genesis proofs after confirmation.
+    /// Stores that persist a `TxConfirmation` may not round-trip this
+    /// field (it is transient confirmation-watch data); it is all
+    /// zeroes when unknown.
+    pub block_header: [u8; 80],
+    /// All transaction hashes of the block, in block order and in
+    /// internal (little-endian) byte order, for building the
+    /// transaction merkle proof. Empty when unknown (see
+    /// [`TxConfirmation::block_header`]).
+    pub block_tx_hashes: Vec<[u8; 32]>,
 }
 
 /// Chain backend interface for blockchain interaction.
@@ -108,6 +120,32 @@ pub trait ChainBridge {
 
     /// Gets a block header hash by height.
     fn get_block_hash(&self, height: u32) -> Result<[u8; 32], ChainError>;
+
+    /// Looks up the confirmation state of a transaction.
+    ///
+    /// `txid` is in internal (little-endian) byte order, i.e. the same
+    /// order used by [`tap_primitives::asset::OutPoint::txid`] and raw
+    /// transaction serialization. Implementations that talk to block
+    /// explorers must reverse it to obtain the display hex form.
+    ///
+    /// Returns `Ok(None)` while the transaction is unconfirmed, and a
+    /// fully populated [`TxConfirmation`] (including the block header
+    /// and the block's transaction hashes) once it has at least one
+    /// confirmation.
+    ///
+    /// The default implementation reports the operation as
+    /// unsupported, so backends without confirmation lookups keep
+    /// compiling; confirmation watching is then disabled.
+    fn get_tx_confirmation(
+        &self,
+        txid: &[u8; 32],
+    ) -> Result<Option<TxConfirmation>, ChainError> {
+        let _ = txid;
+        Err(ChainError::Other(
+            "get_tx_confirmation is not supported by this chain backend"
+                .into(),
+        ))
+    }
 }
 
 /// Wallet interface for PSBT operations and UTXO management.
@@ -156,9 +194,23 @@ pub trait KeyRing {
 pub trait AssetSigner {
     /// Signs a virtual transaction input.
     ///
-    /// `signing_key` identifies which key to sign with.
-    /// `virtual_tx` is the serialized virtual transaction.
-    /// Returns the signature bytes.
+    /// `signing_key` identifies the raw (pre-tweak) key to sign with,
+    /// as previously returned by [`KeyRing::derive_next_key`].
+    /// `virtual_tx` is the 32-byte BIP-341 key-spend sighash of the
+    /// virtual transaction (not the serialized transaction itself);
+    /// implementations should reject inputs that are not exactly 32
+    /// bytes.
+    ///
+    /// # BIP-86 tweak contract
+    ///
+    /// Asset script keys are taproot output keys: by default they are
+    /// derived from the raw key via the BIP-341 key-spend-only tweak
+    /// with an empty script tree (`ScriptKey::bip86`, Go's
+    /// `NewScriptKeyBip86`). Verifiers check the witness signature
+    /// against that tweaked script key, so the signer MUST apply the
+    /// same BIP-86 taproot tweak to the private key of `signing_key`
+    /// before signing, and return the resulting 64-byte BIP-340
+    /// Schnorr signature over the 32-byte digest.
     fn sign_virtual_tx(
         &self,
         signing_key: &KeyDescriptor,

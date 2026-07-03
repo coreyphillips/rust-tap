@@ -155,6 +155,10 @@ impl UniverseBackend for MemoryUniverseBackend {
         self.universes.remove(id);
         Ok(())
     }
+
+    fn universe_ids(&self) -> Result<Vec<UniverseId>, UniverseError> {
+        Ok(self.universes.keys().cloned().collect())
+    }
 }
 
 /// In-memory federation database.

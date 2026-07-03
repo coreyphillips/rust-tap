@@ -8,17 +8,32 @@ On-chain functionality is testnet-ready. Lightning asset channel integration is 
 
 | Area | Status |
 |------|--------|
-| Core protocol (MS-SMT, assets, commitments, VM, proofs) | Complete |
-| Cryptography (BIP-340/341/342, HD derivation, group keys) | Complete |
-| On-chain pipelines (minting, transfers, PSBT construction) | Complete |
-| Universe sync (diff-based MS-SMT federation) | Complete |
-| SQLite + in-memory persistence | Complete |
-| TLV wire encoding (Go `tapd`-compatible) | Complete |
-| Proof courier | Trait + HTTP implementation |
-| LDK integration (channels, HTLC signing, cooperative/force close) | In progress -- individual components built, not yet wired end-to-end |
-| RFQ (Request For Quote) with per-peer rate limiting | In progress -- standalone negotiation works, not yet connected to channel lifecycle |
+| Core protocol (MS-SMT, assets, commitments, VM, proofs) | Complete, validated against Go `tapd` test vectors |
+| Full proof verification (inclusion/exclusion vs anchor outputs, STXO, reveals, state transitions) | Complete -- verifies real `tapd` proof files end to end |
+| Cryptography (BIP-340/341/342, HD derivation, group keys V0/V1, Pedersen commitments) | Complete |
+| On-chain pipelines (minting, transfers, burns, PSBT construction, proof suffix creation) | Complete |
+| vPSBT (Go `tappsbt`-compatible virtual packets) | Complete, byte-exact against Go vectors |
+| STXO proofs / alt leaves (TransitionV1) | Complete, Go-default semantics |
+| Supply commitments | Verification complete; authoring state machine deferred |
+| Address V0/V1/V2 + authmailbox courier client (ECIES) | Complete; gRPC mailbox transport is a follow-up |
+| Universe sync (diff-based MS-SMT federation, verified inserts) | Complete |
+| Universe server (`tap-server`, tapd-compatible REST) | Complete -- rust-tap to rust-tap federation proven; gRPC follow-up for tapd-native sync |
+| SQLite + in-memory persistence | Complete (8 migrations) |
+| TLV wire encoding (Go `tapd`-compatible) | Complete, byte-exact against Go vectors |
+| Node lifecycle (mint/send/confirmation watching via `tick()` or background thread) | Complete |
+| LDK integration (channels, HTLC signing, cooperative/force close) | Data structures and signing at Go wire parity; live channel flow blocked on rust-lightning extension points (see `tap-ldk/docs/ldk-fork-requirements.md`) |
+| RFQ (Go `rfqmsg`-compatible wire format, pending-request tracking, HTLC interception) | Complete against Go v0.8 compatibility fixtures |
 | External security audit | Not started |
-| Live `tapd` interop testing | Encoding vectors only |
+| Live `tapd` interop testing | Go test vectors + real `tapd` proof files verified; live daemon testing recommended before mainnet |
+
+### Async
+
+The core crates are intentionally synchronous (small dependency tree,
+mobile-friendly). Async lives only at the edges: the `tap-server` crate
+wraps the sync core with `tokio::task::spawn_blocking`. If a public
+async API is needed later, the plan is a thin wrapper crate around
+`Arc<TapNode>` using the same pattern, never async plumbing inside the
+protocol crates.
 
 ## Quick Start
 
@@ -146,11 +161,12 @@ use tap_ldk::rfq::*;
 
 struct MyOracle;
 impl PriceOracle for MyOracle {
+    // Rates are asset units per BTC (Go rfqmsg.AssetRate semantics).
     fn ask_price(&self, _id: &AssetId, _max: u64) -> Result<FixedPoint, RfqError> {
-        Ok(FixedPoint::from_integer(5000)) // 5000 msat per unit
+        Ok(FixedPoint::from_integer(20_000_000)) // 5000 msat per unit
     }
     fn bid_price(&self, _id: &AssetId, _max: u64) -> Result<FixedPoint, RfqError> {
-        Ok(FixedPoint::from_integer(4800))
+        Ok(FixedPoint::from_integer(25_000_000)) // 4000 msat per unit
     }
 }
 
@@ -196,8 +212,9 @@ tap_mgr.handle_intercepted_htlc(
 ## Testing
 
 ```bash
-# Full unit test suite (~329 tests across all crates)
-cargo test -p tap-primitives -p tap-onchain -p tap-ldk -p tap-persist -p tap-universe --lib
+# Full test suite (700+ tests across all crates, including Go tapd
+# test vector conformance suites)
+cargo test --workspace
 
 # Property-based encoding round-trip tests
 cargo test -p tap-primitives --test proptest_encoding

@@ -95,7 +95,7 @@ const OWNED_ASSET_COLS: &str = "asset_id, amount, anchor_txid, \
      script_key_family, script_key_index, script_key_raw, \
      internal_key_family, internal_key_index, internal_key_raw, \
      genesis_tag, genesis_meta_hash, genesis_output_index, \
-     genesis_asset_type";
+     genesis_asset_type, genesis_point_txid, genesis_point_vout";
 
 impl AssetStore for SqliteAssetStore {
     fn insert_asset(&mut self, asset: OwnedAsset) -> Result<(), String> {
@@ -105,8 +105,9 @@ impl AssetStore for SqliteAssetStore {
              (asset_id, amount, anchor_txid, anchor_vout, script_key, spent, block_height, \
               script_key_family, script_key_index, script_key_raw, \
               internal_key_family, internal_key_index, internal_key_raw, \
-              genesis_tag, genesis_meta_hash, genesis_output_index, genesis_asset_type) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+              genesis_tag, genesis_meta_hash, genesis_output_index, genesis_asset_type, \
+              genesis_point_txid, genesis_point_vout) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 &asset.asset_id.0[..],
                 asset.amount as i64,
@@ -128,6 +129,8 @@ impl AssetStore for SqliteAssetStore {
                 asset.genesis_meta_hash.as_ref().map(|h| h.to_vec()),
                 asset.genesis_output_index,
                 asset.genesis_asset_type.map(|t| t.to_u8()),
+                asset.genesis_point.as_ref().map(|op| op.txid.to_vec()),
+                asset.genesis_point.as_ref().map(|op| op.vout),
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -289,6 +292,8 @@ fn row_to_owned_asset(
     let genesis_meta_hash_bytes: Option<Vec<u8>> = row.get(14)?;
     let genesis_output_index: Option<u32> = row.get(15)?;
     let genesis_asset_type_byte: Option<u8> = row.get(16)?;
+    let genesis_point_txid_bytes: Option<Vec<u8>> = row.get(17)?;
+    let genesis_point_vout: Option<u32> = row.get(18)?;
 
     let mut asset_id = [0u8; 32];
     asset_id.copy_from_slice(&asset_id_bytes);
@@ -306,6 +311,19 @@ fn row_to_owned_asset(
         Some(hash)
     });
 
+    let genesis_point = match (genesis_point_txid_bytes, genesis_point_vout)
+    {
+        (Some(bytes), Some(vout)) if bytes.len() == 32 => {
+            let mut gp_txid = [0u8; 32];
+            gp_txid.copy_from_slice(&bytes);
+            Some(OutPoint {
+                txid: gp_txid,
+                vout,
+            })
+        }
+        _ => None,
+    };
+
     Ok(OwnedAsset {
         asset_id: AssetId(asset_id),
         amount: amount as u64,
@@ -315,6 +333,7 @@ fn row_to_owned_asset(
         block_height,
         script_key_desc: key_desc_from_cols(sk_family, sk_index, sk_raw),
         internal_key: key_desc_from_cols(ik_family, ik_index, ik_raw),
+        genesis_point,
         genesis_tag,
         genesis_meta_hash,
         genesis_output_index,
@@ -680,6 +699,10 @@ fn row_to_batch_header(row: &rusqlite::Row) -> (i64, MintingBatch) {
                 block_height: height,
                 tx_index: tx_idx,
                 tx,
+                // The block header and tx hash list are transient
+                // confirmation-watch data and are not persisted.
+                block_header: [0u8; 80],
+                block_tx_hashes: Vec::new(),
             })
         }
         _ => None,
@@ -697,6 +720,7 @@ fn row_to_batch_header(row: &rusqlite::Row) -> (i64, MintingBatch) {
             seedlings: HashMap::new(),
             genesis_psbt,
             root_asset_commitment: None,
+            sprouted_assets: Vec::new(),
             signed_tx,
             genesis_outpoint,
             confirmation,
@@ -1110,6 +1134,8 @@ mod tests {
             block_height: 850_000,
             tx_index: 3,
             tx: vec![0x01, 0x02],
+            block_header: [0u8; 80],
+            block_tx_hashes: Vec::new(),
         });
         batch.mint_output_index = Some(0);
 

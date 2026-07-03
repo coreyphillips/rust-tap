@@ -34,9 +34,12 @@ pub struct OwnedAsset {
     pub script_key_desc: Option<KeyDescriptor>,
     /// The taproot internal key of the anchor output, when known.
     pub internal_key: Option<KeyDescriptor>,
-    /// The genesis tag (asset name), when known. Together with the
-    /// genesis outpoint this allows reconstructing the
+    /// The genesis outpoint (`Genesis::first_prev_out`, the first
+    /// input of the genesis transaction), when known. Together with
+    /// the other genesis fields this allows reconstructing the
     /// `tap_primitives::asset::Genesis` of the asset.
+    pub genesis_point: Option<OutPoint>,
+    /// The genesis tag (asset name), when known.
     pub genesis_tag: Option<String>,
     /// The genesis meta hash, when known.
     pub genesis_meta_hash: Option<[u8; 32]>,
@@ -65,6 +68,7 @@ impl OwnedAsset {
             block_height,
             script_key_desc: None,
             internal_key: None,
+            genesis_point: None,
             genesis_tag: None,
             genesis_meta_hash: None,
             genesis_output_index: None,
@@ -100,10 +104,14 @@ pub struct BurnRecord {
 
 /// Trait for persisting owned assets.
 pub trait AssetStore {
-    /// Stores a newly received/minted asset.
+    /// Stores a newly received/minted asset. A single anchor outpoint
+    /// can carry several assets (e.g. a multi-asset mint batch);
+    /// implementations must key on at least (outpoint, asset ID,
+    /// script key).
     fn insert_asset(&mut self, asset: OwnedAsset) -> Result<(), String>;
 
-    /// Marks an asset as spent.
+    /// Marks every asset anchored at the outpoint as spent (spending
+    /// an anchor UTXO consumes all assets committed to in it).
     fn mark_spent(&mut self, outpoint: &OutPoint) -> Result<(), String>;
 
     /// Returns all unspent assets for a given asset ID.
@@ -123,9 +131,12 @@ pub trait AssetStore {
 }
 
 /// In-memory asset store for testing.
+///
+/// Keyed by (anchor outpoint, asset ID, script key): a single anchor
+/// output's TAP commitment can carry several assets.
 #[derive(Default)]
 pub struct MemoryAssetStore {
-    assets: HashMap<OutPoint, OwnedAsset>,
+    assets: HashMap<(OutPoint, AssetId, SerializedKey), OwnedAsset>,
     burns: Vec<BurnRecord>,
 }
 
@@ -137,13 +148,22 @@ impl MemoryAssetStore {
 
 impl AssetStore for MemoryAssetStore {
     fn insert_asset(&mut self, asset: OwnedAsset) -> Result<(), String> {
-        self.assets.insert(asset.anchor_outpoint, asset);
+        self.assets.insert(
+            (asset.anchor_outpoint, asset.asset_id, asset.script_key),
+            asset,
+        );
         Ok(())
     }
 
     fn mark_spent(&mut self, outpoint: &OutPoint) -> Result<(), String> {
-        if let Some(asset) = self.assets.get_mut(outpoint) {
-            asset.spent = true;
+        let mut found = false;
+        for asset in self.assets.values_mut() {
+            if asset.anchor_outpoint == *outpoint {
+                asset.spent = true;
+                found = true;
+            }
+        }
+        if found {
             Ok(())
         } else {
             Err("asset not found".into())
@@ -213,6 +233,10 @@ mod tests {
             family: 212,
             index: 8,
             pub_key: SerializedKey([0x03; 33]),
+        });
+        asset.genesis_point = Some(OutPoint {
+            txid: [0x55; 32],
+            vout: 2,
         });
         asset.genesis_tag = Some("test-coin".to_string());
         asset.genesis_meta_hash = Some([0x44; 32]);

@@ -109,6 +109,62 @@ impl ChainBridge for EsploraChain {
         hash.copy_from_slice(&bytes);
         Ok(hash)
     }
+
+    fn get_tx_confirmation(
+        &self,
+        txid: &[u8; 32],
+    ) -> Result<Option<TxConfirmation>, ChainError> {
+        // The trait passes the txid in internal byte order; Esplora
+        // uses display (reversed) hex.
+        let mut display = *txid;
+        display.reverse();
+        let txid_hex: String =
+            display.iter().map(|b| format!("{:02x}", b)).collect();
+
+        let status = self
+            .get_tx_status(&txid_hex)
+            .map_err(ChainError::ConfirmationFailed)?;
+        if !status.confirmed {
+            return Ok(None);
+        }
+
+        let block = self
+            .get_block_data(&status.block_hash, status.block_height)
+            .map_err(ChainError::ConfirmationFailed)?;
+        let tx = self
+            .get_raw_tx(&txid_hex)
+            .map_err(ChainError::ConfirmationFailed)?;
+        let block_hash = hex_decode_array::<32>(&status.block_hash)
+            .map_err(ChainError::ConfirmationFailed)?;
+
+        // Esplora lists txids in display hex; the merkle proof wants
+        // internal byte order.
+        let mut tx_index = None;
+        let mut block_tx_hashes = Vec::with_capacity(block.txids.len());
+        for (i, txid_str) in block.txids.iter().enumerate() {
+            let mut hash = hex_decode_array::<32>(txid_str)
+                .map_err(ChainError::ConfirmationFailed)?;
+            hash.reverse();
+            block_tx_hashes.push(hash);
+            if *txid_str == txid_hex {
+                tx_index = Some(i as u32);
+            }
+        }
+        let tx_index = tx_index.ok_or_else(|| {
+            ChainError::ConfirmationFailed(
+                "confirmed tx not found in its block".into(),
+            )
+        })?;
+
+        Ok(Some(TxConfirmation {
+            block_hash,
+            block_height: block.height,
+            tx_index,
+            tx,
+            block_header: block.header,
+            block_tx_hashes,
+        }))
+    }
 }
 
 /// Transaction confirmation status from Esplora.
@@ -447,21 +503,35 @@ impl KeyRing for TapKeyRing {
 }
 
 impl AssetSigner for TapKeyRing {
+    // Per the `AssetSigner` contract (tap-onchain/src/chain.rs):
+    // `virtual_tx` is the 32-byte BIP-341 sighash, and the signature
+    // must come from the BIP-86 tweaked key (empty script tree) so it
+    // verifies against `ScriptKey::bip86(raw_key)`.
     fn sign_virtual_tx(
         &self,
         signing_key: &KeyDescriptor,
         virtual_tx: &[u8],
     ) -> Result<Vec<u8>, ChainError> {
+        use bitcoin::key::TapTweak;
+
+        let digest: [u8; 32] = virtual_tx.try_into().map_err(|_| {
+            ChainError::SigningFailed(
+                "expected a 32-byte sighash digest".into(),
+            )
+        })?;
+
         let keypairs = self.keypairs.lock().unwrap();
         let (_, keypair) = keypairs
             .iter()
             .find(|(kd, _)| kd.pub_key == signing_key.pub_key)
             .ok_or_else(|| ChainError::SigningFailed("Key not found".into()))?;
-        let msg = bitcoin::secp256k1::Message::from_digest({
-            use bitcoin::hashes::{sha256, Hash};
-            sha256::Hash::hash(virtual_tx).to_byte_array()
-        });
-        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, keypair);
+
+        // Apply the BIP-86 taproot tweak (no script path).
+        let tweaked = keypair.tap_tweak(&self.secp, None);
+        let msg = bitcoin::secp256k1::Message::from_digest(digest);
+        let sig = self
+            .secp
+            .sign_schnorr_no_aux_rand(&msg, &tweaked.to_keypair());
         Ok(sig.serialize().to_vec())
     }
 }

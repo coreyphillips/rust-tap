@@ -104,16 +104,20 @@ fn main() {
         ..Default::default()
     };
 
-    let node = TapNodeBuilder::new(config)
-        .set_chain_bridge(chain)
-        .set_wallet_anchor(bdk_wallet)
-        .set_key_ring(key_ring)
-        .set_ldk_ops(StubLdk)
-        .set_price_oracle(StubOracle)
-        .build()
-        .expect("Failed to build node");
+    // `start()` takes an Arc so its background worker (confirmation
+    // watching, universe sync) can hold a weak handle to the node.
+    let node = std::sync::Arc::new(
+        TapNodeBuilder::new(config)
+            .set_chain_bridge(chain)
+            .set_wallet_anchor(bdk_wallet)
+            .set_key_ring(key_ring)
+            .set_ldk_ops(StubLdk)
+            .set_price_oracle(StubOracle)
+            .build()
+            .expect("Failed to build node"),
+    );
 
-    node.start().expect("Failed to start node");
+    node.clone().start().expect("Failed to start node");
 
     // Route to subcommand or interactive menu.
     if args.len() > 2 {
