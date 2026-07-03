@@ -314,16 +314,30 @@ fn decode_additional_inputs(data: &[u8]) -> Result<Vec<File>, ProofError> {
 fn decode_alt_leaves(data: &[u8]) -> Result<Vec<Asset>, ProofError> {
     let (count, mut offset) =
         decode_bigsize(data).map_err(ProofError::from)?;
-    if count > data.len() as u64 {
+
+    // A minimal alt leaf is 39 bytes of inner TLV (script version +
+    // script key) plus a 1-byte length prefix, so bound the count by
+    // what the record can actually contain (Go's minAltLeafSize).
+    const MIN_ALT_LEAF_SIZE: u64 = 40;
+    if count > data.len() as u64 / MIN_ALT_LEAF_SIZE {
         return Err(decode_err("too many alt leaves"));
     }
 
     let mut leaves = Vec::with_capacity(count as usize);
+    let mut leaf_keys = std::collections::BTreeSet::new();
     for _ in 0..count {
         let (leaf_bytes, consumed) = decode_var_bytes(&data[offset..])
             .map_err(ProofError::from)?;
         offset += consumed;
-        leaves.push(decode_asset(&leaf_bytes)?);
+        let leaf = decode_asset(&leaf_bytes)?;
+
+        // Each alt leaf must have a unique script key, matching Go's
+        // AltLeavesDecoder (asset.ErrDuplicateScriptKeys).
+        if !leaf_keys.insert(*leaf.script_key.serialized()) {
+            return Err(decode_err("duplicate alt leaf script key"));
+        }
+
+        leaves.push(leaf);
     }
 
     if offset != data.len() {

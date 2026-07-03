@@ -17,14 +17,19 @@
 //! - [`traits`]: Backend, sync, and federation trait definitions
 //! - [`memory`]: In-memory implementations for testing
 //! - [`syncer`]: Simple diff-based sync algorithm
+//! - [`ignore`]: Signed ignore tuples (supply commitment ignore leaves)
+//! - [`supply`]: Universe supply commitments (trees, events, verifier)
 
 #[cfg(feature = "http-client")]
 pub mod http_client;
+pub mod ignore;
 pub mod memory;
+pub mod supply;
 pub mod syncer;
 pub mod traits;
 pub mod types;
 
+pub use ignore::{IgnoreError, IgnoreSig, IgnoreTuple, SignedIgnoreTuple};
 pub use memory::{MemoryFederationDb, MemoryUniverseBackend};
 pub use syncer::SimpleSyncer;
 pub use traits::{DiffEngine, FederationDb, MultiverseArchive, Syncer, UniverseBackend};

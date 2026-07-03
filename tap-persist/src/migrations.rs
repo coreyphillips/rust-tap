@@ -16,6 +16,8 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/001_initial.up.sql")),
     (2, include_str!("../migrations/002_universe.up.sql")),
     (3, include_str!("../migrations/003_burns.up.sql")),
+    (4, include_str!("../migrations/004_supply.up.sql")),
+    (5, include_str!("../migrations/005_mailbox.up.sql")),
 ];
 
 /// Runs all pending migrations against the given connection.
@@ -74,11 +76,15 @@ pub(crate) fn current_version(conn: &Connection) -> Result<u32, rusqlite::Error>
 mod tests {
     use super::*;
 
+    fn latest_version() -> u32 {
+        MIGRATIONS.last().expect("at least one migration").0
+    }
+
     #[test]
     fn test_run_migrations_fresh_db() {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert_eq!(current_version(&conn).unwrap(), latest_version());
     }
 
     #[test]
@@ -87,7 +93,7 @@ mod tests {
         run_migrations(&conn).unwrap();
         // Running again should not fail.
         run_migrations(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert_eq!(current_version(&conn).unwrap(), latest_version());
     }
 
     #[test]
@@ -113,6 +119,15 @@ mod tests {
         assert!(tables.contains(&"universe_leaves".to_string()));
         assert!(tables.contains(&"universe_servers".to_string()));
         assert!(tables.contains(&"asset_burns".to_string()));
+        assert!(tables.contains(&"addresses".to_string()));
+        assert!(tables.contains(&"mailbox_cursors".to_string()));
+        assert!(tables.contains(&"mssmt_nodes".to_string()));
+        assert!(tables.contains(&"mssmt_roots".to_string()));
+        assert!(tables.contains(&"universe_supply_roots".to_string()));
+        assert!(tables.contains(&"universe_supply_leaves".to_string()));
+        assert!(tables.contains(&"supply_commitments".to_string()));
+        assert!(tables.contains(&"supply_pre_commits".to_string()));
+        assert!(tables.contains(&"ignore_tuples".to_string()));
     }
 
     #[test]

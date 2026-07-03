@@ -11,18 +11,33 @@
 //!
 //! - [`keys`]: Key derivation, taproot tweaking, group key computation
 //! - [`schnorr`]: BIP-340 Schnorr signature verification for asset witnesses
+//! - [`pedersen`]: Pedersen commitments and NUMS xpub helpers
 
 pub mod derivation;
+pub mod ecies;
 pub mod keys;
+pub mod pedersen;
 pub mod schnorr;
 pub mod tapscript;
 pub mod virtual_tx;
 
+pub use ecies::{
+    decrypt_sha256_chacha20_poly1305, ecdh,
+    encrypt_sha256_chacha20_poly1305, extract_additional_data,
+    hkdf_sha256, EciesError, EciesVersion, LATEST_ECIES_VERSION,
+};
 pub use keys::{
     compute_group_key, compute_taproot_output_key, parse_pub_key,
     serialize_pub_key, tweak_pub_key,
 };
-pub use schnorr::SchnorrWitnessValidator;
+pub use pedersen::{
+    new_commitment, nums_xpub, taproot_nums_key, tweaked_nums_key,
+    verify_commitment, CryptoError, Opening, TAPROOT_NUMS_BYTES,
+};
+pub use schnorr::{
+    sign_schnorr, verify_schnorr, verify_schnorr_key_bytes,
+    SchnorrWitnessValidator,
+};
 pub use tapscript::{
     create_tap_output_script, tap_branch_hash, tap_leaf_hash,
     taproot_output_key,

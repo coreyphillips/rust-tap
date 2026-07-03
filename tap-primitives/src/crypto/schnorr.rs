@@ -120,6 +120,43 @@ pub fn verify_schnorr(
         .map_err(|e| format!("verification failed: {}", e))
 }
 
+/// Verifies a raw BIP-340 Schnorr signature against a message and an
+/// x-only public key given as raw bytes.
+///
+/// This helper lets crates without a direct secp256k1 dependency (e.g.
+/// tap-universe) verify signatures such as signed ignore tuples.
+pub fn verify_schnorr_key_bytes(
+    sig: &[u8; 64],
+    msg: &[u8; 32],
+    pubkey_x_only: &[u8; 32],
+) -> Result<(), String> {
+    let pubkey = XOnlyPublicKey::from_slice(pubkey_x_only)
+        .map_err(|e| format!("invalid public key: {}", e))?;
+    verify_schnorr(sig, msg, &pubkey)
+}
+
+/// Signs a 32-byte message with a BIP-340 Schnorr signature using the
+/// given secret key bytes. Signing is deterministic (no auxiliary
+/// randomness).
+///
+/// The message is signed as-is; callers are responsible for any
+/// pre-hashing convention (e.g. lnd's `SignMessageSchnorr` signs
+/// `sha256(msg)`).
+pub fn sign_schnorr(
+    msg: &[u8; 32],
+    secret_key: &[u8; 32],
+) -> Result<[u8; 64], String> {
+    use bitcoin::secp256k1::{Keypair, SecretKey};
+
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(secret_key)
+        .map_err(|e| format!("invalid secret key: {}", e))?;
+    let keypair = Keypair::from_secret_key(&secp, &sk);
+    let sig = secp
+        .sign_schnorr_no_aux_rand(&Message::from_digest(*msg), &keypair);
+    Ok(*sig.as_ref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

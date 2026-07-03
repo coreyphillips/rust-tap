@@ -12,6 +12,7 @@
 use tap_onchain::chain::ChainError;
 use tap_onchain::mint::MintError;
 use tap_onchain::proof::courier::CourierError;
+use tap_onchain::proof::mailbox::MailboxError;
 use tap_onchain::send::SendError;
 use tap_primitives::address::AddressError;
 use tap_primitives::asset::AssetId;
@@ -51,6 +52,8 @@ pub enum TapNodeError {
     },
     /// Address error.
     Address(AddressError),
+    /// Auth mailbox error.
+    Mailbox(MailboxError),
 }
 
 impl std::fmt::Display for TapNodeError {
@@ -90,6 +93,7 @@ impl std::fmt::Display for TapNodeError {
                 asset_id, available, needed
             ),
             TapNodeError::Address(e) => write!(f, "address error: {}", e),
+            TapNodeError::Mailbox(e) => write!(f, "mailbox error: {}", e),
         }
     }
 }
@@ -123,5 +127,11 @@ impl From<CourierError> for TapNodeError {
 impl From<AddressError> for TapNodeError {
     fn from(e: AddressError) -> Self {
         TapNodeError::Address(e)
+    }
+}
+
+impl From<MailboxError> for TapNodeError {
+    fn from(e: MailboxError) -> Self {
+        TapNodeError::Mailbox(e)
     }
 }

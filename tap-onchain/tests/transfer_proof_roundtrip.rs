@@ -64,12 +64,12 @@ impl ChainLookup for MockLookup {
 fn ctx(
 ) -> VerifierCtx<AcceptHeaders, DefaultMerkleVerifier, AcceptGroups, MockLookup>
 {
-    VerifierCtx {
-        header_verifier: AcceptHeaders,
-        merkle_verifier: DefaultMerkleVerifier,
-        group_verifier: AcceptGroups,
-        chain_lookup: MockLookup,
-    }
+    VerifierCtx::new(
+        AcceptHeaders,
+        DefaultMerkleVerifier,
+        AcceptGroups,
+        MockLookup,
+    )
 }
 
 /// A signer that produces real BIP-340 Schnorr signatures, matching the

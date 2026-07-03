@@ -22,10 +22,12 @@
 
 use std::collections::BTreeMap;
 
-use tap_primitives::asset::{Asset, OutPoint, SerializedKey};
+use tap_primitives::asset::{
+    self, Asset, OutPoint, SerializedKey, EMPTY_GENESIS_ID,
+};
 use tap_primitives::commitment::{
-    asset_commitment_key, tap_commitment_key, TapCommitmentTree,
-    TapscriptPreimage,
+    asset_commitment_key, tap_commitment_key, CommitmentProof,
+    TapCommitmentTree, TapscriptPreimage,
 };
 use tap_primitives::encoding::asset::encode_asset;
 use tap_primitives::proof::{
@@ -64,15 +66,50 @@ pub struct Bip86Output {
     pub internal_key: SerializedKey,
 }
 
+/// Options for proof suffix creation, the Rust analogue of Go's
+/// `proof.GenConfig` (proof/append.go).
+///
+/// The defaults mirror Go's `proof.DefaultGenConfig` in v0.8.99: the
+/// proof version is stamped `TransitionV0`, while STXO alt leaves and
+/// STXO inclusion/exclusion proofs are still generated for transfer
+/// root assets (verifiers validate them when present but only require
+/// them for V1 proofs). Pass `transition_version: TransitionVersion::V1`
+/// (Go's `proof.WithVersion(TransitionV1)`) to stamp V1 and make the
+/// STXO proofs mandatory at verification time.
+#[derive(Clone, Debug)]
+pub struct ProofSuffixOptions {
+    /// The transition version stamped on the created proof (Go's
+    /// `GenConfig.TransitionVersion`, default `TransitionV0`).
+    pub transition_version: TransitionVersion,
+    /// Skips the generation of STXO inclusion and exclusion proofs
+    /// (Go's `proof.WithNoSTXOProofs`, used for asset channels). The
+    /// target output's commitment must then have been built without
+    /// STXO alt leaves as well.
+    pub no_stxo_proofs: bool,
+}
+
+impl Default for ProofSuffixOptions {
+    fn default() -> Self {
+        ProofSuffixOptions {
+            transition_version: TransitionVersion::V0,
+            no_stxo_proofs: false,
+        }
+    }
+}
+
 /// Creates the transition proof suffix for the asset output at
-/// `out_index` within `asset_outputs`, mirroring Go's
-/// `tapsend.CreateProofSuffix`:
+/// `out_index` within `asset_outputs` with default
+/// [`ProofSuffixOptions`], mirroring Go's `tapsend.CreateProofSuffix`
+/// without options:
 ///
 /// - a real inclusion proof from the output's commitment tree,
 /// - for split assets, a split root proof pointing at the root asset's
 ///   output (whose committed root asset must match the split witness),
 /// - exclusion proofs for all other asset outputs (non-inclusion
-///   commitment proofs) and all `bip86_outputs` (tapscript proofs).
+///   commitment proofs) and all `bip86_outputs` (tapscript proofs),
+/// - for transfer root assets, STXO alt leaves plus STXO inclusion and
+///   exclusion proofs (unless opted out via
+///   [`ProofSuffixOptions::no_stxo_proofs`]).
 ///
 /// `prev_out` is the anchor outpoint of the (first) input being spent,
 /// Go's `vPacket.Inputs[0].PrevID.OutPoint`. Chain data (block header,
@@ -84,6 +121,28 @@ pub fn create_proof_suffix(
     asset_outputs: &[OutputProofInfo<'_>],
     out_index: usize,
     bip86_outputs: &[Bip86Output],
+) -> Result<proof::Proof, String> {
+    create_proof_suffix_with_options(
+        anchor_tx,
+        prev_out,
+        asset_outputs,
+        out_index,
+        bip86_outputs,
+        &ProofSuffixOptions::default(),
+    )
+}
+
+/// Creates the transition proof suffix for the asset output at
+/// `out_index` with explicit [`ProofSuffixOptions`], mirroring Go's
+/// `tapsend.CreateProofSuffix` with `proof.GenOption`s. See
+/// [`create_proof_suffix`].
+pub fn create_proof_suffix_with_options(
+    anchor_tx: &bitcoin::Transaction,
+    prev_out: OutPoint,
+    asset_outputs: &[OutputProofInfo<'_>],
+    out_index: usize,
+    bip86_outputs: &[Bip86Output],
+    options: &ProofSuffixOptions,
 ) -> Result<proof::Proof, String> {
     let target = asset_outputs
         .get(out_index)
@@ -113,14 +172,6 @@ pub fn create_proof_suffix(
     }
     inclusion_commitment_proof.tap_sibling_preimage =
         target.tapscript_sibling.clone();
-
-    let inclusion_proof = TaprootProof {
-        output_index: target.anchor_output_index,
-        internal_key: target.internal_key,
-        commitment_proof: Some(inclusion_commitment_proof),
-        tapscript_proof: None,
-        unknown_odd_types: BTreeMap::new(),
-    };
 
     // Split root proof, if the target is a split asset
     // (proof/append.go:295).
@@ -152,11 +203,38 @@ pub fn create_proof_suffix(
             tapscript_sibling: None,
         });
     }
-    let exclusion_proofs = generate_exclusion_proofs(
+    let mut exclusion_proofs = generate_exclusion_proofs(
         target.asset,
         target.anchor_output_index,
         &other_outputs,
     )?;
+
+    // STXO proofs for transfer root assets: inclusion proofs for the
+    // spent-asset markers committed to in the target output (Go
+    // proof/append.go CreateTransitionProof:209) and exclusion proofs
+    // showing they are absent from every other asset-carrying output
+    // (Go tapsend/proof.go addSTXOExclusionProofs). Genesis assets and
+    // split leaves are exempt (`IsTransferRoot`).
+    if target.asset.is_transfer_root() && !options.no_stxo_proofs {
+        add_stxo_proofs(
+            target,
+            &other_outputs,
+            &mut inclusion_commitment_proof,
+            &mut exclusion_proofs,
+        )?;
+    }
+
+    let inclusion_proof = TaprootProof {
+        output_index: target.anchor_output_index,
+        internal_key: target.internal_key,
+        commitment_proof: Some(inclusion_commitment_proof),
+        tapscript_proof: None,
+        unknown_odd_types: BTreeMap::new(),
+    };
+
+    // Copy any alt leaves from the anchor commitment to the proof
+    // (Go proof/append.go CreateTransitionProof: FetchAltLeaves).
+    let alt_leaves = target.commitment.fetch_alt_leaves();
 
     // The chain data is not final yet: like Go's `newParams`, we embed
     // the anchor transaction in a pseudo block containing only that
@@ -167,7 +245,7 @@ pub fn create_proof_suffix(
         .ok_or_else(|| "failed to build tx merkle proof".to_string())?;
 
     Ok(proof::Proof {
-        version: TransitionVersion::V0,
+        version: options.transition_version,
         prev_out,
         block_header: BlockHeader([0u8; 80]),
         block_height: 0,
@@ -182,9 +260,149 @@ pub fn create_proof_suffix(
         challenge_witness: None,
         genesis_reveal: None,
         group_key_reveal: None,
-        alt_leaves: vec![],
+        alt_leaves,
         unknown_odd_types: BTreeMap::new(),
     })
+}
+
+/// Generates the STXO inclusion proofs for the target output and the
+/// STXO exclusion proofs for all other asset-carrying outputs of a
+/// transfer root asset.
+///
+/// Inclusion (Go proof/append.go CreateTransitionProof): for each
+/// previous witness, the spent-asset marker derived from its `PrevId`
+/// must be committed to under `EMPTY_GENESIS_ID` in the target
+/// output's commitment; the resulting proof is stored in the inclusion
+/// commitment proof's `stxo_proofs`, keyed by the marker's serialized
+/// burn key.
+///
+/// Exclusion (Go tapsend/proof.go addSTXOExclusionProofs): for every
+/// exclusion proof that carries a commitment proof (i.e. the output
+/// holds a Taproot Asset commitment), a non-inclusion proof for each
+/// spent-asset marker is stored in that commitment proof's
+/// `stxo_proofs`. Outputs covered by tapscript (BIP-86) proofs carry
+/// no assets and are skipped.
+fn add_stxo_proofs(
+    target: &OutputProofInfo<'_>,
+    other_outputs: &[AnchorOutputInfo<'_>],
+    inclusion_commitment_proof: &mut CommitmentProof,
+    exclusion_proofs: &mut [TaprootProof],
+) -> Result<(), String> {
+    let empty_id = *EMPTY_GENESIS_ID.as_bytes();
+
+    // The commitment construction step must already have merged the
+    // STXO alt leaves for this asset (Go: "no alt leaves for transfer
+    // root asset").
+    let alt_commitment = target
+        .commitment
+        .asset_commitments()
+        .get(&empty_id)
+        .ok_or_else(|| {
+            "no alt leaves for transfer root asset".to_string()
+        })?;
+
+    // A transfer root must have previous witnesses.
+    if target.asset.prev_witnesses.is_empty() {
+        return Err("no prev witnesses for transfer root asset".to_string());
+    }
+
+    // We should have at least as many alt leaves as prev witnesses;
+    // additional alt leaves unrelated to STXO proofs are allowed.
+    if alt_commitment.assets().len() < target.asset.prev_witnesses.len() {
+        return Err(
+            "not enough alt leaves for transfer root asset".to_string()
+        );
+    }
+
+    // The spent-asset markers, one per previous witness.
+    let stxo_assets = asset::collect_stxo(target.asset)
+        .map_err(|e| format!("error collecting STXO assets: {}", e))?;
+
+    // STXO inclusion proofs from the target output's commitment.
+    let mut stxo_inclusion_proofs: BTreeMap<SerializedKey, CommitmentProof> =
+        BTreeMap::new();
+    for spent_asset in &stxo_assets {
+        let (found, stxo_proof) = target
+            .commitment
+            .proof(&empty_id, &spent_asset.asset_commitment_key())
+            .map_err(|e| e.to_string())?;
+
+        // STXO inclusion proofs must prove presence and always include
+        // a valid asset-level proof.
+        if found.is_none() {
+            return Err(format!(
+                "STXO asset not committed to in output {}",
+                target.anchor_output_index
+            ));
+        }
+        if stxo_proof.asset_proof.is_none() {
+            return Err("missing asset proof in STXO inclusion".to_string());
+        }
+
+        stxo_inclusion_proofs
+            .insert(*spent_asset.script_key.serialized(), stxo_proof);
+    }
+
+    // Each spent input corresponds to one entry in prev_witnesses, so
+    // the counts must match (duplicate PrevIds would collapse here).
+    if stxo_inclusion_proofs.len() != target.asset.prev_witnesses.len() {
+        return Err(format!(
+            "stxo inclusion proof count mismatch: expected {}, got {}",
+            target.asset.prev_witnesses.len(),
+            stxo_inclusion_proofs.len()
+        ));
+    }
+
+    inclusion_commitment_proof.stxo_proofs = stxo_inclusion_proofs;
+
+    // STXO exclusion proofs against every other asset-carrying output.
+    for exclusion_proof in exclusion_proofs.iter_mut() {
+        let Some(cp) = exclusion_proof.commitment_proof.as_mut() else {
+            // Outputs without assets are covered by their tapscript
+            // (BIP-86) exclusion proofs.
+            continue;
+        };
+
+        let out_tree = other_outputs
+            .iter()
+            .find(|out| {
+                out.output_index == exclusion_proof.output_index
+            })
+            .and_then(|out| out.commitment)
+            .ok_or_else(|| {
+                format!(
+                    "no commitment tree for excluded output {}",
+                    exclusion_proof.output_index
+                )
+            })?;
+
+        let mut stxo_exclusion_proofs: BTreeMap<
+            SerializedKey,
+            CommitmentProof,
+        > = BTreeMap::new();
+        for spent_asset in &stxo_assets {
+            let (found, stxo_proof) = out_tree
+                .proof(&empty_id, &spent_asset.asset_commitment_key())
+                .map_err(|e| e.to_string())?;
+
+            // The spent asset must NOT be committed to in any other
+            // output, otherwise the transfer double-spends the input.
+            if found.is_some() {
+                return Err(format!(
+                    "STXO asset committed to in output {}; cannot create \
+                     exclusion proof",
+                    exclusion_proof.output_index
+                ));
+            }
+
+            stxo_exclusion_proofs
+                .insert(*spent_asset.script_key.serialized(), stxo_proof);
+        }
+
+        cp.stxo_proofs = stxo_exclusion_proofs;
+    }
+
+    Ok(())
 }
 
 /// Creates the split root proof for a split asset: an inclusion proof

@@ -24,7 +24,9 @@ pub mod encode;
 pub mod file;
 pub mod meta;
 pub mod ownership;
+pub mod send_fragment;
 pub mod tx_merkle;
+pub mod tx_proof;
 pub mod types;
 pub mod verify;
 
@@ -43,12 +45,17 @@ pub use ownership::{
     create_ownership_proof_asset, gen_challenge_nums, prove_ownership,
     verify_challenge_witness,
 };
+pub use send_fragment::{
+    SendFragment, SendFragmentVersion, SendOutput,
+    LATEST_SEND_FRAGMENT_VERSION, MAX_SEND_FRAGMENT_OUTPUTS,
+};
 pub use tx_merkle::TxMerkleProof;
+pub use tx_proof::TxProof;
 pub use types::*;
 pub use verify::{
     tx_spends_prev_out, ChainLookup, DefaultMerkleVerifier,
-    FixedHeightChainLookup, GroupVerifier, HeaderVerifier, MerkleVerifier,
-    ProofVerificationOptions, VerifierCtx,
+    FixedHeightChainLookup, GroupVerifier, HeaderVerifier, IgnoreChecker,
+    MerkleVerifier, NoIgnoreChecker, ProofVerificationOptions, VerifierCtx,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use verify::{TrustAllGroups, TrustAllHeaders};
@@ -75,6 +82,17 @@ pub enum ProofError {
     InvalidInclusionProof(String),
     InvalidExclusionProof(String),
     VerificationFailed(String),
+    /// The claimed outpoint's hash does not match the transaction hash
+    /// in a [`TxProof`]. Matches Go's `ErrHashMismatch`.
+    HashMismatch,
+    /// The claimed outpoint's output index is invalid for the
+    /// transaction in a [`TxProof`]. Matches Go's
+    /// `ErrOutputIndexInvalid`.
+    OutputIndexInvalid,
+    /// The claimed output script does not match the constructed
+    /// Taproot output key script in a [`TxProof`]. Matches Go's
+    /// `ErrClaimedOutputScriptMismatch`.
+    ClaimedOutputScriptMismatch,
 }
 
 impl std::fmt::Display for ProofError {
@@ -130,6 +148,19 @@ impl std::fmt::Display for ProofError {
             }
             ProofError::VerificationFailed(msg) => {
                 write!(f, "verification failed: {}", msg)
+            }
+            ProofError::HashMismatch => {
+                write!(f, "outpoint hash does not match tx hash")
+            }
+            ProofError::OutputIndexInvalid => {
+                write!(f, "output index is invalid for tx")
+            }
+            ProofError::ClaimedOutputScriptMismatch => {
+                write!(
+                    f,
+                    "claimed output pk script doesn't match \
+                     constructed Taproot output key pk script"
+                )
             }
         }
     }

@@ -184,6 +184,11 @@ pub enum CommitmentError {
     MismatchedTapKey,
     MismatchedAssetType,
     InvalidProof(String),
+    /// An asset is not a valid alt leaf (Go's `Asset.ValidateAltLeaf`).
+    InvalidAltLeaf(String),
+    /// An alt leaf collides with another new or already committed alt
+    /// leaf (Go's `asset.ErrDuplicateAltLeafKey`).
+    DuplicateAltLeafKey([u8; 32]),
 }
 
 impl std::fmt::Display for CommitmentError {
@@ -201,6 +206,16 @@ impl std::fmt::Display for CommitmentError {
             }
             CommitmentError::InvalidProof(msg) => {
                 write!(f, "invalid proof: {}", msg)
+            }
+            CommitmentError::InvalidAltLeaf(msg) => {
+                write!(f, "invalid alt leaf: {}", msg)
+            }
+            CommitmentError::DuplicateAltLeafKey(key) => {
+                write!(
+                    f,
+                    "duplicate alt leaf key: {}",
+                    crate::hex::encode(key)
+                )
             }
         }
     }

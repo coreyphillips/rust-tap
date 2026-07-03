@@ -24,12 +24,47 @@ pub struct UniverseId {
 }
 
 /// What kind of proofs a universe stores.
+///
+/// Mirrors Go's `universe.ProofType` (universe/interface.go:820).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ProofType {
     /// Only issuance (genesis) proofs.
     Issuance,
     /// All transfer proofs.
     Transfer,
+    /// Signed ignore tuples (supply commitment ignore sub-tree).
+    Ignore,
+    /// Burn proofs (supply commitment burn sub-tree).
+    Burn,
+    /// Mint proofs within the supply commitment mint sub-tree.
+    MintSupply,
+}
+
+impl ProofType {
+    /// Returns the Go-compatible string representation
+    /// (universe/interface.go `ProofType.String`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProofType::Issuance => "issuance",
+            ProofType::Transfer => "transfer",
+            ProofType::Ignore => "ignore",
+            ProofType::Burn => "burn",
+            ProofType::MintSupply => "mint_supply",
+        }
+    }
+
+    /// Parses the Go-compatible string representation
+    /// (universe/interface.go `ParseStrProofType`).
+    pub fn from_str_name(s: &str) -> Option<ProofType> {
+        match s {
+            "issuance" => Some(ProofType::Issuance),
+            "transfer" => Some(ProofType::Transfer),
+            "ignore" => Some(ProofType::Ignore),
+            "burn" => Some(ProofType::Burn),
+            "mint_supply" => Some(ProofType::MintSupply),
+            _ => None,
+        }
+    }
 }
 
 /// The type of sync to perform.

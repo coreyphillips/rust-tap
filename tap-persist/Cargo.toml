@@ -8,6 +8,7 @@ description = "Persistence layer for Taproot Assets (in-memory and file-backed s
 tap-primitives = { path = "../tap-primitives" }
 tap-onchain = { path = "../tap-onchain" }
 tap-universe = { path = "../tap-universe" }
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 bitcoin_hashes = { version = "0.14", default-features = false, features = ["std"] }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 

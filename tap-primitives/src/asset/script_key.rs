@@ -99,6 +99,77 @@ pub struct TweakedScriptKey {
     pub key_type: ScriptKeyType,
 }
 
+/// The method used to derive the script key of an asset send output
+/// from the recipient's internal key and the asset ID of the output.
+/// Mirrors Go's `asset.ScriptKeyDerivationMethod` (asset/asset.go:1266).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ScriptKeyDerivationMethod {
+    /// The script key is derived using the recipient's internal key
+    /// and a single leaf that contains an un-spendable Pedersen
+    /// commitment key (`OP_CHECKSIG <NUMS_key + asset_id * G>`),
+    /// yielding unique script keys per asset ID to avoid universe
+    /// proof collisions.
+    UniquePedersen = 0,
+}
+
+/// Derives a unique script key for the given asset ID using the
+/// recipient's internal key and the specified derivation method,
+/// mirroring Go's `asset.DeriveUniqueScriptKey` (asset/asset.go:1282).
+///
+/// For [`ScriptKeyDerivationMethod::UniquePedersen`] the script key is
+/// the taproot output key of the internal key with a single-leaf
+/// tapscript tree whose leaf is the Pedersen commitment based
+/// non-spendable leaf committing to the asset ID. The returned key is
+/// even-Y normalized (schnorr serialize/parse in Go), with the leaf
+/// tap hash recorded as the tweak.
+pub fn derive_unique_script_key(
+    internal_key: SerializedKey,
+    asset_id: &super::genesis::AssetId,
+    method: ScriptKeyDerivationMethod,
+) -> Result<ScriptKey, AssetError> {
+    use super::group_key::{
+        new_non_spendable_script_leaf, PEDERSEN_VERSION,
+    };
+    use crate::crypto::tapscript::{tap_leaf_hash, taproot_output_key};
+
+    match method {
+        ScriptKeyDerivationMethod::UniquePedersen => {
+            let (leaf_version, leaf_script) =
+                new_non_spendable_script_leaf(
+                    PEDERSEN_VERSION,
+                    asset_id.as_bytes(),
+                )
+                .map_err(|e| {
+                    AssetError::EncodingError(format!(
+                        "unable to create non-spendable leaf: {}",
+                        e
+                    ))
+                })?;
+
+            let root_hash = tap_leaf_hash(leaf_version, &leaf_script);
+            // Go round-trips the output key through schnorr
+            // serialize/parse, which normalizes it to even Y (0x02).
+            let output_x_only =
+                taproot_output_key(&internal_key, &root_hash)
+                    .map_err(AssetError::InvalidKey)?;
+
+            let mut pub_key = [0u8; 33];
+            pub_key[0] = 0x02;
+            pub_key[1..].copy_from_slice(&output_x_only);
+
+            Ok(ScriptKey {
+                pub_key: SerializedKey(pub_key),
+                tweaked: Some(TweakedScriptKey {
+                    raw_key: internal_key,
+                    tweak: root_hash.to_vec(),
+                    key_type: ScriptKeyType::UniquePedersen,
+                }),
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

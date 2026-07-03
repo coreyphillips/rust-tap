@@ -6,10 +6,14 @@ description = "Universe sync and federation for Taproot Assets"
 
 [dependencies]
 tap-primitives = { path = "../tap-primitives" }
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 bitcoin_hashes = { version = "0.14", default-features = false, features = ["std"] }
 ureq = { version = "2", optional = true, features = ["json"] }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+tap-primitives = { path = "../tap-primitives", features = ["test-utils"] }
 
 [features]
 default = ["http-client"]

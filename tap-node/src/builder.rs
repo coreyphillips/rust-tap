@@ -17,8 +17,10 @@ use tap_ldk::rfq::PriceOracle;
 use tap_onchain::chain::{AssetSigner, ChainBridge, KeyRing, WalletAnchor};
 use tap_onchain::mint::Planter;
 use tap_onchain::proof::courier::Courier;
+use tap_onchain::proof::mailbox::{MailboxSigner, MailboxTransport};
 use tap_persist::asset_store::{AssetStore, MemoryAssetStore};
 use tap_persist::batch_store::{BatchStore, MemoryBatchStore};
+use tap_persist::mailbox_store::{MailboxStore, MemoryMailboxStore};
 use tap_persist::proof_store::{MemoryProofStore, ProofStore};
 use tap_universe::memory::{MemoryFederationDb, MemoryUniverseBackend};
 
@@ -79,6 +81,9 @@ pub struct TapNodeBuilder<C, W, K, L, P> {
     proof_store: Option<Box<dyn ProofStore + Send>>,
     batch_store: Option<Box<dyn BatchStore + Send>>,
     courier: Option<Box<dyn Courier + Send + Sync>>,
+    mailbox_transport: Option<Box<dyn MailboxTransport + Send + Sync>>,
+    mailbox_signer: Option<Box<dyn MailboxSigner + Send + Sync>>,
+    mailbox_store: Option<Box<dyn MailboxStore + Send>>,
 }
 
 impl<C, W, K, L, P> TapNodeBuilder<C, W, K, L, P>
@@ -102,6 +107,9 @@ where
             proof_store: None,
             batch_store: None,
             courier: None,
+            mailbox_transport: None,
+            mailbox_signer: None,
+            mailbox_store: None,
         }
     }
 
@@ -171,6 +179,37 @@ where
         self
     }
 
+    /// Sets the auth mailbox transport used for V2 address receives.
+    /// Without a transport, `poll_mailbox` is a documented no-op.
+    pub fn set_mailbox_transport(
+        mut self,
+        transport: Box<dyn MailboxTransport + Send + Sync>,
+    ) -> Self {
+        self.mailbox_transport = Some(transport);
+        self
+    }
+
+    /// Sets the mailbox signer (ECDH + challenge signing) used to
+    /// decrypt incoming send fragments. Required when a mailbox
+    /// transport is configured.
+    pub fn set_mailbox_signer(
+        mut self,
+        signer: Box<dyn MailboxSigner + Send + Sync>,
+    ) -> Self {
+        self.mailbox_signer = Some(signer);
+        self
+    }
+
+    /// Overrides the default (in-memory) address book / mailbox cursor
+    /// store.
+    pub fn set_mailbox_store(
+        mut self,
+        store: Box<dyn MailboxStore + Send>,
+    ) -> Self {
+        self.mailbox_store = Some(store);
+        self
+    }
+
     /// Builds the [`TapNode`].
     ///
     /// Returns an error if required backends are missing.
@@ -205,6 +244,11 @@ where
         // Create courier.
         let courier: Box<dyn Courier + Send + Sync> =
             self.courier.unwrap_or_else(|| Box::new(NoCourier));
+
+        // Mailbox store (defaults to in-memory).
+        let mailbox_store: Box<dyn MailboxStore + Send> = self
+            .mailbox_store
+            .unwrap_or_else(|| Box::new(MemoryMailboxStore::new()));
 
         // Create planter with Arc-wrapped backends.
         let planter = Planter::new(
@@ -244,6 +288,9 @@ where
             proof_store: Mutex::new(proof_store),
             batch_store: Mutex::new(batch_store),
             courier,
+            mailbox_transport: self.mailbox_transport,
+            mailbox_signer: self.mailbox_signer,
+            mailbox_store: Mutex::new(mailbox_store),
             universe_backend: Mutex::new(universe_backend),
             federation_db: Mutex::new(federation_db),
             event_bus,

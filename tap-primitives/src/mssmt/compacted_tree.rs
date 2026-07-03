@@ -24,6 +24,7 @@ use super::tree::{check_sum_overflow_u64, TreeError};
 ///
 /// Functionally identical to [`super::tree::FullTree`] but much more
 /// storage-efficient for sparse trees.
+#[derive(Clone, Debug)]
 pub struct CompactedTree<S: TreeStoreUpdateTx> {
     pub store: S,
 }

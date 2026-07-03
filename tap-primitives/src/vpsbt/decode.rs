@@ -333,14 +333,21 @@ fn decode_alt_leaves(value: &[u8]) -> Result<Vec<Asset>, VPsbtError> {
         return Err(decode_err("too many alt leaves"));
     }
     let mut leaves = Vec::with_capacity(count as usize);
+    let mut leaf_keys = std::collections::BTreeSet::new();
     for _ in 0..count {
         let (leaf_bytes, consumed) = decode_var_bytes(&value[offset..])
             .map_err(|e| decode_err(e.to_string()))?;
         offset += consumed;
-        leaves.push(
-            decode_asset(&leaf_bytes)
-                .map_err(|e| decode_err(e.to_string()))?,
-        );
+        let leaf = decode_asset(&leaf_bytes)
+            .map_err(|e| decode_err(e.to_string()))?;
+
+        // Each alt leaf must have a unique script key, matching Go's
+        // AltLeavesDecoder (asset.ErrDuplicateScriptKeys).
+        if !leaf_keys.insert(*leaf.script_key.serialized()) {
+            return Err(decode_err("duplicate alt leaf script key"));
+        }
+
+        leaves.push(leaf);
     }
     if offset != value.len() {
         return Err(decode_err("trailing bytes after alt leaves"));

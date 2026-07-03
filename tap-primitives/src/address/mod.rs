@@ -33,7 +33,10 @@ use std::collections::BTreeMap;
 
 use bech32::{Bech32m, Hrp};
 
-use crate::asset::{AssetId, AssetType, SerializedKey};
+use crate::asset::{
+    derive_unique_script_key, AssetId, AssetType,
+    ScriptKeyDerivationMethod, SerializedKey,
+};
 use crate::commitment::TapCommitmentVersion;
 use crate::encoding::bigsize::{decode_bigsize, encode_bigsize};
 
@@ -671,6 +674,38 @@ impl TapAddress {
     pub fn uses_send_manifests(&self) -> bool {
         self.version == AddressVersion::V2
     }
+
+    /// Returns the script key of this address for the given asset ID,
+    /// mirroring Go's `Tap.ScriptKeyForAssetID` (address/address.go).
+    ///
+    /// For addresses before V2, the script key is always the Taproot
+    /// output key as specified in the address directly. For V2
+    /// addresses, the stored script key acts as an internal key that is
+    /// used to derive a unique Taproot output key per asset ID using a
+    /// Pedersen commitment
+    /// ([`ScriptKeyDerivationMethod::UniquePedersen`]).
+    pub fn script_key_for_asset_id(
+        &self,
+        asset_id: &AssetId,
+    ) -> Result<SerializedKey, AddressError> {
+        if self.version != AddressVersion::V2 {
+            return Ok(self.script_key);
+        }
+
+        let script_key = derive_unique_script_key(
+            self.script_key,
+            asset_id,
+            ScriptKeyDerivationMethod::UniquePedersen,
+        )
+        .map_err(|e| {
+            AddressError::InvalidPayload(format!(
+                "unable to derive unique script key: {}",
+                e
+            ))
+        })?;
+
+        Ok(script_key.pub_key)
+    }
 }
 
 /// Pushes a TLV record with a u8 type number.
@@ -1070,6 +1105,61 @@ mod tests {
             TapAddress::decode(&encoded),
             Err(AddressError::MissingField("asset_id"))
         ));
+    }
+
+    #[test]
+    fn test_script_key_for_asset_id_non_v2() {
+        // Non-V2 addresses return the stored script key unchanged,
+        // matching Go's ScriptKeyForAssetID.
+        for version in [AddressVersion::V0, AddressVersion::V1] {
+            let mut addr = test_address();
+            addr.version = version;
+            let key = addr
+                .script_key_for_asset_id(&AssetId([0x11; 32]))
+                .unwrap();
+            assert_eq!(key, addr.script_key);
+        }
+    }
+
+    #[test]
+    fn test_script_key_for_asset_id_v2_derives_unique_keys() {
+        use crate::asset::{
+            derive_unique_script_key, ScriptKeyDerivationMethod,
+        };
+
+        // Use a real curve point as the address script key so that
+        // the Pedersen derivation succeeds.
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&[0x42; 32])
+            .unwrap();
+        let internal =
+            SerializedKey(sk.public_key(&secp).serialize());
+
+        let mut addr = test_address();
+        addr.version = AddressVersion::V2;
+        addr.script_key = internal;
+        addr.proof_courier_addr =
+            Some("authmailbox+universerpc://foo.bar:10029".to_string());
+
+        let id_a = AssetId([0x11; 32]);
+        let id_b = AssetId([0x22; 32]);
+
+        let key_a = addr.script_key_for_asset_id(&id_a).unwrap();
+        let key_b = addr.script_key_for_asset_id(&id_b).unwrap();
+
+        // V2 derivation is per asset ID and never the raw key.
+        assert_ne!(key_a, addr.script_key);
+        assert_ne!(key_a, key_b);
+
+        // It matches the shared derivation helper (the same one Go's
+        // DeriveUniqueScriptKey backs).
+        let expected = derive_unique_script_key(
+            internal,
+            &id_a,
+            ScriptKeyDerivationMethod::UniquePedersen,
+        )
+        .unwrap();
+        assert_eq!(key_a, expected.pub_key);
     }
 
     #[test]
