@@ -102,6 +102,47 @@ impl FakeChain {
         txid
     }
 
+    /// Scripts a confirmation like [`FakeChain::confirm_tx`], but with
+    /// a fully verifiable single-transaction block: the header's
+    /// merkle root is the txid, the confirmation's block hash is the
+    /// header's real hash, and the block hash is registered so header
+    /// verification against `get_block_hash` passes. Returns the
+    /// internal-order txid and the block hash.
+    pub fn confirm_tx_valid(
+        &self,
+        tx_bytes: &[u8],
+        height: u32,
+    ) -> ([u8; 32], [u8; 32]) {
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(tx_bytes)
+                .expect("valid tx bytes");
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(tx.compute_txid().as_ref());
+
+        let mut header_bytes = [0u8; 80];
+        header_bytes[0] = 0x20;
+        // Single-tx block: the merkle root is the txid itself.
+        header_bytes[36..68].copy_from_slice(&txid);
+        header_bytes[68..72].copy_from_slice(&height.to_le_bytes());
+        let header = tap_primitives::proof::BlockHeader(header_bytes);
+        let block_hash = header.block_hash();
+
+        self.set_block_hash(height, block_hash);
+        let conf = TxConfirmation {
+            block_hash,
+            block_height: height,
+            tx_index: 0,
+            tx: tx_bytes.to_vec(),
+            block_header: header_bytes,
+            block_tx_hashes: vec![txid],
+        };
+        self.confirmations
+            .lock()
+            .expect("confirmations lock")
+            .insert(txid, conf);
+        (txid, block_hash)
+    }
+
     /// The most recently broadcast raw transaction.
     pub fn last_broadcast(&self) -> Option<Vec<u8>> {
         self.broadcasts
@@ -210,8 +251,15 @@ impl WalletAnchor for FakeWallet {
         tx.version = Version::TWO;
         tx.lock_time = LockTime::ZERO;
 
-        let psbt = bitcoin::psbt::Psbt::from_unsigned_tx(tx)
+        let mut psbt = bitcoin::psbt::Psbt::from_unsigned_tx(tx)
             .map_err(|e| ChainError::PsbtFailed(format!("psbt: {}", e)))?;
+        // A real wallet populates the witness UTXO of the inputs it
+        // adds; BIP-341 sighashes (supply commitment signing) need
+        // every input's prevout.
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: ScriptBuf::new_op_return([0xFA; 4]),
+        });
         Ok(psbt.serialize())
     }
 
@@ -221,7 +269,16 @@ impl WalletAnchor for FakeWallet {
     ) -> Result<Vec<u8>, ChainError> {
         let psbt = bitcoin::psbt::Psbt::deserialize(funded_psbt)
             .map_err(|e| ChainError::PsbtFailed(format!("psbt: {}", e)))?;
-        Ok(bitcoin::consensus::serialize(&psbt.unsigned_tx))
+        // Carry over final witnesses the caller already provided
+        // (e.g. the supply pipeline's key-path signatures), like a
+        // real finalizer would.
+        let mut tx = psbt.unsigned_tx.clone();
+        for (i, input) in psbt.inputs.iter().enumerate() {
+            if let Some(witness) = &input.final_script_witness {
+                tx.input[i].witness = witness.clone();
+            }
+        }
+        Ok(bitcoin::consensus::serialize(&tx))
     }
 
     fn import_taproot_output(
@@ -347,6 +404,31 @@ impl AssetSigner for FakeKeys {
         // `Some(root)` (V2 unique Pedersen script keys), per the
         // contract.
         self.sign_with_tweak(signing_key, virtual_tx, tapscript_root)
+    }
+
+    fn sign_message_schnorr(
+        &self,
+        signing_key: &KeyDescriptor,
+        message_digest: &[u8],
+    ) -> Result<Vec<u8>, ChainError> {
+        // RAW (untweaked) key signing, per the contract (delegation
+        // key signed ignore tuples).
+        let digest: [u8; 32] = message_digest.try_into().map_err(|_| {
+            ChainError::SigningFailed("expected 32-byte digest".into())
+        })?;
+        if signing_key.pub_key != Self::pub_key_for(signing_key.index) {
+            return Err(ChainError::SigningFailed(
+                "unknown key descriptor".into(),
+            ));
+        }
+        let secp = Secp256k1::new();
+        let keypair = secp256k1::Keypair::from_secret_key(
+            &secp,
+            &Self::secret_for(signing_key.index),
+        );
+        let msg = secp256k1::Message::from_digest(digest);
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+        Ok(sig.serialize().to_vec())
     }
 }
 

@@ -268,6 +268,40 @@ pub trait AssetSigner {
             )),
         }
     }
+
+    /// Signs a 32-byte message digest with the RAW (untweaked) private
+    /// key of `signing_key`, returning a 64-byte BIP-340 Schnorr
+    /// signature.
+    ///
+    /// Unlike [`AssetSigner::sign_virtual_tx`] (which applies the
+    /// BIP-86 taproot tweak) and
+    /// [`AssetSigner::sign_virtual_tx_tweaked`] (BIP-341 tapscript
+    /// tweak), no key tweak is applied here. This is the equivalent of
+    /// lnd's `SignMessageSchnorr`, used by the supply commitment
+    /// pipeline to sign ignore tuples with the group's delegation key:
+    /// verifiers check the signature against the raw delegation public
+    /// key. The caller passes the final BIP-340 message (the ignore
+    /// flow passes `IgnoreTuple::signing_digest()`, which already
+    /// includes lnd's extra SHA-256 of the tuple digest).
+    ///
+    /// The default implementation fails with a precise error so
+    /// implementations that predate this method keep compiling and
+    /// reject raw-key signing loudly rather than producing a signature
+    /// with the wrong tweak.
+    fn sign_message_schnorr(
+        &self,
+        signing_key: &KeyDescriptor,
+        message_digest: &[u8],
+    ) -> Result<Vec<u8>, ChainError> {
+        let _ = (signing_key, message_digest);
+        Err(ChainError::SigningFailed(
+            "this AssetSigner does not implement sign_message_schnorr: \
+             signing with the raw (untweaked) key (e.g. delegation-key \
+             signed ignore tuples) requires overriding \
+             AssetSigner::sign_message_schnorr"
+                .into(),
+        ))
+    }
 }
 
 /// Persistence interface for minting state.

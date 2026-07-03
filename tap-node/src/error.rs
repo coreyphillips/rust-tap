@@ -42,6 +42,8 @@ pub enum TapNodeError {
     Universe(String),
     /// Storage error.
     Storage(String),
+    /// Supply commitment pipeline error.
+    Supply(String),
     /// Asset not found.
     AssetNotFound(AssetId),
     /// Insufficient asset balance.
@@ -79,6 +81,9 @@ impl std::fmt::Display for TapNodeError {
             }
             TapNodeError::Storage(msg) => {
                 write!(f, "storage error: {}", msg)
+            }
+            TapNodeError::Supply(msg) => {
+                write!(f, "supply commitment error: {}", msg)
             }
             TapNodeError::AssetNotFound(id) => {
                 write!(f, "asset not found: {:?}", id)

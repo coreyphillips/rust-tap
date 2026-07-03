@@ -25,6 +25,11 @@ use tap_persist::pending_anchor_store::{
     MemoryPendingAnchorStore, PendingAnchorStore,
 };
 use tap_persist::proof_store::{MemoryProofStore, ProofStore};
+use tap_persist::supply_store::{
+    MemorySupplyCommitStore, MemorySupplyStagingStore,
+    MemorySupplyTreeStore, SupplyCommitStore, SupplyStagingStore,
+    SupplyTreeStore,
+};
 use tap_universe::memory::{MemoryFederationDb, MemoryUniverseBackend};
 
 use crate::config::TapNodeConfig;
@@ -104,6 +109,9 @@ pub struct TapNodeBuilder<C, W, K, L, P> {
     mailbox_transport: Option<Box<dyn MailboxTransport + Send + Sync>>,
     mailbox_signer: Option<Box<dyn MailboxSigner + Send + Sync>>,
     mailbox_store: Option<Box<dyn MailboxStore + Send>>,
+    supply_tree_store: Option<Box<dyn SupplyTreeStore + Send>>,
+    supply_commit_store: Option<Box<dyn SupplyCommitStore + Send>>,
+    supply_staging_store: Option<Box<dyn SupplyStagingStore + Send>>,
 }
 
 impl<C, W, K, L, P> TapNodeBuilder<C, W, K, L, P>
@@ -131,6 +139,9 @@ where
             mailbox_transport: None,
             mailbox_signer: None,
             mailbox_store: None,
+            supply_tree_store: None,
+            supply_commit_store: None,
+            supply_staging_store: None,
         }
     }
 
@@ -242,6 +253,36 @@ where
         self
     }
 
+    /// Overrides the default supply tree store (the persistent supply
+    /// MS-SMTs per asset group).
+    pub fn set_supply_tree_store(
+        mut self,
+        store: Box<dyn SupplyTreeStore + Send>,
+    ) -> Self {
+        self.supply_tree_store = Some(store);
+        self
+    }
+
+    /// Overrides the default supply commitment store (confirmed supply
+    /// commitments and pre-commitment outputs per asset group).
+    pub fn set_supply_commit_store(
+        mut self,
+        store: Box<dyn SupplyCommitStore + Send>,
+    ) -> Self {
+        self.supply_commit_store = Some(store);
+        self
+    }
+
+    /// Overrides the default supply staging store (the staged supply
+    /// update queue and supply key metadata).
+    pub fn set_supply_staging_store(
+        mut self,
+        store: Box<dyn SupplyStagingStore + Send>,
+    ) -> Self {
+        self.supply_staging_store = Some(store);
+        self
+    }
+
     /// Builds the [`TapNode`].
     ///
     /// Returns an error if required backends are missing.
@@ -271,7 +312,10 @@ where
             self.asset_store.is_none()
                 || self.proof_store.is_none()
                 || self.batch_store.is_none()
-                || self.pending_anchor_store.is_none(),
+                || self.pending_anchor_store.is_none()
+                || self.supply_tree_store.is_none()
+                || self.supply_commit_store.is_none()
+                || self.supply_staging_store.is_none(),
         )?;
         let asset_store: Box<dyn AssetStore + Send> = match self
             .asset_store
@@ -295,6 +339,21 @@ where
             match self.pending_anchor_store {
                 Some(store) => store,
                 None => default_pending_anchor_store(&default_db),
+            };
+        let supply_tree_store: Box<dyn SupplyTreeStore + Send> =
+            match self.supply_tree_store {
+                Some(store) => store,
+                None => default_supply_tree_store(&default_db),
+            };
+        let supply_commit_store: Box<dyn SupplyCommitStore + Send> =
+            match self.supply_commit_store {
+                Some(store) => store,
+                None => default_supply_commit_store(&default_db),
+            };
+        let supply_staging_store: Box<dyn SupplyStagingStore + Send> =
+            match self.supply_staging_store {
+                Some(store) => store,
+                None => default_supply_staging_store(&default_db),
             };
 
         // Reload the durable pending-anchor watch list so a restart
@@ -372,6 +431,10 @@ where
             mailbox_store: Mutex::new(mailbox_store),
             universe_backend: Mutex::new(universe_backend),
             federation_db: Mutex::new(federation_db),
+            supply_tree_store: Mutex::new(supply_tree_store),
+            supply_commit_store: Mutex::new(supply_commit_store),
+            supply_staging_store: Mutex::new(supply_staging_store),
+            last_supply_commit: Mutex::new(None),
             event_bus,
             event_receiver: Mutex::new(Some(event_receiver)),
             pending_anchors: Mutex::new(pending_anchors),
@@ -464,6 +527,48 @@ fn default_pending_anchor_store(
             ),
         ),
         _ => Box::new(MemoryPendingAnchorStore::new()),
+    }
+}
+
+fn default_supply_tree_store(
+    db: &Option<DefaultDb>,
+) -> Box<dyn SupplyTreeStore + Send> {
+    match db {
+        #[cfg(feature = "sqlite")]
+        Some(db) => Box::new(
+            tap_persist::supply_store::SqliteSupplyTreeStore::new(
+                Arc::clone(db),
+            ),
+        ),
+        _ => Box::new(MemorySupplyTreeStore::new()),
+    }
+}
+
+fn default_supply_commit_store(
+    db: &Option<DefaultDb>,
+) -> Box<dyn SupplyCommitStore + Send> {
+    match db {
+        #[cfg(feature = "sqlite")]
+        Some(db) => Box::new(
+            tap_persist::supply_store::SqliteSupplyCommitStore::new(
+                Arc::clone(db),
+            ),
+        ),
+        _ => Box::new(MemorySupplyCommitStore::new()),
+    }
+}
+
+fn default_supply_staging_store(
+    db: &Option<DefaultDb>,
+) -> Box<dyn SupplyStagingStore + Send> {
+    match db {
+        #[cfg(feature = "sqlite")]
+        Some(db) => Box::new(
+            tap_persist::supply_store::SqliteSupplyStagingStore::new(
+                Arc::clone(db),
+            ),
+        ),
+        _ => Box::new(MemorySupplyStagingStore::new()),
     }
 }
 

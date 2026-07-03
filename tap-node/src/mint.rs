@@ -24,13 +24,14 @@ use tap_ldk::rfq::PriceOracle;
 use tap_onchain::chain::{
     AssetSigner, ChainBridge, KeyRing, TxConfirmation, WalletAnchor,
 };
-use tap_onchain::mint::{BatchState, MintingBatch, Seedling};
+use tap_onchain::mint::{BatchState, MintError, MintingBatch, Seedling};
 use tap_onchain::proof::generate::GenesisProofParams;
 use tap_onchain::psbt::genesis::create_genesis_template;
 use tap_persist::asset_store::OwnedAsset;
 use tap_persist::proof_store::ProofLocator;
 use tap_primitives::asset::{
-    SerializedKey, TAPROOT_ASSETS_KEY_FAMILY,
+    GroupKey, GroupKeyReveal, GroupKeyRevealV1, GroupKeyVersion,
+    SerializedKey, PEDERSEN_VERSION, TAPROOT_ASSETS_KEY_FAMILY,
 };
 use tap_primitives::proof;
 
@@ -41,9 +42,15 @@ use crate::tasks::{AnchorKind, MintAnchor, PendingAnchor};
 use crate::types::{MintResult, MintedAsset};
 
 /// Queues an asset seedling for the next mint batch.
+///
+/// When the seedling's metadata opts into universe supply commitments
+/// but carries no delegation key, one is derived from the node's key
+/// ring and injected (Go's tapgarden equally resolves the delegation
+/// key during minting); the descriptor is persisted so the node can
+/// later sign with it (pre-commitment spends, ignore tuples).
 pub(crate) fn queue_mint<C, W, K, L, P>(
     node: &TapNode<C, W, K, L, P>,
-    seedling: Seedling,
+    mut seedling: Seedling,
 ) -> Result<(), TapNodeError>
 where
     C: ChainBridge + Send + Sync + 'static,
@@ -52,9 +59,44 @@ where
     L: LdkChannelOps + Send + Sync + 'static,
     P: PriceOracle + Send + Sync + 'static,
 {
+    if let Some(meta) = seedling.meta.as_mut() {
+        if meta.universe_commitments && meta.delegation_key.is_none() {
+            let desc =
+                node.keys.derive_next_key(TAPROOT_ASSETS_KEY_FAMILY)?;
+            node.supply_staging_store
+                .lock()
+                .expect("supply staging store lock")
+                .save_key_descriptor(&desc)
+                .map_err(TapNodeError::Storage)?;
+            meta.delegation_key = Some(desc.pub_key);
+        }
+    }
+
     let mut planter = node.planter.lock().expect("planter lock");
     planter.queue_seedling(seedling)?;
     Ok(())
+}
+
+/// Returns whether the seedling mints into an asset group: explicit
+/// emission enablement or universe supply commitments (which are only
+/// defined for grouped assets, matching Go).
+fn seedling_is_grouped(seedling: &Seedling) -> bool {
+    seedling.enable_emission
+        || seedling
+            .meta
+            .as_ref()
+            .map(|m| m.universe_commitments)
+            .unwrap_or(false)
+}
+
+/// Returns whether the seedling opted into universe supply
+/// commitments.
+fn seedling_wants_supply_commitments(seedling: &Seedling) -> bool {
+    seedling
+        .meta
+        .as_ref()
+        .map(|m| m.universe_commitments)
+        .unwrap_or(false)
 }
 
 /// Finalizes the pending mint batch.
@@ -150,6 +192,51 @@ where
         tap_onchain::mint::MintError::NoPendingBatch,
     ))?;
     let batch_key = batch.batch_key.clone();
+
+    // Universe supply commitments: seedlings that opted in share a
+    // single pre-commitment output paying to the delegation key. Go's
+    // tapgarden adds one pre-commitment output per batch
+    // (unfundedAnchorPsbt, planter.go:718), so a batch supports one
+    // universe-commitments delegation key.
+    let delegation_key = {
+        let mut keys: Vec<SerializedKey> = Vec::new();
+        for seedling in batch.seedlings.values() {
+            if !seedling_wants_supply_commitments(seedling) {
+                continue;
+            }
+            let key = seedling
+                .meta
+                .as_ref()
+                .and_then(|m| m.delegation_key)
+                .ok_or_else(|| {
+                    TapNodeError::Supply(
+                        "universe commitments require a delegation key \
+                         in the seedling metadata"
+                            .into(),
+                    )
+                })?;
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        if keys.len() > 1 {
+            return Err(TapNodeError::Supply(
+                "a mint batch supports at most one universe-commitments \
+                 delegation key"
+                    .into(),
+            ));
+        }
+        keys.into_iter().next()
+    };
+
+    // Tags of the seedlings minting into asset groups.
+    let grouped_tags: Vec<String> = batch
+        .seedlings
+        .values()
+        .filter(|s| seedling_is_grouped(s))
+        .map(|s| s.asset_name.clone())
+        .collect();
+
     save_batch(node, batch)?;
     node.event_bus.emit(TapEvent::MintBatchStateChanged {
         batch_key: batch_key.pub_key,
@@ -191,7 +278,23 @@ where
     )
     .map_err(|e| TapNodeError::Storage(format!("template: {}", e)))?;
 
-    let dummy_tx = bitcoin::consensus::serialize(&dummy_template.tx);
+    // Universe supply commitments: append the pre-commitment output,
+    // a P2TR output paying to the BIP-86 tweak of the delegation key
+    // with 1000 sats (Go's tapgarden.PreCommitTxOut, planter.go:3327,
+    // appended after the asset anchor output in unfundedAnchorPsbt).
+    // It does not depend on the genesis point, so it stays valid
+    // through the fund-once re-commit.
+    let mut template_tx = dummy_template.tx;
+    if let Some(dk) = &delegation_key {
+        let (value, script) = tap_universe::supply::pre_commit_tx_out(dk)
+            .map_err(|e| TapNodeError::Supply(e.to_string()))?;
+        template_tx.output.push(bitcoin::TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(script),
+        });
+    }
+
+    let dummy_tx = bitcoin::consensus::serialize(&template_tx);
     let funded = node.wallet.fund_psbt(&dummy_tx, fee_rate)?;
 
     let mut psbt = bitcoin::psbt::Psbt::deserialize(&funded)
@@ -226,6 +329,21 @@ where
     // output index. The seedlings (including metadata and script key
     // overrides) and the original batch key are preserved.
     planter.recommit_batch(real_genesis_point, tap_output_index)?;
+
+    // Step 4b: Attach group keys and group genesis witnesses to the
+    // grouped assets, then rebuild the batch commitment (grouped
+    // assets are keyed by group key in the TAP commitment). This must
+    // happen after the re-commit because the group key derivation
+    // commits to the final asset ID, which depends on the real genesis
+    // point.
+    let mut group_reveals: Vec<(String, GroupKeyReveal)> = Vec::new();
+    if !grouped_tags.is_empty() {
+        let keys = &node.keys;
+        let reveals = &mut group_reveals;
+        planter.update_sprouted_assets(|assets| {
+            attach_group_keys(&**keys, assets, &grouped_tags, reveals)
+        })?;
+    }
 
     let batch = planter.pending_batch().ok_or(TapNodeError::Mint(
         tap_onchain::mint::MintError::NoPendingBatch,
@@ -336,6 +454,7 @@ where
             name: asset.genesis.tag.clone(),
             amount: asset.amount,
             script_key: asset.script_key.pub_key,
+            group_key: asset.group_key.as_ref().map(|gk| gk.group_pub_key),
         });
     }
 
@@ -349,6 +468,8 @@ where
         kind: AnchorKind::Mint(MintAnchor {
             batch,
             internal_key: internal_key_desc.pub_key,
+            group_reveals,
+            delegation_key,
         }),
     };
     let stored = crate::anchor_codec::encode_pending_anchor(&anchor);
@@ -438,16 +559,68 @@ where
         .set_anchor_block_height(&anchor_outpoint, conf.block_height)
         .map_err(TapNodeError::Storage)?;
 
+    // When the anchor transaction carries a supply pre-commitment
+    // output (an extra P2TR output), the genesis proofs must carry an
+    // exclusion proof for it: a BIP-86 tapscript proof for the
+    // delegation key (Go equally excludes the pre-commitment output
+    // from the asset commitment proofs).
+    let pre_commit_exclusion = match &anchor.delegation_key {
+        Some(dk) => {
+            let anchor_tx: bitcoin::Transaction =
+                bitcoin::consensus::deserialize(&anchor_tx_bytes).map_err(
+                    |e| TapNodeError::Storage(format!("anchor tx: {}", e)),
+                )?;
+            let (value, script) =
+                tap_universe::supply::pre_commit_tx_out(dk)
+                    .map_err(|e| TapNodeError::Supply(e.to_string()))?;
+            let out_idx = anchor_tx
+                .output
+                .iter()
+                .position(|out| {
+                    out.value.to_sat() == value
+                        && out.script_pubkey.as_bytes() == script.as_slice()
+                })
+                .ok_or_else(|| {
+                    TapNodeError::Supply(
+                        "confirmed mint anchor transaction has no \
+                         pre-commitment output"
+                            .into(),
+                    )
+                })?;
+            Some(proof::TaprootProof {
+                output_index: out_idx as u32,
+                internal_key: *dk,
+                commitment_proof: None,
+                tapscript_proof: Some(proof::TapscriptProof {
+                    tap_preimage_1: None,
+                    tap_preimage_2: None,
+                    bip86: true,
+                    unknown_odd_types: std::collections::BTreeMap::new(),
+                }),
+                unknown_odd_types: std::collections::BTreeMap::new(),
+            })
+        }
+        None => None,
+    };
+
     for asset in &batch.sprouted_assets {
         let asset_id = asset.genesis.id();
         let meta_reveal = batch
             .seedlings
             .get(&asset.genesis.tag)
             .and_then(|s| s.meta.clone());
+        let group_key_reveal = anchor
+            .group_reveals
+            .iter()
+            .find(|(tag, _)| *tag == asset.genesis.tag)
+            .map(|(_, reveal)| reveal.clone());
 
         // NOTE: exclusion proofs for the wallet's BTC change output
         // are omitted (we do not know its internal key). Go includes
         // them; universe servers only require the inclusion proof.
+        // The pre-commitment output (P2TR) does get an exclusion
+        // proof, as full proof verification demands one for every
+        // other P2TR output.
         let genesis_proof =
             tap_onchain::proof::generate_genesis_proof(GenesisProofParams {
                 anchor_tx_bytes: anchor_tx_bytes.clone(),
@@ -461,14 +634,85 @@ where
                 internal_key: anchor.internal_key,
                 commitment: batch.root_asset_commitment.clone(),
                 commitment_proof: None,
-                exclusion_proofs: vec![],
+                exclusion_proofs: pre_commit_exclusion
+                    .clone()
+                    .into_iter()
+                    .collect(),
                 genesis_reveal: asset.genesis.clone(),
                 meta_reveal,
-                group_key_reveal: None,
+                group_key_reveal,
             })
             .map_err(TapNodeError::Storage)?;
 
         let proof_bytes = proof::encode::encode_proof(&genesis_proof);
+
+        // Universe supply commitments: stage the mint supply update
+        // and persist the pre-commitment output for the asset group
+        // (Go's caretaker sends the mint event to the supply commit
+        // state machine on confirmation; caretaker.go
+        // sendSupplyCommitEvents). Idempotent: staging upserts by
+        // leaf key, the pre-commitment by outpoint.
+        let wants_supply = batch
+            .seedlings
+            .get(&asset.genesis.tag)
+            .map(seedling_wants_supply_commitments)
+            .unwrap_or(false);
+        if wants_supply {
+            let delegation_key =
+                anchor.delegation_key.as_ref().ok_or_else(|| {
+                    TapNodeError::Supply(
+                        "universe-commitments asset confirmed without a \
+                         delegation key"
+                            .into(),
+                    )
+                })?;
+            let group_key = asset
+                .group_key
+                .as_ref()
+                .map(|gk| gk.group_pub_key)
+                .ok_or_else(|| {
+                    TapNodeError::Supply(
+                        "universe-commitments asset confirmed without a \
+                         group key"
+                            .into(),
+                    )
+                })?;
+
+            let mint_event =
+                tap_universe::supply::NewMintEvent::decode(&proof_bytes)
+                    .map_err(|e| TapNodeError::Supply(e.to_string()))?;
+            let pre_commit = tap_universe::supply::new_pre_commit_from_proof(
+                &genesis_proof,
+                delegation_key,
+            )
+            .map_err(|e| TapNodeError::Supply(e.to_string()))?;
+
+            {
+                let mut staging = node
+                    .supply_staging_store
+                    .lock()
+                    .expect("supply staging store lock");
+                staging
+                    .set_delegation_key(&group_key, delegation_key)
+                    .map_err(TapNodeError::Storage)?;
+                staging
+                    .map_asset_group(&asset_id, &group_key)
+                    .map_err(TapNodeError::Storage)?;
+                staging
+                    .stage_update(
+                        &group_key,
+                        &tap_universe::supply::SupplyUpdateEvent::Mint(
+                            mint_event,
+                        ),
+                    )
+                    .map_err(TapNodeError::Storage)?;
+            }
+            node.supply_commit_store
+                .lock()
+                .expect("supply commit store lock")
+                .insert_pre_commit(&pre_commit)
+                .map_err(TapNodeError::Storage)?;
+        }
 
         // Store the genesis proof file.
         let mut file = proof::file::File::new();
@@ -567,6 +811,105 @@ where
         .expect("batch store lock")
         .save_batch(batch)
         .map_err(TapNodeError::Storage)
+}
+
+/// Attaches a V1 group key and group genesis witness to every sprouted
+/// asset whose tag is in `grouped_tags`, recording the group key
+/// reveals for the genesis proofs.
+///
+/// Per asset: a fresh group internal key is derived from the key ring,
+/// the tweaked group key is `GroupPubKeyV1(internal, tapscript(asset
+/// ID), asset ID)` (asset/group_key.go:849), and the group membership
+/// witness is a key-path Schnorr signature with the tweaked group key
+/// over the grouped-genesis virtual transaction sighash (the signature
+/// the VM checks in `validate_group_genesis_witness`). The signature
+/// is produced through [`AssetSigner::sign_virtual_tx_tweaked`] with
+/// the group tapscript root, which applies exactly the required
+/// BIP-341 tweak to the internal key.
+fn attach_group_keys<K>(
+    keys: &K,
+    assets: &mut [tap_primitives::asset::Asset],
+    grouped_tags: &[String],
+    reveals: &mut Vec<(String, GroupKeyReveal)>,
+) -> Result<(), MintError>
+where
+    K: KeyRing + AssetSigner,
+{
+    use tap_primitives::crypto::virtual_tx::{
+        input_group_genesis_key_spend_sighash, virtual_tx,
+    };
+
+    let commitment_err =
+        |e: &dyn std::fmt::Display| MintError::CommitmentError(e.to_string());
+
+    for asset in assets.iter_mut() {
+        if !grouped_tags.contains(&asset.genesis.tag) {
+            continue;
+        }
+
+        let desc = keys
+            .derive_next_key(TAPROOT_ASSETS_KEY_FAMILY)
+            .map_err(MintError::Chain)?;
+        let asset_id = asset.genesis.id();
+
+        let reveal = GroupKeyRevealV1::new(
+            PEDERSEN_VERSION,
+            desc.pub_key,
+            &asset_id,
+            None,
+        )
+        .map_err(|e| commitment_err(&e))?;
+        let group_pub = reveal
+            .group_pub_key(&asset_id)
+            .map_err(|e| commitment_err(&e))?;
+        let tapscript_root: [u8; 32] = reveal
+            .tapscript
+            .root
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                MintError::CommitmentError(
+                    "group key tapscript root is not 32 bytes".into(),
+                )
+            })?;
+
+        asset.group_key = Some(GroupKey {
+            version: GroupKeyVersion::V1,
+            raw_key: desc.pub_key,
+            group_pub_key: SerializedKey(group_pub.serialize()),
+            tapscript_root: tapscript_root.to_vec(),
+            witness: vec![],
+        });
+
+        // The grouped-genesis virtual tx commits to only the
+        // (witnessless) genesis asset itself; the sighash is stable
+        // whether or not the witness is already attached.
+        let empty = tap_primitives::vm::InputSet::new();
+        let (base_tx, _, _) =
+            virtual_tx(asset, &empty).map_err(|e| commitment_err(&e))?;
+        let sighash = input_group_genesis_key_spend_sighash(
+            &base_tx,
+            asset,
+            bitcoin::sighash::TapSighashType::Default,
+        )
+        .map_err(|e| commitment_err(&e))?;
+
+        let sig = keys
+            .sign_virtual_tx_tweaked(&desc, &sighash, Some(&tapscript_root))
+            .map_err(MintError::Chain)?;
+        if sig.len() != 64 {
+            return Err(MintError::CommitmentError(format!(
+                "expected 64-byte group witness signature, got {}",
+                sig.len()
+            )));
+        }
+        asset.prev_witnesses[0].tx_witness = vec![sig];
+
+        reveals
+            .push((asset.genesis.tag.clone(), GroupKeyReveal::V1(reveal)));
+    }
+
+    Ok(())
 }
 
 /// Extracts an x-only public key from a 33-byte compressed key.

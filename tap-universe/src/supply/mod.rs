@@ -19,16 +19,18 @@
 //! in a P2TR output whose tapscript root is a single Pedersen
 //! non-spendable leaf over the 32-byte supply root hash.
 //!
-//! # Deferred: authoring state machine
+//! # Authoring
 //!
-//! Go's `supplycommit` package also contains a state machine that
-//! *authors* new commitments (creating, funding, signing, and
-//! broadcasting the commitment transaction, plus the WAL-style
-//! persistence in tapdb's `supply_commit.go`). That authoring flow
-//! depends on wallet/PSBT infrastructure and is intentionally deferred;
-//! this module implements the verify-first subset: event and tree
-//! construction (byte-compatible with Go), commitment data structures,
-//! and full verification of externally produced supply commitments.
+//! Go's `supplycommit` package also contains a protofsm state machine
+//! that *authors* new commitments. In this workspace that flow lives
+//! as a synchronous pipeline: transaction shaping and signing in
+//! `tap_onchain::supply_commit`, staging/persistence in
+//! `tap_persist::supply_store`, and orchestration (staging producers,
+//! broadcast, confirmation handling, self-verification against
+//! [`SupplyVerifier`]) in tap-node's `supply` module. This module
+//! provides the shared data structures, event/tree construction
+//! (byte-compatible with Go), and full verification of supply
+//! commitments, which the authoring pipeline uses as its oracle.
 
 pub mod events;
 pub mod verifier;
@@ -830,6 +832,33 @@ mod tests {
         assert_eq!(
             hex_encode(&output_key),
             "544a2cb26fe71c9a3864f5b89dbc97304d7c5ffeba93ed1a4b82f1bb5c6a82b0"
+        );
+    }
+
+    /// Go vector: `tapgarden.PreCommitTxOut` (planter.go:3327) executed
+    /// against v0.8.99-alpha with the delegation private key 0x..21
+    /// (the same key as the signed-ignore-tuple vectors):
+    ///
+    /// ```text
+    /// pub:      021697ffa6fd9de627c077e3d2fe541084ce13300b0bec1146f95ae57f0d0bd6a5
+    /// value:    1000
+    /// pkScript: 51209c865d97d3097e3510189cd67944fea034ad394dc7d42656c5d3484f2f6862b2
+    /// ```
+    #[test]
+    fn test_pre_commit_tx_out_matches_go() {
+        let delegation_key = SerializedKey(
+            hex_decode(
+                "021697ffa6fd9de627c077e3d2fe541084ce13300b0bec1146f95ae57f0d0bd6a5",
+            )
+            .try_into()
+            .expect("33 bytes"),
+        );
+        let (value, script) =
+            pre_commit_tx_out(&delegation_key).expect("tx out");
+        assert_eq!(value, 1000);
+        assert_eq!(
+            hex_encode(&script),
+            "51209c865d97d3097e3510189cd67944fea034ad394dc7d42656c5d3484f2f6862b2"
         );
     }
 
