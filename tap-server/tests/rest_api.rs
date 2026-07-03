@@ -243,11 +243,15 @@ async fn leaves_endpoint() {
     );
 }
 
+/// The LEGACY rust-tap-only POST query route stays served for older
+/// `HttpUniverseClient` builds (tapd does not have this route; current
+/// clients use the GET binding above and only fall back to this POST
+/// on 404/405).
 #[tokio::test]
 async fn query_proof_post_endpoint() {
     let (app, id, key, leaf) = app_with_genesis_leaf();
 
-    // The exact body HttpUniverseClient::query_proof_leaf sends:
+    // The exact body older HttpUniverseClient builds send:
     // display-order txid hex in leaf_key.op.hash_str, matching tapd.
     let body = json!({
         "id": {
@@ -312,10 +316,15 @@ async fn query_proof_post_endpoint() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// The tapd-native `QueryProof` GET binding is the PRIMARY proof
+/// query route (`universe.yaml`): display-order txid path segment and
+/// the proof type as the `id.proof_type` query parameter. This is the
+/// route `HttpUniverseClient::query_proof` uses first.
 #[tokio::test]
 async fn get_proof_by_path_endpoint() {
     let (app, id, key, leaf) = app_with_genesis_leaf();
 
+    // Without an explicit proof type (defaults to issuance).
     let uri = format!(
         "/v1/taproot-assets/universe/proofs/asset-id/{}/{}/{}/{}",
         hex(id.asset_id.as_bytes()),
@@ -330,6 +339,28 @@ async fn get_proof_by_path_endpoint() {
         Some(hex(&leaf.proof).as_str())
     );
 
+    // With the explicit `id.proof_type` query parameter the client
+    // sends.
+    let (status, body) =
+        get(&app, &format!("{}?id.proof_type=PROOF_TYPE_ISSUANCE", uri))
+            .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.pointer("/asset_leaf/proof").and_then(|v| v.as_str()),
+        Some(hex(&leaf.proof).as_str())
+    );
+    assert_eq!(
+        body.pointer("/asset_leaf/asset/amount")
+            .and_then(|v| v.as_str()),
+        Some(leaf.amount.to_string().as_str())
+    );
+
+    // The transfer universe for this asset is empty: 404.
+    let (status, _) =
+        get(&app, &format!("{}?id.proof_type=PROOF_TYPE_TRANSFER", uri))
+            .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
     // Missing proof: 404.
     let uri = format!(
         "/v1/taproot-assets/universe/proofs/asset-id/{}/{}/{}/{}",
@@ -340,6 +371,35 @@ async fn get_proof_by_path_endpoint() {
     );
     let (status, _) = get(&app, &uri).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The group-key variant of the `QueryProof` GET binding is routed:
+/// an unknown group key yields 404 (not a routing error) and a
+/// malformed group key is a client error.
+#[tokio::test]
+async fn get_proof_group_key_route() {
+    let (app, _, key, _) = app_with_genesis_leaf();
+
+    // 32-byte x-only group key unknown to the backend.
+    let uri = format!(
+        "/v1/taproot-assets/universe/proofs/group-key/{}/{}/{}/{}",
+        "44".repeat(32),
+        display_txid_hex(&key),
+        key.outpoint.vout,
+        hex(key.script_key.as_bytes()),
+    );
+    let (status, _) = get(&app, &uri).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Malformed group key: 400.
+    let uri = format!(
+        "/v1/taproot-assets/universe/proofs/group-key/nothex/{}/{}/{}",
+        display_txid_hex(&key),
+        key.outpoint.vout,
+        hex(key.script_key.as_bytes()),
+    );
+    let (status, _) = get(&app, &uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

@@ -19,10 +19,16 @@
 //! - `GET  /v1/taproot-assets/universe/leaves/asset-id/{id}` and
 //!   `.../leaves/group-key/{id}`
 //! - `GET/POST /v1/taproot-assets/universe/proofs/asset-id/{id}/{txid}/{vout}/{script_key}`
-//!   (GET queries, POST inserts; txid in display order)
+//!   (GET queries, POST inserts; txid in display order, proof type via
+//!   the `id.proof_type` query parameter). The GET is tapd's native
+//!   `QueryProof` binding and the PRIMARY proof query route; it is
+//!   what `HttpUniverseClient` uses first.
+//! - `GET  /v1/taproot-assets/universe/proofs/group-key/{key}/{txid}/{vout}/{script_key}`
+//!   (the group-key `QueryProof` binding from `universe.yaml`)
 //! - `POST /v1/taproot-assets/universe/proofs/query/{id}/{proof_type}`
-//!   (the query path `HttpUniverseClient` uses; leaf key in the body,
-//!   txid in display order, matching tapd)
+//!   (LEGACY, rust-tap only: tapd does not serve this route. Kept so
+//!   older `HttpUniverseClient` builds that only knew the POST query
+//!   route keep working; leaf key in the body, txid in display order)
 //! - `GET  /v1/taproot-assets/universe/info`
 //!
 //! Handlers run the synchronous [`UniverseService`] methods on the
@@ -79,6 +85,10 @@ pub fn router(service: UniverseService) -> Router {
         .route(
             "/v1/taproot-assets/universe/proofs/asset-id/:id/:txid/:vout/:script_key",
             get(get_proof).post(post_proof),
+        )
+        .route(
+            "/v1/taproot-assets/universe/proofs/group-key/:id/:txid/:vout/:script_key",
+            get(get_group_proof),
         )
         .route(
             "/v1/taproot-assets/universe/proofs/query/:id/:proof_type",
@@ -348,15 +358,17 @@ async fn get_group_leaves(
     leaves_response(service, selector, params).await
 }
 
-/// GET /v1/taproot-assets/universe/proofs/asset-id/{id}/{txid}/{vout}/{script_key}
-///
-/// The txid path segment is in display order, matching tapd.
-async fn get_proof(
-    State(service): State<UniverseService>,
-    Path((id, txid, vout, script_key)): Path<(String, String, u32, String)>,
-    Query(params): Query<HashMap<String, String>>,
+/// Shared proof query for the tapd-native `QueryProof` GET bindings:
+/// parses the leaf key path segments (txid in display order), runs the
+/// query for the selected universe, and marshals the response.
+async fn query_proof_response(
+    service: UniverseService,
+    selector: UniverseSelector,
+    txid: String,
+    vout: u32,
+    script_key: String,
+    params: HashMap<String, String>,
 ) -> ApiResult {
-    let asset_id = parse_asset_id(&id)?;
     let proof_type = proof_type_param(&params)?;
     let key = tap_universe::types::LeafKey {
         outpoint: OutPoint {
@@ -366,7 +378,6 @@ async fn get_proof(
         script_key: parse_script_key(&script_key)?,
     };
 
-    let selector = UniverseSelector::Asset(asset_id);
     let found = run_blocking(move || {
         service.query_proof(&selector, proof_type, &key)
     })
@@ -381,6 +392,34 @@ async fn get_proof(
             "no universe proof found".into(),
         ))),
     }
+}
+
+/// GET /v1/taproot-assets/universe/proofs/asset-id/{id}/{txid}/{vout}/{script_key}
+///
+/// tapd's native `QueryProof` binding and the primary proof query
+/// route. The txid path segment is in display order, matching tapd;
+/// the proof type travels as the `id.proof_type` query parameter.
+async fn get_proof(
+    State(service): State<UniverseService>,
+    Path((id, txid, vout, script_key)): Path<(String, String, u32, String)>,
+    Query(params): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let selector = UniverseSelector::Asset(parse_asset_id(&id)?);
+    query_proof_response(service, selector, txid, vout, script_key, params)
+        .await
+}
+
+/// GET /v1/taproot-assets/universe/proofs/group-key/{key}/{txid}/{vout}/{script_key}
+///
+/// The group-key variant of tapd's `QueryProof` binding.
+async fn get_group_proof(
+    State(service): State<UniverseService>,
+    Path((id, txid, vout, script_key)): Path<(String, String, u32, String)>,
+    Query(params): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let selector = UniverseSelector::Group(parse_group_key(&id)?);
+    query_proof_response(service, selector, txid, vout, script_key, params)
+        .await
 }
 
 /// POST /v1/taproot-assets/universe/proofs/asset-id/{id}/{txid}/{vout}/{script_key}
@@ -412,12 +451,15 @@ async fn post_proof(
 
 /// POST /v1/taproot-assets/universe/proofs/query/{id}/{proof_type}
 ///
-/// The proof query path `HttpUniverseClient::query_proof_leaf` uses;
-/// the leaf key is carried in the body with the txid in display byte
-/// order, matching tapd (see the `json` module docs). For backward
-/// compatibility with older rust-tap clients that sent the txid in
-/// internal byte order, a failed lookup is retried with the txid
-/// reversed.
+/// LEGACY, rust-tap only: tapd does not serve this route, and current
+/// `HttpUniverseClient` builds query proofs through the tapd-native
+/// GET binding (see [`get_proof`]), only falling back to this POST
+/// when the GET is answered with 404/405. It is kept so older
+/// rust-tap clients that only knew the POST query route keep working.
+/// The leaf key is carried in the body with the txid in display byte
+/// order (see the `json` module docs). For backward compatibility
+/// with older rust-tap clients that sent the txid in internal byte
+/// order, a failed lookup is retried with the txid reversed.
 async fn post_query_proof(
     State(service): State<UniverseService>,
     Path((id, proof_type)): Path<(String, String)>,

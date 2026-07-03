@@ -502,16 +502,18 @@ impl KeyRing for TapKeyRing {
     }
 }
 
-impl AssetSigner for TapKeyRing {
-    // Per the `AssetSigner` contract (tap-onchain/src/chain.rs):
-    // `virtual_tx` is the 32-byte BIP-341 sighash, and the signature
-    // must come from the BIP-86 tweaked key (empty script tree) so it
-    // verifies against `ScriptKey::bip86(raw_key)`.
-    fn sign_virtual_tx(
+impl TapKeyRing {
+    // Shared signing core for both `AssetSigner` methods: applies the
+    // BIP-341 taproot tweak (empty tree for `None`, the given
+    // tapscript merkle root for `Some`) to the descriptor's keypair
+    // and Schnorr-signs the 32-byte sighash digest.
+    fn sign_with_tweak(
         &self,
         signing_key: &KeyDescriptor,
         virtual_tx: &[u8],
+        tapscript_root: Option<&[u8; 32]>,
     ) -> Result<Vec<u8>, ChainError> {
+        use bitcoin::hashes::Hash;
         use bitcoin::key::TapTweak;
 
         let digest: [u8; 32] = virtual_tx.try_into().map_err(|_| {
@@ -526,13 +528,46 @@ impl AssetSigner for TapKeyRing {
             .find(|(kd, _)| kd.pub_key == signing_key.pub_key)
             .ok_or_else(|| ChainError::SigningFailed("Key not found".into()))?;
 
-        // Apply the BIP-86 taproot tweak (no script path).
-        let tweaked = keypair.tap_tweak(&self.secp, None);
+        // BIP-341 tweak: TapTweakHash(internal_pub) for the key-spend
+        // only (BIP-86) case, TapTweakHash(internal_pub, root) when the
+        // script key commits to a tapscript root (e.g. V2-address
+        // unique Pedersen script keys).
+        let merkle_root = tapscript_root.map(|root| {
+            bitcoin::taproot::TapNodeHash::from_byte_array(*root)
+        });
+        let tweaked = keypair.tap_tweak(&self.secp, merkle_root);
         let msg = bitcoin::secp256k1::Message::from_digest(digest);
         let sig = self
             .secp
             .sign_schnorr_no_aux_rand(&msg, &tweaked.to_keypair());
         Ok(sig.serialize().to_vec())
+    }
+}
+
+impl AssetSigner for TapKeyRing {
+    // Per the `AssetSigner` contract (tap-onchain/src/chain.rs):
+    // `virtual_tx` is the 32-byte BIP-341 sighash, and the signature
+    // must come from the BIP-86 tweaked key (empty script tree) so it
+    // verifies against `ScriptKey::bip86(raw_key)`.
+    fn sign_virtual_tx(
+        &self,
+        signing_key: &KeyDescriptor,
+        virtual_tx: &[u8],
+    ) -> Result<Vec<u8>, ChainError> {
+        self.sign_with_tweak(signing_key, virtual_tx, None)
+    }
+
+    // Tapscript-tweak-aware signing: `Some(root)` applies the BIP-341
+    // TapTweakHash(internal_key, root) tweak (matching Go's
+    // TaprootKeySpendSignMethod with TapTweak = root), needed to spend
+    // assets held under V2-address unique Pedersen script keys.
+    fn sign_virtual_tx_tweaked(
+        &self,
+        signing_key: &KeyDescriptor,
+        virtual_tx: &[u8],
+        tapscript_root: Option<&[u8; 32]>,
+    ) -> Result<Vec<u8>, ChainError> {
+        self.sign_with_tweak(signing_key, virtual_tx, tapscript_root)
     }
 }
 

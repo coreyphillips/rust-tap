@@ -216,6 +216,58 @@ pub trait AssetSigner {
         signing_key: &KeyDescriptor,
         virtual_tx: &[u8],
     ) -> Result<Vec<u8>, ChainError>;
+
+    /// Signs a virtual transaction input for a script key that commits
+    /// to a tapscript tree (key-spend path with a script root).
+    ///
+    /// Like [`AssetSigner::sign_virtual_tx`], `virtual_tx` is the
+    /// 32-byte BIP-341 key-spend sighash and `signing_key` identifies
+    /// the raw (pre-tweak) key, but the taproot tweak applied to the
+    /// private key before signing depends on `tapscript_root`:
+    ///
+    /// - `None`: the BIP-86 key-spend-only tweak with an empty script
+    ///   tree, i.e. `TapTweakHash(internal_pub)`. Identical to
+    ///   [`AssetSigner::sign_virtual_tx`]; the default implementation
+    ///   delegates to it.
+    /// - `Some(root)`: the BIP-341 tweak with the given 32-byte
+    ///   tapscript merkle root, i.e.
+    ///   `TapTweakHash(internal_pub, root)` added to the private key
+    ///   (negated first if its public key has odd Y). This matches
+    ///   Go's `lndclient.SignDescriptor` with
+    ///   `TaprootKeySpendSignMethod` and `TapTweak = root`
+    ///   (tapsend.CreateTaprootSignature), and is what V2-address
+    ///   unique Pedersen script keys require: their script key is the
+    ///   taproot output key of the address key tweaked with the
+    ///   Pedersen non-spendable leaf's tap hash
+    ///   (`derive_unique_script_key`).
+    ///
+    /// Returns the 64-byte BIP-340 Schnorr signature over the digest.
+    ///
+    /// The default implementation only supports `None` (it delegates
+    /// to [`AssetSigner::sign_virtual_tx`]); for `Some(root)` it fails
+    /// with a precise error, so implementations that predate this
+    /// method keep working for BIP-86 keys and reject
+    /// tapscript-tweaked keys loudly instead of producing invalid
+    /// signatures.
+    fn sign_virtual_tx_tweaked(
+        &self,
+        signing_key: &KeyDescriptor,
+        virtual_tx: &[u8],
+        tapscript_root: Option<&[u8; 32]>,
+    ) -> Result<Vec<u8>, ChainError> {
+        match tapscript_root {
+            None => self.sign_virtual_tx(signing_key, virtual_tx),
+            Some(_) => Err(ChainError::SigningFailed(
+                "this AssetSigner does not implement \
+                 sign_virtual_tx_tweaked: signing a script key that \
+                 commits to a tapscript root (e.g. a V2-address \
+                 unique Pedersen script key) requires overriding \
+                 AssetSigner::sign_virtual_tx_tweaked to apply the \
+                 BIP-341 TapTweakHash(internal_key, root) tweak"
+                    .into(),
+            )),
+        }
+    }
 }
 
 /// Persistence interface for minting state.
