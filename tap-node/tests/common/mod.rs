@@ -42,6 +42,9 @@ pub struct FakeChain {
     pub confirmations: Mutex<HashMap<[u8; 32], TxConfirmation>>,
     pub broadcasts: Mutex<Vec<Vec<u8>>>,
     pub fail_confirmations: std::sync::atomic::AtomicBool,
+    /// Scripted block hashes by height; heights not present fall back
+    /// to the synthetic `[height as u8; 32]` hash.
+    pub block_hashes: Mutex<HashMap<u32, [u8; 32]>>,
 }
 
 impl FakeChain {
@@ -50,7 +53,17 @@ impl FakeChain {
             confirmations: Mutex::new(HashMap::new()),
             broadcasts: Mutex::new(Vec::new()),
             fail_confirmations: std::sync::atomic::AtomicBool::new(false),
+            block_hashes: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Scripts the block hash returned for a height (e.g. so a mailbox
+    /// send fragment's header verifies against this chain).
+    pub fn set_block_hash(&self, height: u32, hash: [u8; 32]) {
+        self.block_hashes
+            .lock()
+            .expect("block hashes lock")
+            .insert(height, hash);
     }
 
     /// Makes `get_tx_confirmation` fail with a chain error until
@@ -114,7 +127,13 @@ impl ChainBridge for FakeChain {
         Ok(())
     }
     fn get_block_hash(&self, height: u32) -> Result<[u8; 32], ChainError> {
-        Ok([height as u8; 32])
+        Ok(self
+            .block_hashes
+            .lock()
+            .expect("block hashes lock")
+            .get(&height)
+            .copied()
+            .unwrap_or([height as u8; 32]))
     }
     fn get_tx_confirmation(
         &self,
@@ -267,12 +286,18 @@ impl KeyRing for FakeKeys {
     }
 }
 
-impl AssetSigner for FakeKeys {
-    fn sign_virtual_tx(
+impl FakeKeys {
+    /// Shared signing core: BIP-341 tweak (empty tree for `None`, the
+    /// given tapscript merkle root for `Some`), then Schnorr over the
+    /// 32-byte digest.
+    fn sign_with_tweak(
         &self,
         signing_key: &KeyDescriptor,
         virtual_tx: &[u8],
+        tapscript_root: Option<&[u8; 32]>,
     ) -> Result<Vec<u8>, ChainError> {
+        use bitcoin::hashes::Hash;
+
         let digest: [u8; 32] = virtual_tx.try_into().map_err(|_| {
             ChainError::SigningFailed(
                 "expected 32-byte sighash digest".into(),
@@ -291,12 +316,37 @@ impl AssetSigner for FakeKeys {
             &secp,
             &Self::secret_for(signing_key.index),
         );
-        // BIP-86 taproot tweak (empty script tree), per the contract.
-        let tweaked = keypair.tap_tweak(&secp, None);
+        let merkle_root = tapscript_root.map(|root| {
+            bitcoin::taproot::TapNodeHash::from_byte_array(*root)
+        });
+        let tweaked = keypair.tap_tweak(&secp, merkle_root);
         let msg = secp256k1::Message::from_digest(digest);
         let sig =
             secp.sign_schnorr_no_aux_rand(&msg, &tweaked.to_keypair());
         Ok(sig.serialize().to_vec())
+    }
+}
+
+impl AssetSigner for FakeKeys {
+    fn sign_virtual_tx(
+        &self,
+        signing_key: &KeyDescriptor,
+        virtual_tx: &[u8],
+    ) -> Result<Vec<u8>, ChainError> {
+        // BIP-86 taproot tweak (empty script tree), per the contract.
+        self.sign_with_tweak(signing_key, virtual_tx, None)
+    }
+
+    fn sign_virtual_tx_tweaked(
+        &self,
+        signing_key: &KeyDescriptor,
+        virtual_tx: &[u8],
+        tapscript_root: Option<&[u8; 32]>,
+    ) -> Result<Vec<u8>, ChainError> {
+        // BIP-341 TapTweakHash(internal_key, root) tweak for
+        // `Some(root)` (V2 unique Pedersen script keys), per the
+        // contract.
+        self.sign_with_tweak(signing_key, virtual_tx, tapscript_root)
     }
 }
 
@@ -465,6 +515,57 @@ pub fn build_harness(config: TapNodeConfig) -> Harness {
 /// The default harness with a regtest config.
 pub fn default_harness() -> Harness {
     build_harness(TapNodeConfig::default())
+}
+
+/// Builds a harness whose node also has an auth mailbox transport and
+/// a mailbox signer knowing the first few `FakeKeys` secrets, so V2
+/// (authmailbox) addresses can be created and polled. Returns the
+/// shared transport so tests can deliver send manifests to it.
+pub fn build_mailbox_harness(
+    config: TapNodeConfig,
+) -> (Harness, Arc<tap_onchain::proof::mailbox::MockTransport>) {
+    use tap_onchain::proof::mailbox::{MockTransport, SoftMailboxSigner};
+
+    let chain = Arc::new(FakeChain::new());
+    let batch_store = Arc::new(Mutex::new(MemoryBatchStore::new()));
+    let courier = Arc::new(MockCourier::new());
+    let transport = Arc::new(MockTransport::new());
+
+    // The mailbox receiver key of a V2 address is its script key: a
+    // key derived from the node key ring. Give the signer the first
+    // few deterministic FakeKeys secrets for ECDH.
+    let mut signer = SoftMailboxSigner::new();
+    for index in 0..4 {
+        signer.add_key(FakeKeys::secret_for(index));
+    }
+
+    let node = TapNodeBuilder::new(config)
+        .set_chain_bridge(SharedChain(Arc::clone(&chain)))
+        .set_wallet_anchor(FakeWallet)
+        .set_key_ring(FakeKeys::new())
+        .set_ldk_ops(FakeLdk)
+        .set_price_oracle(FakeOracle)
+        .set_batch_store(Box::new(SharedBatchStore(Arc::clone(
+            &batch_store,
+        ))))
+        .set_courier(Box::new(SharedCourier(Arc::clone(&courier))))
+        .set_mailbox_transport(Box::new(Arc::clone(&transport)))
+        .set_mailbox_signer(Box::new(signer))
+        .build()
+        .expect("node builds");
+
+    let events = node.event_receiver().expect("event receiver");
+
+    (
+        Harness {
+            node: Arc::new(node),
+            chain,
+            batch_store,
+            courier,
+            events,
+        },
+        transport,
+    )
 }
 
 pub struct Harness {

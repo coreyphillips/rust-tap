@@ -199,22 +199,22 @@ where
     }
 
     // The signer maps each input's (tweaked) script key to its stored
-    // key descriptor; signing an input whose descriptor is unknown
-    // fails with `SendError::UnknownScriptKey`.
-    let mut keys_by_script_key: HashMap<SerializedKey, KeyDescriptor> =
-        HashMap::new();
-    for owned in &selected {
-        ensure_seam_signable(owned)?;
+    // key descriptor plus the taproot tweak the seam must apply (None
+    // for BIP-86 keys, the recomputed Pedersen leaf tap hash for V2
+    // unique script keys); signing an input whose descriptor is
+    // unknown fails with `SendError::UnknownScriptKey`. The passive
+    // assets are signed with their own stored script key descriptors,
+    // so their keys must be resolvable by the same signer.
+    let mut keys_by_script_key: HashMap<
+        SerializedKey,
+        (KeyDescriptor, Option<[u8; 32]>),
+    > = HashMap::new();
+    for owned in selected.iter().chain(passive_owned.iter()) {
         if let Some(desc) = &owned.script_key_desc {
-            keys_by_script_key.insert(owned.script_key, desc.clone());
-        }
-    }
-    // The passive assets are signed with their own stored script key
-    // descriptors, so their keys must be resolvable by the same signer.
-    for owned in &passive_owned {
-        ensure_seam_signable(owned)?;
-        if let Some(desc) = &owned.script_key_desc {
-            keys_by_script_key.insert(owned.script_key, desc.clone());
+            keys_by_script_key.insert(
+                owned.script_key,
+                (desc.clone(), tapscript_root_for(owned)),
+            );
         }
     }
     let signer = NodeVirtualSigner {
@@ -840,45 +840,39 @@ where
     Ok(())
 }
 
-/// Ensures the stored descriptor can actually sign for the asset's
-/// script key through the [`AssetSigner`] seam, whose contract is
-/// BIP-86 key-spend signing only.
+/// Determines the taproot tweak the [`AssetSigner`] seam must apply
+/// to the stored raw key to sign for the asset's script key.
 ///
-/// Accepted script keys:
-/// - the raw descriptor key itself (legacy untweaked script keys), and
-/// - the BIP-86 tweak of the descriptor key (mint and change outputs,
-///   and V0/V1 address receives).
+/// - `None` for the raw descriptor key itself (legacy untweaked
+///   script keys) and for the BIP-86 tweak of the descriptor key
+///   (mint and change outputs, and V0/V1 address receives): the seam
+///   applies the empty-tree BIP-86 tweak
+///   ([`AssetSigner::sign_virtual_tx`]).
+/// - `Some(leaf tap hash)` when the script key is the V2 unique
+///   per-asset-ID script key: the address key tweaked with the
+///   Pedersen-commitment tapscript leaf over the asset ID
+///   ([`derive_unique_script_key`]). The recomputed leaf tap hash is
+///   the tapscript root the seam must apply per BIP-341
+///   ([`AssetSigner::sign_virtual_tx_tweaked`]). A signer that does
+///   not override that method rejects the send with a precise error
+///   naming the required extension.
 ///
-/// A V2-address receive instead holds the asset under a unique
-/// per-asset-ID script key: the address key tweaked with a
-/// Pedersen-commitment tapscript leaf
-/// ([`derive_unique_script_key`]). Signing it requires applying that
-/// leaf's tap hash as the taproot tweak, which the current
-/// [`AssetSigner`] seam cannot express (it always applies the
-/// empty-tree BIP-86 tweak), so such assets are rejected here with a
-/// precise error instead of either producing an invalid BIP-86
-/// signature or failing later with a misleading
-/// [`SendError::UnknownScriptKey`].
-///
-/// An asset with no stored descriptor passes through: it is reported
-/// as `UnknownScriptKey` by the signer, as before. A descriptor whose
-/// relationship to the script key is not recognized also passes
-/// through, preserving the existing BIP-86 signing behavior for
-/// externally managed keys.
-fn ensure_seam_signable(owned: &OwnedAsset) -> Result<(), TapNodeError> {
-    let desc = match &owned.script_key_desc {
-        Some(desc) => desc,
-        None => return Ok(()),
-    };
+/// An asset with no stored descriptor, or one whose descriptor's
+/// relationship to the script key is not recognized, maps to `None`,
+/// preserving the existing BIP-86 signing behavior for externally
+/// managed keys (an unknown descriptor is later reported as
+/// [`SendError::UnknownScriptKey`] by the signer).
+fn tapscript_root_for(owned: &OwnedAsset) -> Option<[u8; 32]> {
+    let desc = owned.script_key_desc.as_ref()?;
     if owned.script_key == desc.pub_key {
-        return Ok(());
+        return None;
     }
     // Only compare against the BIP-86 tweak when the stored raw key is
     // a valid point (ScriptKey::bip86 asserts validity).
     if XOnlyPublicKey::from_slice(&desc.pub_key.0[1..]).is_ok()
         && owned.script_key == ScriptKey::bip86(desc.pub_key).pub_key
     {
-        return Ok(());
+        return None;
     }
     if let Ok(unique) = derive_unique_script_key(
         desc.pub_key,
@@ -886,21 +880,17 @@ fn ensure_seam_signable(owned: &OwnedAsset) -> Result<(), TapNodeError> {
         ScriptKeyDerivationMethod::UniquePedersen,
     ) {
         if unique.pub_key == owned.script_key {
-            return Err(TapNodeError::Send(SendError::InvalidState(
-                format!(
-                    "asset {} is held under a V2 unique script key (the \
-                     address key tweaked with the asset-id Pedersen \
-                     commitment leaf); the AssetSigner seam only \
-                     supports BIP-86 key-spend signing and cannot apply \
-                     the tapscript tweak, so this asset cannot be sent \
-                     yet -- extend the signer seam with tapscript tweak \
-                     support to spend V2-address receives",
-                    hex_id(&owned.asset_id)
-                ),
-            )));
+            // The recorded tweak is the Pedersen leaf's 32-byte tap
+            // hash, i.e. the single-leaf tapscript root.
+            let root = unique
+                .tweaked
+                .and_then(|t| <[u8; 32]>::try_from(t.tweak.as_slice()).ok());
+            if root.is_some() {
+                return root;
+            }
         }
     }
-    Ok(())
+    None
 }
 
 /// Simple largest-first coin selection.
@@ -1033,15 +1023,21 @@ where
 /// [`KeyRing`] + [`AssetSigner`].
 ///
 /// Holds a map from the (tweaked) input script keys to their stored
-/// raw key descriptors (from `OwnedAsset::script_key_desc`). Signing
-/// resolves the descriptor for the exact script key being spent and
-/// delegates to [`AssetSigner::sign_virtual_tx`], which by contract
-/// applies the BIP-86 taproot tweak to the raw key before signing (see
-/// the trait docs in `tap_onchain::chain`). Script keys with no stored
-/// descriptor fail with [`SendError::UnknownScriptKey`].
+/// raw key descriptors (from `OwnedAsset::script_key_desc`) plus the
+/// taproot tweak the seam must apply (see [`tapscript_root_for`]).
+/// Signing resolves the entry for the exact script key being spent
+/// and delegates to [`AssetSigner::sign_virtual_tx_tweaked`]: for
+/// `None` roots that is by contract the BIP-86 taproot tweak of the
+/// raw key (the default implementation delegates to
+/// [`AssetSigner::sign_virtual_tx`]); for `Some(root)` (V2 unique
+/// Pedersen script keys) the BIP-341
+/// `TapTweakHash(internal_key, root)` tweak (see the trait docs in
+/// `tap_onchain::chain`). Script keys with no stored descriptor fail
+/// with [`SendError::UnknownScriptKey`].
 struct NodeVirtualSigner<'a, K> {
     keys: &'a K,
-    keys_by_script_key: HashMap<SerializedKey, KeyDescriptor>,
+    keys_by_script_key:
+        HashMap<SerializedKey, (KeyDescriptor, Option<[u8; 32]>)>,
 }
 
 impl<K: KeyRing + AssetSigner> VirtualSigner for NodeVirtualSigner<'_, K> {
@@ -1050,14 +1046,14 @@ impl<K: KeyRing + AssetSigner> VirtualSigner for NodeVirtualSigner<'_, K> {
         sighash: &[u8; 32],
         script_key: &ScriptKey,
     ) -> Result<Vec<u8>, SendError> {
-        let desc = self
+        let (desc, tapscript_root) = self
             .keys_by_script_key
             .get(script_key.serialized())
             .ok_or_else(|| {
                 SendError::UnknownScriptKey(*script_key.serialized())
             })?;
         self.keys
-            .sign_virtual_tx(desc, sighash)
+            .sign_virtual_tx_tweaked(desc, sighash, tapscript_root.as_ref())
             .map_err(SendError::Chain)
     }
 }

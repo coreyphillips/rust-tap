@@ -415,12 +415,12 @@ where
                 //
                 // NOTE: the unique per-asset script key is a
                 // Pedersen-leaf tapscript tweak of the address key.
-                // The current AssetSigner seam cannot apply that
-                // tweak, so `send_asset` refuses these assets with a
-                // precise error (see `ensure_seam_signable` in
-                // `send.rs`) until the signer seam grows tapscript
-                // tweak support. The descriptor is persisted anyway so
-                // the context is not lost.
+                // `send_asset` recomputes that leaf's tap hash from
+                // the stored descriptor (see `tapscript_root_for` in
+                // `send.rs`) and signs through
+                // `AssetSigner::sign_virtual_tx_tweaked`; a signer
+                // that does not implement the tapscript-tweak
+                // extension rejects the send with a precise error.
                 let mut owned = OwnedAsset::new(
                     asset.asset_id,
                     asset.amount,
@@ -1178,10 +1178,15 @@ mod tests {
         );
         assert_eq!(owned.block_height, height);
 
-        // Sending a V2-received asset onward is refused with a precise
-        // error about the Pedersen-tweaked unique script key (NOT a
-        // misleading UnknownScriptKey): the AssetSigner seam cannot
-        // apply the tapscript tweak needed to sign it yet.
+        // MockKeys does not override
+        // `AssetSigner::sign_virtual_tx_tweaked`, so sending a
+        // V2-received asset onward is refused by the default
+        // implementation with a precise error naming the required
+        // extension (NOT a misleading UnknownScriptKey): the send
+        // path correctly classified the input as a Pedersen-tweaked
+        // unique script key and routed it to the tweaked method.
+        // (The full harness signer overrides the method; see the
+        // end-to-end onward-send test in tests/receive_flow.rs.)
         let onward = TapAddress {
             version: AddressVersion::V0,
             asset_version: 0,
@@ -1209,7 +1214,7 @@ mod tests {
             node.send_asset(asset_id, amount, &onward).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("V2 unique script key"),
+            msg.contains("sign_virtual_tx_tweaked"),
             "unexpected error: {}",
             msg
         );

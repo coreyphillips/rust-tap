@@ -15,9 +15,13 @@
 //! the [`crate::syncer::SimpleSyncer`].
 //!
 //! REST paths follow `taprpc/universerpc/universe.yaml` in the Go
-//! implementation. The Lightning Labs REST gateway encodes `bytes`
-//! fields non-standardly as hex in some responses while standard
-//! protojson uses base64; response parsing accepts both.
+//! implementation; in particular proof queries use tapd's native
+//! `QueryProof` GET binding (with a one-shot fallback to the legacy
+//! rust-tap-only POST query route for older `tap-server` builds, see
+//! [`HttpUniverseClient::query_proof`]). The Lightning Labs REST
+//! gateway encodes `bytes` fields non-standardly as hex in some
+//! responses while standard protojson uses base64; response parsing
+//! accepts both.
 
 use tap_primitives::asset::{AssetId, OutPoint, SerializedKey};
 use tap_primitives::mssmt::NodeHash;
@@ -122,26 +126,124 @@ impl HttpUniverseClient {
         outpoint: &OutPoint,
         script_key: &SerializedKey,
     ) -> Result<Option<Vec<u8>>, UniverseError> {
+        let id = UniverseId {
+            asset_id: *asset_id,
+            group_key: None,
+            proof_type,
+        };
         Ok(self
-            .query_proof_leaf(asset_id, proof_type, outpoint, script_key)?
+            .query_proof_leaf(&id, outpoint, script_key)?
             .map(|parsed| parsed.proof))
     }
 
     /// Queries a proof leaf (proof bytes plus universe metadata) from
     /// the server. Returns `None` if the proof doesn't exist.
+    ///
+    /// The primary route is tapd's native `QueryProof` GET binding
+    /// (`taprpc/universerpc/universe.yaml`):
+    ///
+    /// `GET /v1/taproot-assets/universe/proofs/asset-id/{id}/{txid}/{vout}/{script_key}`
+    ///
+    /// (or `.../proofs/group-key/{key}/...` for group-key universes),
+    /// where the txid path segment is in display order (tapd parses it
+    /// with `chainhash.NewHashFromStr`, same as the insert path) and
+    /// the proof type travels as the `id.proof_type` query parameter.
+    ///
+    /// Compatibility: older rust-tap `tap-server` builds only exposed
+    /// a nonstandard `POST /proofs/query/{id}/{proof_type}` route,
+    /// which tapd does not serve. Because those servers answer the GET
+    /// with 404 (route unknown), a 404/405 GET response falls back to
+    /// one legacy POST attempt (asset-id universes only; the legacy
+    /// route never supported group keys). Against tapd (and current
+    /// rust-tap servers) a 404 means the proof does not exist, so the
+    /// fallback simply 404s again and `None` is returned.
     fn query_proof_leaf(
         &self,
-        asset_id: &AssetId,
-        proof_type: ProofType,
+        id: &UniverseId,
         outpoint: &OutPoint,
         script_key: &SerializedKey,
     ) -> Result<Option<ParsedProofLeaf>, UniverseError> {
-        let asset_id_hex = hex_encode(asset_id.as_bytes());
-        let proof_type_str = proof_type_rpc_str(proof_type)?;
+        let proof_type_str = proof_type_rpc_str(id.proof_type)?;
 
-        // tapd parses `leaf_key.op.hash_str` with
-        // `chainhash.NewHashFromStr`, which expects display order
-        // (reversed from internal), same as the insert path.
+        let mut txid_display = outpoint.txid;
+        txid_display.reverse();
+        let txid_hex = hex_encode(&txid_display);
+        let script_key_hex = hex_encode(script_key.as_bytes());
+
+        let url = format!(
+            "{}/v1/taproot-assets/universe/proofs/{}/{}/{}/{}?id.proof_type={}",
+            self.base_url,
+            Self::universe_id_path(id),
+            txid_hex,
+            outpoint.vout,
+            script_key_hex,
+            proof_type_str,
+        );
+
+        let response = match ureq::get(&url).call() {
+            Ok(response) => response,
+            // 404: the proof does not exist, or (older rust-tap
+            // servers) the GET route itself is absent. 405: the route
+            // exists but rejects GET. Fall back to the legacy POST
+            // query route once.
+            Err(ureq::Error::Status(404 | 405, _)) => {
+                return self.query_proof_leaf_legacy(
+                    id,
+                    outpoint,
+                    script_key,
+                    proof_type_str,
+                );
+            }
+            // tapd reports a missing proof as a plain error
+            // (`universe.ErrNoUniverseProofFound`, gRPC code Unknown),
+            // which its REST gateway surfaces as a 500 whose message
+            // contains "no universe proof found". Map that miss to
+            // None instead of a sync error.
+            Err(ureq::Error::Status(500, response)) => {
+                let body =
+                    response.into_string().unwrap_or_default();
+                if body.contains("no universe proof found") {
+                    return Ok(None);
+                }
+                return Err(UniverseError::SyncError(format!(
+                    "query_proof HTTP 500: {}",
+                    body.trim()
+                )));
+            }
+            Err(e) => {
+                return Err(UniverseError::SyncError(format!(
+                    "query_proof HTTP error: {}",
+                    e
+                )))
+            }
+        };
+
+        let json: serde_json::Value = response.into_json().map_err(|e| {
+            UniverseError::SyncError(format!("parse response: {}", e))
+        })?;
+
+        parse_asset_proof_response(&json).map(Some)
+    }
+
+    /// Legacy proof query fallback for older rust-tap `tap-server`
+    /// builds: `POST /v1/taproot-assets/universe/proofs/query/{id}/{proof_type}`
+    /// with the leaf key in the body (txid in display order). This
+    /// route is NOT part of tapd's REST gateway; it is only attempted
+    /// after the tapd-native GET failed with 404/405 (see
+    /// [`Self::query_proof_leaf`]). Group-key universes never had a
+    /// legacy route, so they resolve to `None` directly.
+    fn query_proof_leaf_legacy(
+        &self,
+        id: &UniverseId,
+        outpoint: &OutPoint,
+        script_key: &SerializedKey,
+        proof_type_str: &str,
+    ) -> Result<Option<ParsedProofLeaf>, UniverseError> {
+        if id.group_key.is_some() {
+            return Ok(None);
+        }
+        let asset_id_hex = hex_encode(id.asset_id.as_bytes());
+
         let mut txid_display = outpoint.txid;
         txid_display.reverse();
         let txid_hex = hex_encode(&txid_display);
@@ -167,19 +269,18 @@ impl HttpUniverseClient {
         );
 
         let response = match ureq::post(&url).send_json(&body) {
-            Ok(response) => response,
-            Err(ureq::Error::Status(404, _)) => return Ok(None),
+            // Both "proof not found" and "route not found" (tapd, or a
+            // rust-tap server new enough to have dropped the legacy
+            // route) map to None: the primary GET already said 404.
+            Err(ureq::Error::Status(404 | 405, _)) => return Ok(None),
             Err(e) => {
                 return Err(UniverseError::SyncError(format!(
-                    "query_proof HTTP error: {}",
+                    "query_proof legacy HTTP error: {}",
                     e
                 )))
             }
+            Ok(response) => response,
         };
-
-        if response.status() == 404 {
-            return Ok(None);
-        }
 
         let json: serde_json::Value = response.into_json().map_err(|e| {
             UniverseError::SyncError(format!("parse response: {}", e))
@@ -329,8 +430,7 @@ impl DiffEngine for HttpUniverseClient {
         key: &LeafKey,
     ) -> Result<Option<UniverseProof>, UniverseError> {
         let parsed = match self.query_proof_leaf(
-            &id.asset_id,
-            id.proof_type,
+            id,
             &key.outpoint,
             &key.script_key,
         )? {
