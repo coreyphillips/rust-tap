@@ -21,10 +21,17 @@
 //! this server over its universe backend, and peers point
 //! `HttpUniverseClient` + `SimpleSyncer` at it (`tap_universe::sync_all`).
 //!
-//! Note on tapd interop: tapd itself federates over gRPC, not REST, so
-//! a tapd node cannot sync *from* this server yet; a tonic/gRPC layer
-//! is a documented follow-up. tapd's REST-speaking tooling and our own
-//! client can query and push proofs against this server.
+//! Note on tapd interop: tapd itself federates over gRPC, not REST.
+//! With the `grpc` feature (on by default) this crate also serves the
+//! `universerpc.Universe` gRPC service (module [`grpc`]) on a separate
+//! port, which is the tapd-native federation path: a peer running tapd
+//! (or rust-tap's `tap_grpc::GrpcUniverseClient`) can sync from this
+//! server over gRPC. REST remains for gateway-style clients (tapd's
+//! REST tooling, `HttpUniverseClient`). The gRPC subset served is
+//! `AssetRoots`, `QueryAssetRoots`, `AssetLeafKeys`, `AssetLeaves`,
+//! `QueryProof`, `InsertProof` and `Info`; all remaining universe RPCs
+//! answer `Unimplemented` (see the [`grpc`] module docs for the
+//! explicit list and the inclusion-proof interop caveat).
 //!
 //! Layering:
 //!
@@ -35,10 +42,17 @@
 //! - [`rest`]: the axum [`Router`] binding the REST paths to the
 //!   service via `spawn_blocking` (the core stays synchronous; tokio
 //!   and axum live only in this crate).
+//! - [`grpc`] (feature `grpc`): the tonic layer binding the
+//!   `universerpc.Universe` service to the same [`UniverseService`];
+//!   marshaling only, via `tap_grpc::convert`.
 //!
 //! The `tap-universe-server` binary (feature `sqlite`) serves a
-//! SQLite-backed universe from the command line.
+//! SQLite-backed universe from the command line; with the `grpc`
+//! feature, `--grpc-listen <addr>` additionally serves gRPC in the
+//! same tokio runtime.
 
+#[cfg(feature = "grpc")]
+pub mod grpc;
 pub mod json;
 pub mod rest;
 pub mod service;

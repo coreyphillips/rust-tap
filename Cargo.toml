@@ -5,6 +5,7 @@ members = [
     "tap-ldk",
     "tap-persist",
     "tap-universe",
+    "tap-grpc",
     "tap-node",
     "tap-server",
     "examples/quickstart",
