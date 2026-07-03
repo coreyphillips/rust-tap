@@ -63,6 +63,7 @@ pub mod mint;
 pub mod node;
 pub mod receive;
 pub mod send;
+pub mod supply;
 pub mod sync;
 pub mod tasks;
 pub mod types;

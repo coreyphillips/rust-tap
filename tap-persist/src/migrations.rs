@@ -23,6 +23,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (8, include_str!("../migrations/008_multi_asset_anchor.up.sql")),
     (9, include_str!("../migrations/009_pending_anchors.up.sql")),
     (10, include_str!("../migrations/010_address_key_descs.up.sql")),
+    (11, include_str!("../migrations/011_supply_staging.up.sql")),
 ];
 
 /// Runs all pending migrations against the given connection.
@@ -134,6 +135,10 @@ mod tests {
         assert!(tables.contains(&"supply_pre_commits".to_string()));
         assert!(tables.contains(&"ignore_tuples".to_string()));
         assert!(tables.contains(&"pending_anchors".to_string()));
+        assert!(tables.contains(&"supply_update_events".to_string()));
+        assert!(tables.contains(&"supply_key_descs".to_string()));
+        assert!(tables.contains(&"supply_delegation_keys".to_string()));
+        assert!(tables.contains(&"supply_asset_groups".to_string()));
     }
 
     #[test]

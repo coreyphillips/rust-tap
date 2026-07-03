@@ -54,6 +54,12 @@ pub(crate) enum AnchorKind {
     /// finished with real chain data, stored, and delivered to the
     /// recipient courier.
     Transfer(TransferAnchor),
+    /// A supply commitment transaction: on confirmation the commitment
+    /// block is attached, the commitment is verified with the node's
+    /// own supply verifier, the supply trees are updated, the
+    /// commitment is persisted, spent pre-commitments are marked, and
+    /// the staged supply update events are consumed.
+    SupplyCommit(SupplyCommitAnchor),
 }
 
 /// Context needed to finish a mint after confirmation.
@@ -64,6 +70,27 @@ pub(crate) struct MintAnchor {
     pub batch: MintingBatch,
     /// The taproot internal key of the mint (TAP commitment) output.
     pub internal_key: SerializedKey,
+    /// Per-tag group key reveals of the batch's grouped assets, used
+    /// for the genesis proofs' group key reveal records.
+    pub group_reveals: Vec<(String, tap_primitives::asset::GroupKeyReveal)>,
+    /// The delegation public key when the batch carries a
+    /// universe-commitments pre-commitment output (its descriptor is
+    /// persisted in the supply staging store when the node derived
+    /// it).
+    pub delegation_key: Option<SerializedKey>,
+}
+
+/// Context needed to finish a supply commitment after confirmation.
+#[derive(Clone)]
+pub(crate) struct SupplyCommitAnchor {
+    /// The asset group the commitment is for.
+    pub group_key: SerializedKey,
+    /// The commitment as broadcast (no commitment block yet).
+    pub commitment: tap_universe::supply::RootCommitment,
+    /// The staged supply update events frozen into this commitment.
+    /// Only these are consumed on confirmation; events staged after
+    /// broadcast stay queued for the next commitment.
+    pub events: Vec<tap_universe::supply::SupplyUpdateEvent>,
 }
 
 /// Context needed to finish a transfer after confirmation.
@@ -130,6 +157,10 @@ pub struct TickSummary {
     pub pending_anchors: usize,
     /// Whether a periodic universe sync ran during this tick.
     pub universe_synced: bool,
+    /// Supply commitment transactions broadcast by the periodic supply
+    /// commit sweep during this tick (0 when the sweep is disabled or
+    /// not due, see `TapNodeConfig::supply_commit_interval_secs`).
+    pub supply_commits: usize,
     /// New universe leaves discovered by the periodic sync (0 when no
     /// sync ran).
     pub new_universe_leaves: usize,
@@ -178,6 +209,14 @@ where
                         crate::send::finish_transfer_confirmation(
                             node,
                             transfer.clone(),
+                            anchor.txid,
+                            &conf,
+                        )
+                    }
+                    AnchorKind::SupplyCommit(supply) => {
+                        crate::supply::finish_supply_commit_confirmation(
+                            node,
+                            supply.clone(),
                             anchor.txid,
                             &conf,
                         )
@@ -264,7 +303,40 @@ where
         }
     }
 
-    // -- (c) Prune expired RFQ quotes. --
+    // -- (c) Periodic supply commitment sweep. --
+    //
+    // Gated by config; only groups with staged updates are committed
+    // (Go's supply commit ticker also only produces a commitment when
+    // pending updates exist). Groups whose previous commitment is
+    // still awaiting confirmation are skipped; their staged updates
+    // stay queued (dangling updates).
+    let supply_interval = node.config.supply_commit_interval_secs;
+    if supply_interval > 0 {
+        let due = {
+            let last = node
+                .last_supply_commit
+                .lock()
+                .expect("last supply commit lock");
+            match *last {
+                None => true,
+                Some(at) => at.elapsed().as_secs() >= supply_interval,
+            }
+        };
+        if due {
+            match crate::supply::sweep_supply_commits(node) {
+                Ok(committed) => summary.supply_commits = committed,
+                Err(e) => summary
+                    .errors
+                    .push(format!("supply commit sweep failed: {}", e)),
+            }
+            *node
+                .last_supply_commit
+                .lock()
+                .expect("last supply commit lock") = Some(Instant::now());
+        }
+    }
+
+    // -- (d) Prune expired RFQ quotes. --
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

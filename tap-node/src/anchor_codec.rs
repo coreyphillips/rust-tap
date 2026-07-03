@@ -47,20 +47,32 @@ use tap_primitives::commitment::{
     AssetCommitmentTree, TapCommitmentTree, TapCommitmentVersion,
 };
 use tap_primitives::encoding::asset::{decode_asset, encode_asset};
+use tap_primitives::mssmt::NodeHash;
 use tap_primitives::proof::{self, MetaReveal};
+use tap_universe::supply::{
+    RootCommitment, SupplySubTree, SupplyUpdateEvent,
+};
 
 use crate::tasks::{
-    AnchorKind, MintAnchor, PassiveAnchor, PendingAnchor, TransferAnchor,
+    AnchorKind, MintAnchor, PassiveAnchor, PendingAnchor,
+    SupplyCommitAnchor, TransferAnchor,
 };
 
 /// Store discriminator for mint anchors.
 pub(crate) const KIND_MINT: u8 = 0;
 /// Store discriminator for transfer anchors.
 pub(crate) const KIND_TRANSFER: u8 = 1;
+/// Store discriminator for supply commitment anchors.
+pub(crate) const KIND_SUPPLY_COMMIT: u8 = 2;
 
 /// Current payload format version. Bump when the layout changes;
 /// decoders reject versions they do not understand.
 const PAYLOAD_VERSION: u8 = 1;
+
+/// Mint payload format version: version 2 appends the group key
+/// reveals and the optional delegation key. Version-1 rows (written
+/// before supply commitment support) decode with empty defaults.
+const MINT_PAYLOAD_VERSION: u8 = 2;
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -74,6 +86,9 @@ pub(crate) fn encode_pending_anchor(
         AnchorKind::Mint(mint) => (KIND_MINT, encode_mint_payload(mint)),
         AnchorKind::Transfer(transfer) => {
             (KIND_TRANSFER, encode_transfer_payload(transfer))
+        }
+        AnchorKind::SupplyCommit(supply) => {
+            (KIND_SUPPLY_COMMIT, encode_supply_commit_payload(supply))
         }
     };
     StoredPendingAnchor {
@@ -97,6 +112,9 @@ pub(crate) fn decode_pending_anchor(
         KIND_TRANSFER => {
             AnchorKind::Transfer(decode_transfer_payload(&stored.payload)?)
         }
+        KIND_SUPPLY_COMMIT => AnchorKind::SupplyCommit(
+            decode_supply_commit_payload(&stored.payload)?,
+        ),
         other => {
             return Err(format!("unknown pending anchor kind: {}", other))
         }
@@ -113,7 +131,7 @@ pub(crate) fn decode_pending_anchor(
 
 fn encode_mint_payload(mint: &MintAnchor) -> Vec<u8> {
     let mut buf = Vec::new();
-    buf.push(PAYLOAD_VERSION);
+    buf.push(MINT_PAYLOAD_VERSION);
 
     buf.extend_from_slice(&mint.batch.batch_key.pub_key.0);
     buf.extend_from_slice(&mint.internal_key.0);
@@ -144,6 +162,21 @@ fn encode_mint_payload(mint: &MintAnchor) -> Vec<u8> {
         write_var_bytes(&mut buf, &meta.encode());
     }
 
+    // Version 2: group key reveals per tag (for the genesis proofs of
+    // grouped assets) and the optional universe-commitments delegation
+    // key.
+    write_u32(&mut buf, mint.group_reveals.len() as u32);
+    for (tag, reveal) in &mint.group_reveals {
+        write_var_bytes(&mut buf, tag.as_bytes());
+        write_var_bytes(
+            &mut buf,
+            &proof::encode::encode_group_key_reveal(reveal),
+        );
+    }
+    write_opt(&mut buf, mint.delegation_key.as_ref(), |b, k| {
+        b.extend_from_slice(&k.0)
+    });
+
     buf
 }
 
@@ -152,7 +185,13 @@ fn decode_mint_payload(
     batch_store: &dyn BatchStore,
 ) -> Result<MintAnchor, String> {
     let mut r = Reader::new(payload);
-    r.expect_version("mint")?;
+    let version = r.u8()?;
+    if version != 1 && version != MINT_PAYLOAD_VERSION {
+        return Err(format!(
+            "unsupported pending mint anchor payload version: {}",
+            version
+        ));
+    }
 
     let batch_key = SerializedKey(r.array33()?);
     let internal_key = SerializedKey(r.array33()?);
@@ -185,6 +224,29 @@ fn decode_mint_payload(
             format!("pending mint anchor meta reveal: {}", e)
         })?;
         metas.push((tag, meta));
+    }
+
+    // Version 2: group key reveals and the delegation key. Version-1
+    // rows predate supply commitments and default to none.
+    let mut group_reveals = Vec::new();
+    let mut delegation_key = None;
+    if version >= 2 {
+        let reveal_count = r.u32()?;
+        for _ in 0..reveal_count {
+            let tag = String::from_utf8(r.var_bytes()?.to_vec()).map_err(
+                |e| format!("pending mint anchor group reveal tag: {}", e),
+            )?;
+            let reveal =
+                proof::decode::decode_group_key_reveal(r.var_bytes()?)
+                    .map_err(|e| {
+                        format!(
+                            "pending mint anchor group key reveal: {}",
+                            e
+                        )
+                    })?;
+            group_reveals.push((tag, reveal));
+        }
+        delegation_key = r.opt(|r| r.array33().map(SerializedKey))?;
     }
     r.finish()?;
 
@@ -234,7 +296,111 @@ fn decode_mint_payload(
     Ok(MintAnchor {
         batch,
         internal_key,
+        group_reveals,
+        delegation_key,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Supply commitment payload
+// ---------------------------------------------------------------------------
+
+fn encode_supply_commit_payload(supply: &SupplyCommitAnchor) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.push(PAYLOAD_VERSION);
+
+    buf.extend_from_slice(&supply.group_key.0);
+
+    let commitment = &supply.commitment;
+    write_var_bytes(
+        &mut buf,
+        &bitcoin::consensus::encode::serialize(&commitment.txn),
+    );
+    write_u32(&mut buf, commitment.tx_out_idx);
+    buf.extend_from_slice(&commitment.internal_key.0);
+    write_opt(&mut buf, commitment.output_key.as_ref(), |b, k| {
+        b.extend_from_slice(k)
+    });
+    buf.extend_from_slice(&commitment.supply_root_hash.0);
+    write_u64(&mut buf, commitment.supply_root_sum);
+    write_opt(&mut buf, commitment.spent_commitment.as_ref(), |b, op| {
+        write_outpoint(b, op)
+    });
+
+    // The staged events frozen into this commitment, with their
+    // sub-tree type discriminator and Go per-type encoding.
+    write_u32(&mut buf, supply.events.len() as u32);
+    for event in &supply.events {
+        buf.push(sub_tree_type_byte(event.sub_tree_type()));
+        write_var_bytes(&mut buf, &event.encode());
+    }
+
+    buf
+}
+
+fn decode_supply_commit_payload(
+    payload: &[u8],
+) -> Result<SupplyCommitAnchor, String> {
+    let mut r = Reader::new(payload);
+    r.expect_version("supply commit")?;
+
+    let group_key = SerializedKey(r.array33()?);
+
+    let raw_tx = r.var_bytes()?;
+    let txn: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize(raw_tx).map_err(|e| {
+            format!("pending supply commit anchor tx: {}", e)
+        })?;
+    let tx_out_idx = r.u32()?;
+    let internal_key = SerializedKey(r.array33()?);
+    let output_key = r.opt(|r| r.array32())?;
+    let supply_root_hash = NodeHash(r.array32()?);
+    let supply_root_sum = r.u64()?;
+    let spent_commitment = r.opt(|r| r.outpoint())?;
+
+    let event_count = r.u32()?;
+    let mut events = Vec::with_capacity(event_count as usize);
+    for _ in 0..event_count {
+        let tree_type = sub_tree_type_from_byte(r.u8()?)?;
+        let event = SupplyUpdateEvent::decode(tree_type, r.var_bytes()?)
+            .map_err(|e| {
+                format!("pending supply commit anchor event: {}", e)
+            })?;
+        events.push(event);
+    }
+    r.finish()?;
+
+    Ok(SupplyCommitAnchor {
+        group_key,
+        commitment: RootCommitment {
+            txn,
+            tx_out_idx,
+            internal_key,
+            output_key,
+            supply_root_hash,
+            supply_root_sum,
+            commitment_block: None,
+            spent_commitment,
+        },
+        events,
+    })
+}
+
+fn sub_tree_type_byte(tree_type: SupplySubTree) -> u8 {
+    match tree_type {
+        SupplySubTree::Mint => 0,
+        SupplySubTree::Burn => 1,
+        SupplySubTree::Ignore => 2,
+    }
+}
+
+fn sub_tree_type_from_byte(byte: u8) -> Result<SupplySubTree, String> {
+    match byte {
+        0 => Ok(SupplySubTree::Mint),
+        1 => Ok(SupplySubTree::Burn),
+        2 => Ok(SupplySubTree::Ignore),
+        other => Err(format!("unknown supply sub-tree type: {}", other)),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ description = "On-chain minting and transfer pipelines for Taproot Assets"
 
 [dependencies]
 tap-primitives = { path = "../tap-primitives" }
+tap-universe = { path = "../tap-universe", default-features = false }
 bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 bitcoin_hashes = { version = "0.14", default-features = false, features = ["std"] }
 secp256k1 = { version = "0.29", default-features = false, features = ["std", "global-context"] }

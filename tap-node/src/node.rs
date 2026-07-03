@@ -25,6 +25,9 @@ use tap_persist::batch_store::BatchStore;
 use tap_persist::mailbox_store::MailboxStore;
 use tap_persist::pending_anchor_store::PendingAnchorStore;
 use tap_persist::proof_store::ProofStore;
+use tap_persist::supply_store::{
+    SupplyCommitStore, SupplyStagingStore, SupplyTreeStore,
+};
 use tap_primitives::address::TapAddress;
 use tap_primitives::asset::{AssetId, OutPoint, SerializedKey};
 use tap_primitives::proof;
@@ -99,6 +102,15 @@ where
         Mutex<Box<dyn tap_universe::traits::UniverseBackend + Send>>,
     pub(crate) federation_db:
         Mutex<Box<dyn tap_universe::traits::FederationDb + Send>>,
+
+    // Universe supply commitments (authoring pipeline).
+    pub(crate) supply_tree_store: Mutex<Box<dyn SupplyTreeStore + Send>>,
+    pub(crate) supply_commit_store:
+        Mutex<Box<dyn SupplyCommitStore + Send>>,
+    pub(crate) supply_staging_store:
+        Mutex<Box<dyn SupplyStagingStore + Send>>,
+    // When the last periodic supply commit sweep ran.
+    pub(crate) last_supply_commit: Mutex<Option<Instant>>,
 
     // Events.
     pub(crate) event_bus: EventBus,
@@ -473,6 +485,111 @@ where
     /// Returns whether an SCID belongs to an asset channel.
     pub fn is_asset_channel(&self, scid: u64) -> bool {
         crate::lightning::is_asset_channel(self, scid)
+    }
+
+    // -- Universe supply commitments (delegates to crate::supply) --
+
+    /// Builds, funds, signs, and broadcasts a supply commitment
+    /// transaction for the given asset group from its staged supply
+    /// update events (mints, burns, ignores).
+    ///
+    /// Returns `Ok(None)` (a no-op) when the group has no staged
+    /// updates; otherwise returns the display-order txid of the
+    /// broadcast commitment transaction. The commitment is finished by
+    /// [`tick`](Self::tick) once it confirms: the commitment block is
+    /// attached, the whole commitment is verified with the node's own
+    /// supply verifier (initial or incremental path), and only then
+    /// are the supply trees updated, the commitment persisted, the
+    /// spent pre-commitments marked, and the staged events consumed.
+    /// Events staged while a commitment is in flight stay queued for
+    /// the next commitment (Go's dangling updates).
+    pub fn commit_supply(
+        &self,
+        group_key: &SerializedKey,
+    ) -> Result<Option<[u8; 32]>, TapNodeError> {
+        crate::supply::commit_supply(self, group_key)
+    }
+
+    /// Stages an ignore supply update for the given asset previous ID
+    /// (outpoint + asset ID + script key) and amount, signing the
+    /// ignore tuple with the asset group's delegation key via the
+    /// node's [`AssetSigner::sign_message_schnorr`] seam. The node
+    /// custodies delegation keys it derived during minting; for groups
+    /// whose delegation key is external, use
+    /// [`stage_supply_ignore`](Self::stage_supply_ignore) with an
+    /// externally signed tuple instead.
+    pub fn ignore_asset_outpoint(
+        &self,
+        prev_id: tap_primitives::asset::PrevId,
+        amount: u64,
+    ) -> Result<(), TapNodeError> {
+        crate::supply::ignore_asset_outpoint(self, prev_id, amount)
+    }
+
+    /// Stages an externally signed ignore tuple as a supply update for
+    /// its asset group. The signature is verified against the group's
+    /// delegation key before staging.
+    pub fn stage_supply_ignore(
+        &self,
+        signed_tuple: tap_universe::ignore::SignedIgnoreTuple,
+    ) -> Result<(), TapNodeError> {
+        crate::supply::stage_supply_ignore(self, signed_tuple)
+    }
+
+    /// Stages a burn supply update from a raw encoded burn proof (the
+    /// Go `BurnLeaf` encoding). The proof's asset group must be known.
+    ///
+    /// Note: the node does not yet have a burn send flow, so burns are
+    /// staged through this API by the embedder; once burns are wired
+    /// into the send pipeline, its confirmation path will stage the
+    /// event automatically, mirroring the mint path.
+    pub fn stage_supply_burn(
+        &self,
+        raw_burn_proof: &[u8],
+    ) -> Result<(), TapNodeError> {
+        crate::supply::stage_supply_burn(self, raw_burn_proof)
+    }
+
+    /// Returns the staged (not yet committed) supply update events of
+    /// the given asset group.
+    pub fn staged_supply_updates(
+        &self,
+        group_key: &SerializedKey,
+    ) -> Result<Vec<tap_universe::supply::SupplyUpdateEvent>, TapNodeError>
+    {
+        self.supply_staging_store
+            .lock()
+            .expect("supply staging store lock")
+            .staged_updates(group_key)
+            .map_err(TapNodeError::Storage)
+    }
+
+    /// Returns the latest persisted (confirmed and verified) supply
+    /// commitment of the given asset group, if any.
+    pub fn latest_supply_commitment(
+        &self,
+        group_key: &SerializedKey,
+    ) -> Result<Option<tap_universe::supply::RootCommitment>, TapNodeError>
+    {
+        self.supply_commit_store
+            .lock()
+            .expect("supply commit store lock")
+            .latest_commitment(group_key)
+            .map_err(TapNodeError::Storage)
+    }
+
+    /// Returns the unspent supply pre-commitment outputs of the given
+    /// asset group.
+    pub fn unspent_supply_pre_commits(
+        &self,
+        group_key: &SerializedKey,
+    ) -> Result<Vec<tap_universe::supply::PreCommitment>, TapNodeError>
+    {
+        self.supply_commit_store
+            .lock()
+            .expect("supply commit store lock")
+            .unspent_pre_commits(group_key)
+            .map_err(TapNodeError::Storage)
     }
 
     // -- Universe Sync (delegates to crate::sync) --

@@ -23,13 +23,17 @@
 //!   `supply-sub-<type>-<group_key_hex>`).
 //! - [`SupplyCommitStore`]: verified on-chain supply commitments and
 //!   pre-commitment outputs.
-//!
-//! The authoring state machine's WAL tables (pending transitions,
-//! update events) are deferred together with the state machine itself.
+//! - [`SupplyStagingStore`]: the authoring pipeline's staged supply
+//!   update queue (Go's `supply_update_events` WAL table, simplified
+//!   to upsert-by-leaf-key / delete-on-commit) plus the key and group
+//!   metadata the pipeline needs across restarts (delegation keys,
+//!   commit internal key descriptors, asset-to-group mapping).
+//!   Migration 011.
 
 use std::collections::HashMap;
 
-use tap_primitives::asset::{OutPoint, SerializedKey};
+use tap_onchain::chain::KeyDescriptor;
+use tap_primitives::asset::{AssetId, OutPoint, SerializedKey};
 use tap_primitives::mssmt::NodeHash;
 use tap_universe::supply::{
     apply_tree_updates, new_supply_tree, update_root_supply_tree,
@@ -145,6 +149,91 @@ pub trait SupplyCommitStore {
         pre_commit_outpoint: &OutPoint,
         spent_by: &OutPoint,
     ) -> Result<(), String>;
+}
+
+/// The staging queue of supply update events awaiting inclusion in the
+/// next supply commitment of their asset group, plus the supply
+/// pipeline's durable key/group metadata.
+///
+/// Mirrors the role of Go's `supply_update_events` table
+/// (tapdb/supply_commit.md): update events are persisted as they are
+/// produced (mint/burn confirmation, ignore requests) and consumed when
+/// the commitment including them is confirmed and applied. This port
+/// simplifies Go's WAL transitions: rows are keyed by their universe
+/// leaf key (upsert semantics, so replays of idempotent confirmation
+/// handling cannot duplicate a leaf) and are deleted once committed.
+/// Events staged while a commitment transaction is in flight simply
+/// stay queued for the next commitment (Go's "dangling updates").
+pub trait SupplyStagingStore {
+    /// Stages (upserts) a supply update event for the group. Events are
+    /// keyed by `(group_key, sub_tree_type, universe_leaf_key)`, so
+    /// staging the same logical update twice replaces it.
+    fn stage_update(
+        &mut self,
+        group_key: &SerializedKey,
+        update: &SupplyUpdateEvent,
+    ) -> Result<(), String>;
+
+    /// Returns all staged updates of the group, in staging order.
+    fn staged_updates(
+        &self,
+        group_key: &SerializedKey,
+    ) -> Result<Vec<SupplyUpdateEvent>, String>;
+
+    /// Returns the group keys that currently have staged updates.
+    fn groups_with_staged_updates(
+        &self,
+    ) -> Result<Vec<SerializedKey>, String>;
+
+    /// Removes the given staged updates (matched by sub-tree type and
+    /// universe leaf key). Missing rows are ignored, so a replayed
+    /// confirmation is harmless.
+    fn remove_staged_updates(
+        &mut self,
+        group_key: &SerializedKey,
+        updates: &[SupplyUpdateEvent],
+    ) -> Result<(), String>;
+
+    /// Persists the key descriptor of a supply-pipeline key (delegation
+    /// key or supply commitment internal key), so its raw key can be
+    /// re-identified for signing after a restart.
+    fn save_key_descriptor(
+        &mut self,
+        desc: &KeyDescriptor,
+    ) -> Result<(), String>;
+
+    /// Returns the stored key descriptor for the given public key.
+    fn key_descriptor(
+        &self,
+        pub_key: &SerializedKey,
+    ) -> Result<Option<KeyDescriptor>, String>;
+
+    /// Records the delegation key of an asset group.
+    fn set_delegation_key(
+        &mut self,
+        group_key: &SerializedKey,
+        delegation_key: &SerializedKey,
+    ) -> Result<(), String>;
+
+    /// Returns the delegation key of an asset group, if known.
+    fn delegation_key(
+        &self,
+        group_key: &SerializedKey,
+    ) -> Result<Option<SerializedKey>, String>;
+
+    /// Records that the given asset belongs to the given (tweaked)
+    /// group key.
+    fn map_asset_group(
+        &mut self,
+        asset_id: &AssetId,
+        group_key: &SerializedKey,
+    ) -> Result<(), String>;
+
+    /// Returns the (tweaked) group key of the given asset, if known.
+    fn asset_group(
+        &self,
+        asset_id: &AssetId,
+    ) -> Result<Option<SerializedKey>, String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -321,12 +410,149 @@ impl SupplyCommitStore for MemorySupplyCommitStore {
     }
 }
 
+/// In-memory [`SupplyStagingStore`].
+#[derive(Default)]
+pub struct MemorySupplyStagingStore {
+    /// Per group key: staged updates as (sub-tree type, leaf key,
+    /// encoded event), in insertion order.
+    staged: Vec<([u8; 33], SupplySubTree, [u8; 32], Vec<u8>)>,
+    key_descs: HashMap<[u8; 33], KeyDescriptor>,
+    delegation_keys: HashMap<[u8; 33], SerializedKey>,
+    asset_groups: HashMap<[u8; 32], SerializedKey>,
+}
+
+impl MemorySupplyStagingStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl SupplyStagingStore for MemorySupplyStagingStore {
+    fn stage_update(
+        &mut self,
+        group_key: &SerializedKey,
+        update: &SupplyUpdateEvent,
+    ) -> Result<(), String> {
+        let tree_type = update.sub_tree_type();
+        let leaf_key = update.universe_leaf_key();
+        let encoded = update.encode();
+
+        // Upsert by (group, type, leaf key).
+        for row in self.staged.iter_mut() {
+            if row.0 == *group_key.as_bytes()
+                && row.1 == tree_type
+                && row.2 == leaf_key
+            {
+                row.3 = encoded;
+                return Ok(());
+            }
+        }
+        self.staged
+            .push((*group_key.as_bytes(), tree_type, leaf_key, encoded));
+        Ok(())
+    }
+
+    fn staged_updates(
+        &self,
+        group_key: &SerializedKey,
+    ) -> Result<Vec<SupplyUpdateEvent>, String> {
+        self.staged
+            .iter()
+            .filter(|row| row.0 == *group_key.as_bytes())
+            .map(|row| {
+                SupplyUpdateEvent::decode(row.1, &row.3)
+                    .map_err(|e| e.to_string())
+            })
+            .collect()
+    }
+
+    fn groups_with_staged_updates(
+        &self,
+    ) -> Result<Vec<SerializedKey>, String> {
+        let mut groups = Vec::new();
+        for row in &self.staged {
+            let key = SerializedKey(row.0);
+            if !groups.contains(&key) {
+                groups.push(key);
+            }
+        }
+        Ok(groups)
+    }
+
+    fn remove_staged_updates(
+        &mut self,
+        group_key: &SerializedKey,
+        updates: &[SupplyUpdateEvent],
+    ) -> Result<(), String> {
+        for update in updates {
+            let tree_type = update.sub_tree_type();
+            let leaf_key = update.universe_leaf_key();
+            self.staged.retain(|row| {
+                !(row.0 == *group_key.as_bytes()
+                    && row.1 == tree_type
+                    && row.2 == leaf_key)
+            });
+        }
+        Ok(())
+    }
+
+    fn save_key_descriptor(
+        &mut self,
+        desc: &KeyDescriptor,
+    ) -> Result<(), String> {
+        self.key_descs.insert(*desc.pub_key.as_bytes(), desc.clone());
+        Ok(())
+    }
+
+    fn key_descriptor(
+        &self,
+        pub_key: &SerializedKey,
+    ) -> Result<Option<KeyDescriptor>, String> {
+        Ok(self.key_descs.get(pub_key.as_bytes()).cloned())
+    }
+
+    fn set_delegation_key(
+        &mut self,
+        group_key: &SerializedKey,
+        delegation_key: &SerializedKey,
+    ) -> Result<(), String> {
+        self.delegation_keys
+            .insert(*group_key.as_bytes(), *delegation_key);
+        Ok(())
+    }
+
+    fn delegation_key(
+        &self,
+        group_key: &SerializedKey,
+    ) -> Result<Option<SerializedKey>, String> {
+        Ok(self.delegation_keys.get(group_key.as_bytes()).copied())
+    }
+
+    fn map_asset_group(
+        &mut self,
+        asset_id: &AssetId,
+        group_key: &SerializedKey,
+    ) -> Result<(), String> {
+        self.asset_groups.insert(*asset_id.as_bytes(), *group_key);
+        Ok(())
+    }
+
+    fn asset_group(
+        &self,
+        asset_id: &AssetId,
+    ) -> Result<Option<SerializedKey>, String> {
+        Ok(self.asset_groups.get(asset_id.as_bytes()).copied())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SQLite implementations
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "sqlite")]
-pub use sqlite_impl::{SqliteSupplyCommitStore, SqliteSupplyTreeStore};
+pub use sqlite_impl::{
+    SqliteSupplyCommitStore, SqliteSupplyStagingStore, SqliteSupplyTreeStore,
+};
 
 #[cfg(feature = "sqlite")]
 mod sqlite_impl {
@@ -858,6 +1084,246 @@ mod sqlite_impl {
             Ok(())
         }
     }
+
+    /// SQLite-backed [`SupplyStagingStore`] over the migration-011
+    /// tables (`supply_update_events`, `supply_key_descs`,
+    /// `supply_delegation_keys`, `supply_asset_groups`).
+    pub struct SqliteSupplyStagingStore {
+        db: std::sync::Arc<SqliteDb>,
+    }
+
+    impl SqliteSupplyStagingStore {
+        pub fn new(db: std::sync::Arc<SqliteDb>) -> Self {
+            SqliteSupplyStagingStore { db }
+        }
+    }
+
+    impl SupplyStagingStore for SqliteSupplyStagingStore {
+        fn stage_update(
+            &mut self,
+            group_key: &SerializedKey,
+            update: &SupplyUpdateEvent,
+        ) -> Result<(), String> {
+            let conn = self.db.conn.lock().map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT INTO supply_update_events \
+                 (group_key, sub_tree_type, leaf_key, event_data) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(group_key, sub_tree_type, leaf_key) \
+                 DO UPDATE SET event_data = excluded.event_data",
+                params![
+                    &group_key.as_bytes()[..],
+                    update.sub_tree_type().as_str(),
+                    &update.universe_leaf_key()[..],
+                    &update.encode()[..],
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        fn staged_updates(
+            &self,
+            group_key: &SerializedKey,
+        ) -> Result<Vec<SupplyUpdateEvent>, String> {
+            let conn = self.db.conn.lock().map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT sub_tree_type, event_data \
+                     FROM supply_update_events WHERE group_key = ?1 \
+                     ORDER BY id",
+                )
+                .map_err(|e| e.to_string())?;
+
+            let rows = stmt
+                .query_map(params![&group_key.as_bytes()[..]], |row| {
+                    let tree_type: String = row.get(0)?;
+                    let data: Vec<u8> = row.get(1)?;
+                    Ok((tree_type, data))
+                })
+                .map_err(|e| e.to_string())?;
+
+            let mut updates = Vec::new();
+            for row in rows {
+                let (tree_type, data) = row.map_err(|e| e.to_string())?;
+                let tree_type = SupplySubTree::from_str_name(&tree_type)
+                    .ok_or_else(|| {
+                        format!("unknown sub-tree type: {}", tree_type)
+                    })?;
+                updates.push(
+                    SupplyUpdateEvent::decode(tree_type, &data)
+                        .map_err(|e| e.to_string())?,
+                );
+            }
+            Ok(updates)
+        }
+
+        fn groups_with_staged_updates(
+            &self,
+        ) -> Result<Vec<SerializedKey>, String> {
+            let conn = self.db.conn.lock().map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT group_key FROM supply_update_events \
+                     GROUP BY group_key ORDER BY MIN(id)",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(|e| e.to_string())?;
+
+            let mut groups = Vec::new();
+            for row in rows {
+                let bytes = row.map_err(|e| e.to_string())?;
+                let key: [u8; 33] = bytes
+                    .try_into()
+                    .map_err(|_| "invalid group key length".to_string())?;
+                groups.push(SerializedKey(key));
+            }
+            Ok(groups)
+        }
+
+        fn remove_staged_updates(
+            &mut self,
+            group_key: &SerializedKey,
+            updates: &[SupplyUpdateEvent],
+        ) -> Result<(), String> {
+            let conn = self.db.conn.lock().map_err(|e| e.to_string())?;
+            for update in updates {
+                conn.execute(
+                    "DELETE FROM supply_update_events \
+                     WHERE group_key = ?1 AND sub_tree_type = ?2 \
+                     AND leaf_key = ?3",
+                    params![
+                        &group_key.as_bytes()[..],
+                        update.sub_tree_type().as_str(),
+                        &update.universe_leaf_key()[..],
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+
+        fn save_key_descriptor(
+            &mut self,
+            desc: &KeyDescriptor,
+        ) -> Result<(), String> {
+            let conn = self.db.conn.lock().map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT OR REPLACE INTO supply_key_descs \
+                 (pub_key, key_family, key_index) VALUES (?1, ?2, ?3)",
+                params![
+                    &desc.pub_key.as_bytes()[..],
+                    desc.family,
+                    desc.index,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        fn key_descriptor(
+            &self,
+            pub_key: &SerializedKey,
+        ) -> Result<Option<KeyDescriptor>, String> {
+            let conn = self.db.conn.lock().map_err(|e| e.to_string())?;
+            conn.query_row(
+                "SELECT key_family, key_index FROM supply_key_descs \
+                 WHERE pub_key = ?1",
+                params![&pub_key.as_bytes()[..]],
+                |row| {
+                    Ok(KeyDescriptor {
+                        family: row.get(0)?,
+                        index: row.get(1)?,
+                        pub_key: *pub_key,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        }
+
+        fn set_delegation_key(
+            &mut self,
+            group_key: &SerializedKey,
+            delegation_key: &SerializedKey,
+        ) -> Result<(), String> {
+            let conn = self.db.conn.lock().map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT OR REPLACE INTO supply_delegation_keys \
+                 (group_key, delegation_key) VALUES (?1, ?2)",
+                params![
+                    &group_key.as_bytes()[..],
+                    &delegation_key.as_bytes()[..],
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        fn delegation_key(
+            &self,
+            group_key: &SerializedKey,
+        ) -> Result<Option<SerializedKey>, String> {
+            let conn = self.db.conn.lock().map_err(|e| e.to_string())?;
+            conn.query_row(
+                "SELECT delegation_key FROM supply_delegation_keys \
+                 WHERE group_key = ?1",
+                params![&group_key.as_bytes()[..]],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .map(|bytes| {
+                bytes
+                    .try_into()
+                    .map(SerializedKey)
+                    .map_err(|_| "invalid delegation key length".to_string())
+            })
+            .transpose()
+        }
+
+        fn map_asset_group(
+            &mut self,
+            asset_id: &AssetId,
+            group_key: &SerializedKey,
+        ) -> Result<(), String> {
+            let conn = self.db.conn.lock().map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT OR REPLACE INTO supply_asset_groups \
+                 (asset_id, group_key) VALUES (?1, ?2)",
+                params![
+                    &asset_id.as_bytes()[..],
+                    &group_key.as_bytes()[..],
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        fn asset_group(
+            &self,
+            asset_id: &AssetId,
+        ) -> Result<Option<SerializedKey>, String> {
+            let conn = self.db.conn.lock().map_err(|e| e.to_string())?;
+            conn.query_row(
+                "SELECT group_key FROM supply_asset_groups \
+                 WHERE asset_id = ?1",
+                params![&asset_id.as_bytes()[..]],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .map(|bytes| {
+                bytes
+                    .try_into()
+                    .map(SerializedKey)
+                    .map_err(|_| "invalid group key length".to_string())
+            })
+            .transpose()
+        }
+    }
 }
 
 #[cfg(all(test, feature = "sqlite"))]
@@ -1113,6 +1579,123 @@ mod tests {
                 .unwrap()
                 .is_none());
         }
+    }
+
+    /// Staged supply updates round-trip through both backends with
+    /// upsert-by-leaf-key and delete-on-commit semantics, and the key
+    /// and group metadata round-trips.
+    #[test]
+    fn test_supply_staging_store_round_trip() {
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut sqlite_store =
+            SqliteSupplyStagingStore::new(Arc::clone(&db));
+        let mut memory_store = MemorySupplyStagingStore::new();
+
+        for store in [
+            &mut sqlite_store as &mut dyn SupplyStagingStore,
+            &mut memory_store as &mut dyn SupplyStagingStore,
+        ] {
+            // Empty store: no groups, no updates.
+            assert!(store.groups_with_staged_updates().unwrap().is_empty());
+            assert!(store.staged_updates(&group_key()).unwrap().is_empty());
+
+            let first = ignore_update(0, 100);
+            let second = ignore_update(1, 250);
+            store.stage_update(&group_key(), &first).unwrap();
+            store.stage_update(&group_key(), &second).unwrap();
+
+            // Re-staging the same leaf key upserts instead of adding.
+            let first_replaced = ignore_update(0, 175);
+            assert_eq!(
+                first.universe_leaf_key(),
+                first_replaced.universe_leaf_key()
+            );
+            store.stage_update(&group_key(), &first_replaced).unwrap();
+
+            let staged = store.staged_updates(&group_key()).unwrap();
+            assert_eq!(staged.len(), 2);
+            let sums: Vec<u64> = staged
+                .iter()
+                .map(|u| u.universe_leaf_node().unwrap().node_sum())
+                .collect();
+            assert_eq!(sums, vec![175, 250]);
+
+            // The staged encodings match the Go event encodings.
+            assert_eq!(staged[0].encode(), first_replaced.encode());
+            assert_eq!(staged[1].encode(), second.encode());
+
+            assert_eq!(
+                store.groups_with_staged_updates().unwrap(),
+                vec![group_key()]
+            );
+
+            // Consuming a subset removes exactly those rows; removing
+            // a missing row is a no-op.
+            store
+                .remove_staged_updates(
+                    &group_key(),
+                    &[first_replaced.clone(), ignore_update(9, 1)],
+                )
+                .unwrap();
+            let staged = store.staged_updates(&group_key()).unwrap();
+            assert_eq!(staged.len(), 1);
+            assert_eq!(staged[0].encode(), second.encode());
+
+            store
+                .remove_staged_updates(&group_key(), &[second.clone()])
+                .unwrap();
+            assert!(store.staged_updates(&group_key()).unwrap().is_empty());
+            assert!(store.groups_with_staged_updates().unwrap().is_empty());
+
+            // Key descriptors.
+            let desc = tap_onchain::chain::KeyDescriptor {
+                family: 212,
+                index: 7,
+                pub_key: valid_script_key(),
+            };
+            assert!(store
+                .key_descriptor(&valid_script_key())
+                .unwrap()
+                .is_none());
+            store.save_key_descriptor(&desc).unwrap();
+            assert_eq!(
+                store.key_descriptor(&valid_script_key()).unwrap(),
+                Some(desc)
+            );
+
+            // Delegation keys and asset groups.
+            assert!(store.delegation_key(&group_key()).unwrap().is_none());
+            store
+                .set_delegation_key(&group_key(), &valid_script_key())
+                .unwrap();
+            assert_eq!(
+                store.delegation_key(&group_key()).unwrap(),
+                Some(valid_script_key())
+            );
+
+            let asset_id = AssetId([0x5A; 32]);
+            assert!(store.asset_group(&asset_id).unwrap().is_none());
+            store.map_asset_group(&asset_id, &group_key()).unwrap();
+            assert_eq!(
+                store.asset_group(&asset_id).unwrap(),
+                Some(group_key())
+            );
+        }
+    }
+
+    /// Staged rows written through one SQLite handle are visible to a
+    /// second handle over the same database (restart durability).
+    #[test]
+    fn test_supply_staging_store_shared_db() {
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut writer = SqliteSupplyStagingStore::new(Arc::clone(&db));
+        let update = ignore_update(3, 42);
+        writer.stage_update(&group_key(), &update).unwrap();
+
+        let reader = SqliteSupplyStagingStore::new(db);
+        let staged = reader.staged_updates(&group_key()).unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].encode(), update.encode());
     }
 
     /// Pre-commitments can be inserted, listed, and marked spent in

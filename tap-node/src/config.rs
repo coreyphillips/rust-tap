@@ -30,6 +30,15 @@ pub struct TapNodeConfig {
     /// in seconds (confirmation polling, periodic universe sync, RFQ
     /// quote pruning). See [`TapNode::tick`](crate::TapNode::tick).
     pub tick_interval_secs: u64,
+    /// Interval between automatic supply commitment attempts in
+    /// seconds (0 = disabled, the default). When enabled, each tick
+    /// checks whether the interval has elapsed and, if so, builds and
+    /// broadcasts a supply commitment for every asset group that has
+    /// staged supply updates (mirroring Go's supply commit ticker,
+    /// which also only commits when pending updates exist). Manual
+    /// commitments are always available via
+    /// [`TapNode::commit_supply`](crate::TapNode::commit_supply).
+    pub supply_commit_interval_secs: u64,
     /// RFQ quote lifetime in seconds.
     pub rfq_quote_lifetime_secs: u64,
     /// CSV delay for force-close outputs (blocks).
@@ -47,6 +56,7 @@ impl Default for TapNodeConfig {
             universe_servers: vec![],
             universe_sync_interval_secs: 600,
             tick_interval_secs: 30,
+            supply_commit_interval_secs: 0,
             rfq_quote_lifetime_secs: 3600,
             csv_delay_blocks: 144,
             default_conf_target: 6,

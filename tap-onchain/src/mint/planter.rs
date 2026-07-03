@@ -279,29 +279,57 @@ where
             assets.push(asset);
         }
 
-        // Build one AssetCommitment per asset ID (each seedling gets
-        // its own genesis tag, hence its own asset ID and tap
-        // commitment key) and combine them into the TapCommitment,
-        // retaining the MS-SMT trees so genesis inclusion proofs can
-        // be derived later.
+        batch.root_asset_commitment = Some(Self::build_commitment(&assets)?);
+        batch.sprouted_assets = assets;
+        batch.genesis_outpoint = Some(genesis_point);
+        batch.mint_output_index = Some(tap_output_index);
+
+        Ok(())
+    }
+
+    /// Builds the batch Taproot Asset commitment from the given
+    /// sprouted assets: one AssetCommitment per asset ID (each seedling
+    /// gets its own genesis tag, hence its own asset ID and tap
+    /// commitment key), combined into the TapCommitment, retaining the
+    /// MS-SMT trees so genesis inclusion proofs can be derived later.
+    fn build_commitment(
+        assets: &[Asset],
+    ) -> Result<TapCommitmentTree, MintError> {
         let mut asset_commitments = Vec::with_capacity(assets.len());
-        for asset in &assets {
+        for asset in assets {
             let asset_commitment = AssetCommitmentTree::new(&[asset])
                 .map_err(|e| MintError::CommitmentError(e.to_string()))?;
             asset_commitments.push(asset_commitment);
         }
 
-        let tap_commitment = TapCommitmentTree::new(
-            TapCommitmentVersion::V2,
-            asset_commitments,
-        )
-        .map_err(|e| MintError::CommitmentError(e.to_string()))?;
+        TapCommitmentTree::new(TapCommitmentVersion::V2, asset_commitments)
+            .map_err(|e| MintError::CommitmentError(e.to_string()))
+    }
 
-        batch.root_asset_commitment = Some(tap_commitment);
-        batch.sprouted_assets = assets;
-        batch.genesis_outpoint = Some(genesis_point);
-        batch.mint_output_index = Some(tap_output_index);
+    /// Applies `f` to the sprouted assets of the committed batch and
+    /// rebuilds the batch's Taproot Asset commitment from the modified
+    /// assets. Used by the node mint flow to attach group keys and
+    /// group genesis witnesses after the fund-once re-commit (the
+    /// group key derivation needs the final asset IDs, which are only
+    /// known once the real genesis point is fixed).
+    ///
+    /// Only valid in the `Committed` state.
+    pub fn update_sprouted_assets<F>(&mut self, f: F) -> Result<(), MintError>
+    where
+        F: FnOnce(&mut [Asset]) -> Result<(), MintError>,
+    {
+        let batch = self
+            .pending_batch
+            .as_mut()
+            .ok_or(MintError::NoPendingBatch)?;
 
+        if batch.state != BatchState::Committed {
+            return Err(MintError::BatchNotPending(batch.state));
+        }
+
+        f(&mut batch.sprouted_assets)?;
+        batch.root_asset_commitment =
+            Some(Self::build_commitment(&batch.sprouted_assets)?);
         Ok(())
     }
 

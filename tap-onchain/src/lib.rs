@@ -25,3 +25,4 @@ pub mod mint;
 pub mod proof;
 pub mod psbt;
 pub mod send;
+pub mod supply_commit;

@@ -75,6 +75,20 @@ pub enum TapEvent {
     },
     /// Universe sync completed.
     UniverseSyncCompleted { new_assets_discovered: usize },
+    /// A supply commitment transaction was broadcast for an asset
+    /// group. The `txid` is in display byte order.
+    SupplyCommitmentBroadcast {
+        group_key: SerializedKey,
+        txid: [u8; 32],
+    },
+    /// A supply commitment was confirmed on-chain, verified against
+    /// the node's own supply verifier, and persisted (trees applied,
+    /// staged updates consumed). The `txid` is in display byte order.
+    SupplyCommitmentConfirmed {
+        group_key: SerializedKey,
+        txid: [u8; 32],
+        block_height: u32,
+    },
     /// A background tick finished having done work or hit errors.
     /// Emitted by [`TapNode::tick`](crate::TapNode::tick) only when
     /// the tick confirmed anchors, ran a universe sync, or recorded

@@ -43,6 +43,10 @@ pub struct MintedAsset {
     pub amount: u64,
     /// Script key for this asset.
     pub script_key: SerializedKey,
+    /// The tweaked group key of the asset, when it was minted into an
+    /// asset group (seedling `enable_emission` or universe supply
+    /// commitments enabled).
+    pub group_key: Option<SerializedKey>,
 }
 
 /// Handle tracking an in-progress asset transfer.
