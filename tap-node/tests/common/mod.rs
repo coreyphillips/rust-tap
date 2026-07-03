@@ -476,3 +476,92 @@ pub fn to_internal(txid_display: [u8; 32]) -> [u8; 32] {
     txid.reverse();
     txid
 }
+
+// ---------------------------------------------------------------------------
+// SQLite-backed harness (restart simulation)
+// ---------------------------------------------------------------------------
+
+static TEMP_DIR_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A unique, self-cleaning temporary directory for SQLite-backed
+/// harnesses.
+pub struct TempDir {
+    pub path: std::path::PathBuf,
+}
+
+impl TempDir {
+    pub fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "tap-node-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            TEMP_DIR_COUNTER
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+        ));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        TempDir { path }
+    }
+
+    /// The SQLite database path inside this directory.
+    pub fn db_path(&self) -> std::path::PathBuf {
+        self.path.join("tap.sqlite")
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A harness whose default stores (asset, proof, batch, pending
+/// anchor) are all SQLite-backed over `db_path`. Building a second
+/// harness over the same path simulates a node restart on the same
+/// database.
+pub struct DbHarness {
+    pub node: Arc<SharedTestNode>,
+    pub chain: Arc<FakeChain>,
+    pub courier: Arc<MockCourier>,
+    pub events: std::sync::mpsc::Receiver<TapEvent>,
+}
+
+impl DbHarness {
+    /// Drains all currently queued events.
+    pub fn drain_events(&self) -> Vec<TapEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.events.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+}
+
+/// Builds a node over the shared fakes with SQLite default stores at
+/// `db_path`.
+pub fn build_db_harness(db_path: &std::path::Path) -> DbHarness {
+    let mut config = TapNodeConfig::default();
+    config.db_path = Some(db_path.to_path_buf());
+
+    let chain = Arc::new(FakeChain::new());
+    let courier = Arc::new(MockCourier::new());
+
+    let node = TapNodeBuilder::new(config)
+        .set_chain_bridge(SharedChain(Arc::clone(&chain)))
+        .set_wallet_anchor(FakeWallet)
+        .set_key_ring(FakeKeys::new())
+        .set_ldk_ops(FakeLdk)
+        .set_price_oracle(FakeOracle)
+        .set_courier(Box::new(SharedCourier(Arc::clone(&courier))))
+        .build()
+        .expect("node builds");
+
+    let events = node.event_receiver().expect("event receiver");
+
+    DbHarness {
+        node: Arc::new(node),
+        chain,
+        courier,
+        events,
+    }
+}

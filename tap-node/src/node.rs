@@ -23,6 +23,7 @@ use tap_onchain::proof::mailbox::{MailboxSigner, MailboxTransport};
 use tap_persist::asset_store::AssetStore;
 use tap_persist::batch_store::BatchStore;
 use tap_persist::mailbox_store::MailboxStore;
+use tap_persist::pending_anchor_store::PendingAnchorStore;
 use tap_persist::proof_store::ProofStore;
 use tap_primitives::address::TapAddress;
 use tap_primitives::asset::{AssetId, OutPoint, SerializedKey};
@@ -104,8 +105,15 @@ where
     pub(crate) event_receiver: Mutex<Option<mpsc::Receiver<TapEvent>>>,
 
     // Anchor transactions awaiting confirmation (mints and transfers
-    // broadcast by this node). Resolved by `tick()`.
+    // broadcast by this node). Resolved by `tick()`. Mirrored in
+    // `pending_anchor_store` so a restart between broadcast and
+    // confirmation does not lose proof generation/delivery; reloaded
+    // from the store when the node is built.
     pub(crate) pending_anchors: Mutex<Vec<crate::tasks::PendingAnchor>>,
+    // Durable mirror of `pending_anchors`. Written at broadcast time,
+    // rows removed once the anchor is resolved by `tick()`.
+    pub(crate) pending_anchor_store:
+        Mutex<Box<dyn PendingAnchorStore + Send>>,
     // When the last periodic universe sync ran.
     pub(crate) last_universe_sync: Mutex<Option<Instant>>,
 

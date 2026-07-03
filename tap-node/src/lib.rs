@@ -53,6 +53,7 @@
 //! let addr = node.new_address(asset_id, 100)?;
 //! ```
 
+mod anchor_codec;
 pub mod builder;
 pub mod config;
 pub mod error;

@@ -13,6 +13,8 @@
 //! - [`asset_store`]: Tracking owned assets and their proofs
 //! - [`batch_store`]: Minting batch state persistence
 //! - [`proof_store`]: Proof file storage and retrieval
+//! - [`pending_anchor_store`]: Broadcast anchor transactions awaiting
+//!   confirmation
 //! - [`ignore_store`]: Signed ignore tuples + is_ignored lookups
 //! - [`supply_store`]: Universe supply trees and supply commitments
 
@@ -20,6 +22,7 @@ pub mod asset_store;
 pub mod batch_store;
 pub mod ignore_store;
 pub mod mailbox_store;
+pub mod pending_anchor_store;
 pub mod proof_store;
 pub mod supply_store;
 

@@ -184,7 +184,26 @@ where
                     }
                 };
                 match result {
-                    Ok(()) => summary.confirmed_anchors += 1,
+                    Ok(()) => {
+                        summary.confirmed_anchors += 1;
+                        // Drop the durable copy: the anchor is fully
+                        // processed and must not be replayed after a
+                        // restart. A removal failure is non-fatal (the
+                        // finish steps are idempotent, so a replay is
+                        // harmless) but reported.
+                        let removed = node
+                            .pending_anchor_store
+                            .lock()
+                            .expect("pending anchor store lock")
+                            .remove_anchor(&anchor.txid);
+                        if let Err(e) = removed {
+                            summary.errors.push(format!(
+                                "removing resolved anchor from store \
+                                 failed: {}",
+                                e
+                            ));
+                        }
+                    }
                     Err(e) => {
                         // Keep the anchor and retry next tick; the
                         // finish steps are idempotent.

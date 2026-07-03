@@ -575,28 +575,37 @@ where
         .flatten();
 
     // Step 9: Register with the confirmation watcher and report the
-    // broadcast.
+    // broadcast. The anchor is written through to the durable
+    // pending-anchor store, so a restart between broadcast and
+    // confirmation still finishes and delivers the proofs.
+    let anchor = PendingAnchor {
+        txid: txid_internal,
+        kind: AnchorKind::Transfer(TransferAnchor {
+            asset_id,
+            amount,
+            recipient_script_key: recipient.script_key,
+            recipient_outpoint,
+            recipient_suffix,
+            change_script_key: has_change.then(|| {
+                result.prepared.root_asset.script_key.pub_key
+            }),
+            change_outpoint: has_change.then_some(change_outpoint),
+            change_suffix,
+            base_file,
+            courier_url: recipient.proof_courier_addr.clone(),
+            passive: passive_suffixes,
+        }),
+    };
+    let stored = crate::anchor_codec::encode_pending_anchor(&anchor);
     node.pending_anchors
         .lock()
         .expect("pending anchors lock")
-        .push(PendingAnchor {
-            txid: txid_internal,
-            kind: AnchorKind::Transfer(TransferAnchor {
-                asset_id,
-                amount,
-                recipient_script_key: recipient.script_key,
-                recipient_outpoint,
-                recipient_suffix,
-                change_script_key: has_change.then(|| {
-                    result.prepared.root_asset.script_key.pub_key
-                }),
-                change_outpoint: has_change.then_some(change_outpoint),
-                change_suffix,
-                base_file,
-                courier_url: recipient.proof_courier_addr.clone(),
-                passive: passive_suffixes,
-            }),
-        });
+        .push(anchor);
+    node.pending_anchor_store
+        .lock()
+        .expect("pending anchor store lock")
+        .upsert_anchor(&stored)
+        .map_err(TapNodeError::Storage)?;
 
     node.event_bus.emit(TapEvent::TransferBroadcast {
         asset_id,

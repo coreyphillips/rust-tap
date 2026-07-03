@@ -336,17 +336,26 @@ where
 
     // Step 10: Register the mint transaction with the confirmation
     // watcher. Confirmation, genesis proof generation, and universe
-    // registration happen in `TapNode::tick`.
+    // registration happen in `TapNode::tick`. The anchor is written
+    // through to the durable pending-anchor store first, so a restart
+    // between broadcast and confirmation still finishes the mint.
+    let anchor = PendingAnchor {
+        txid: txid_internal,
+        kind: AnchorKind::Mint(MintAnchor {
+            batch,
+            internal_key: internal_key_desc.pub_key,
+        }),
+    };
+    let stored = crate::anchor_codec::encode_pending_anchor(&anchor);
     node.pending_anchors
         .lock()
         .expect("pending anchors lock")
-        .push(PendingAnchor {
-            txid: txid_internal,
-            kind: AnchorKind::Mint(MintAnchor {
-                batch,
-                internal_key: internal_key_desc.pub_key,
-            }),
-        });
+        .push(anchor);
+    node.pending_anchor_store
+        .lock()
+        .expect("pending anchor store lock")
+        .upsert_anchor(&stored)
+        .map_err(TapNodeError::Storage)?;
 
     Ok(MintResult {
         batch_key: batch_key.pub_key,

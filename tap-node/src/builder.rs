@@ -21,6 +21,9 @@ use tap_onchain::proof::mailbox::{MailboxSigner, MailboxTransport};
 use tap_persist::asset_store::{AssetStore, MemoryAssetStore};
 use tap_persist::batch_store::{BatchStore, MemoryBatchStore};
 use tap_persist::mailbox_store::{MailboxStore, MemoryMailboxStore};
+use tap_persist::pending_anchor_store::{
+    MemoryPendingAnchorStore, PendingAnchorStore,
+};
 use tap_persist::proof_store::{MemoryProofStore, ProofStore};
 use tap_universe::memory::{MemoryFederationDb, MemoryUniverseBackend};
 
@@ -96,6 +99,7 @@ pub struct TapNodeBuilder<C, W, K, L, P> {
     asset_store: Option<Box<dyn AssetStore + Send>>,
     proof_store: Option<Box<dyn ProofStore + Send>>,
     batch_store: Option<Box<dyn BatchStore + Send>>,
+    pending_anchor_store: Option<Box<dyn PendingAnchorStore + Send>>,
     courier: Option<Box<dyn Courier + Send + Sync>>,
     mailbox_transport: Option<Box<dyn MailboxTransport + Send + Sync>>,
     mailbox_signer: Option<Box<dyn MailboxSigner + Send + Sync>>,
@@ -122,6 +126,7 @@ where
             asset_store: None,
             proof_store: None,
             batch_store: None,
+            pending_anchor_store: None,
             courier: None,
             mailbox_transport: None,
             mailbox_signer: None,
@@ -183,6 +188,17 @@ where
         store: Box<dyn BatchStore + Send>,
     ) -> Self {
         self.batch_store = Some(store);
+        self
+    }
+
+    /// Overrides the default pending anchor store (the durable watch
+    /// list of broadcast mint/transfer anchor transactions awaiting
+    /// confirmation).
+    pub fn set_pending_anchor_store(
+        mut self,
+        store: Box<dyn PendingAnchorStore + Send>,
+    ) -> Self {
+        self.pending_anchor_store = Some(store);
         self
     }
 
@@ -254,7 +270,8 @@ where
             &self.config,
             self.asset_store.is_none()
                 || self.proof_store.is_none()
-                || self.batch_store.is_none(),
+                || self.batch_store.is_none()
+                || self.pending_anchor_store.is_none(),
         )?;
         let asset_store: Box<dyn AssetStore + Send> = match self
             .asset_store
@@ -274,6 +291,21 @@ where
             Some(store) => store,
             None => default_batch_store(&default_db),
         };
+        let pending_anchor_store: Box<dyn PendingAnchorStore + Send> =
+            match self.pending_anchor_store {
+                Some(store) => store,
+                None => default_pending_anchor_store(&default_db),
+            };
+
+        // Reload the durable pending-anchor watch list so a restart
+        // between broadcast and confirmation still finishes the mint
+        // (genesis proofs + universe registration) or transfer (proof
+        // storage + delivery) once the anchor confirms. Mint anchors
+        // reload their batch from the batch store by key.
+        let pending_anchors = restore_pending_anchors(
+            pending_anchor_store.as_ref(),
+            batch_store.as_ref(),
+        )?;
 
         // Create the courier. Without an explicit courier, a
         // configured `courier_url` gets an HTTP courier using the URL
@@ -333,6 +365,7 @@ where
             asset_store: Mutex::new(asset_store),
             proof_store: Mutex::new(proof_store),
             batch_store: Mutex::new(batch_store),
+            pending_anchor_store: Mutex::new(pending_anchor_store),
             courier,
             mailbox_transport: self.mailbox_transport,
             mailbox_signer: self.mailbox_signer,
@@ -341,7 +374,7 @@ where
             federation_db: Mutex::new(federation_db),
             event_bus,
             event_receiver: Mutex::new(Some(event_receiver)),
-            pending_anchors: Mutex::new(Vec::new()),
+            pending_anchors: Mutex::new(pending_anchors),
             last_universe_sync: Mutex::new(None),
             running: AtomicBool::new(false),
             worker: Mutex::new(None),
@@ -416,4 +449,51 @@ fn default_batch_store(
         )),
         _ => Box::new(MemoryBatchStore::new()),
     }
+}
+
+fn default_pending_anchor_store(
+    db: &Option<DefaultDb>,
+) -> Box<dyn PendingAnchorStore + Send> {
+    match db {
+        #[cfg(feature = "sqlite")]
+        Some(db) => Box::new(
+            tap_persist::pending_anchor_store::SqlitePendingAnchorStore::new(
+                Arc::clone(db),
+            ),
+        ),
+        _ => Box::new(MemoryPendingAnchorStore::new()),
+    }
+}
+
+/// Reloads the persisted pending anchors into the in-memory watch
+/// list, deduplicating by txid so a reload can never double-register an
+/// anchor. Mint anchors reload their batch from the batch store by
+/// batch key; a payload that cannot be decoded (or references a
+/// missing batch) fails the build rather than silently dropping the
+/// anchor.
+fn restore_pending_anchors(
+    pending_anchor_store: &dyn PendingAnchorStore,
+    batch_store: &dyn BatchStore,
+) -> Result<Vec<crate::tasks::PendingAnchor>, TapNodeError> {
+    let stored = pending_anchor_store
+        .list_anchors()
+        .map_err(TapNodeError::Storage)?;
+
+    let mut restored = Vec::with_capacity(stored.len());
+    let mut seen = std::collections::HashSet::new();
+    for row in stored {
+        if !seen.insert(row.txid) {
+            continue;
+        }
+        let anchor =
+            crate::anchor_codec::decode_pending_anchor(&row, batch_store)
+                .map_err(|e| {
+                    TapNodeError::Storage(format!(
+                        "restoring pending anchor: {}",
+                        e
+                    ))
+                })?;
+        restored.push(anchor);
+    }
+    Ok(restored)
 }
