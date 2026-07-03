@@ -141,6 +141,124 @@ mod tests {
     }
 
     #[test]
+    fn test_v1_asset_witness_survives_round_trip() {
+        // Regression: Go's tappsbt custom fields always encode assets
+        // with Normal encoding (asset.LeafEncoder delegates to
+        // Asset.Encode); applying the MS-SMT segwit-for-V1 rule here
+        // silently dropped V1 witnesses from virtual packets.
+        use crate::asset::{
+            Asset, AssetType, AssetVersion, Genesis, OutPoint, PrevId,
+            ScriptKey, SerializedKey, Witness,
+        };
+        use crate::address::TapNetwork;
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+
+        // Real curve points are required: the decoder validates keys.
+        let secp = Secp256k1::new();
+        let key_a = SerializedKey(
+            PublicKey::from_secret_key(
+                &secp,
+                &SecretKey::from_slice(&[0x11; 32]).expect("valid"),
+            )
+            .serialize(),
+        );
+        let key_b = SerializedKey(
+            PublicKey::from_secret_key(
+                &secp,
+                &SecretKey::from_slice(&[0x22; 32]).expect("valid"),
+            )
+            .serialize(),
+        );
+
+        let genesis = Genesis {
+            first_prev_out: OutPoint {
+                txid: [0x01; 32],
+                vout: 0,
+            },
+            tag: "v1-witness".to_string(),
+            meta_hash: [0u8; 32],
+            output_index: 0,
+            asset_type: AssetType::Normal,
+        };
+        let mut asset = Asset::new_genesis(
+            genesis,
+            500,
+            ScriptKey::from_pub_key(key_a),
+        );
+        asset.version = AssetVersion::V1;
+        asset.prev_witnesses = vec![Witness {
+            prev_id: Some(PrevId {
+                out_point: OutPoint {
+                    txid: [0xAA; 32],
+                    vout: 1,
+                },
+                id: asset.genesis.id(),
+                script_key: key_a,
+            }),
+            tx_witness: vec![vec![0xEE; 64]],
+            split_commitment: None,
+        }];
+
+        let mut input = VInput::default();
+        input.prev_id = asset.prev_witnesses[0]
+            .prev_id
+            .clone()
+            .expect("prev id set");
+        input.asset = Some(asset.clone());
+
+        let output = VOutput {
+            amount: 500,
+            asset_version: 1,
+            output_type: VOutputType::SIMPLE,
+            interactive: true,
+            anchor_output_index: 0,
+            anchor_output_internal_key: None,
+            anchor_output_bip32_derivation: vec![],
+            anchor_output_taproot_bip32_derivation: vec![],
+            anchor_output_tapscript_sibling: None,
+            asset: Some(asset.clone()),
+            split_asset: None,
+            script_key: OutputScriptKey {
+                pub_key: key_b,
+                tweaked: None,
+            },
+            relative_lock_time: 0,
+            lock_time: 0,
+            proof_delivery_address: None,
+            proof_suffix: None,
+            alt_leaves: vec![],
+            address: None,
+        };
+
+        let packet = VPacket {
+            inputs: vec![input],
+            outputs: vec![output],
+            chain_params: TapNetwork::Regtest,
+            version: VPacketVersion::V1,
+        };
+
+        let bytes = packet.serialize().expect("serialize");
+        let decoded = VPacket::from_raw_bytes(&bytes).expect("decode");
+
+        let in_asset =
+            decoded.inputs[0].asset.as_ref().expect("input asset");
+        assert_eq!(in_asset.version, AssetVersion::V1);
+        assert_eq!(
+            in_asset.prev_witnesses[0].tx_witness,
+            vec![vec![0xEE; 64]],
+            "V1 input asset witness must survive the vPSBT round trip"
+        );
+
+        let out_asset =
+            decoded.outputs[0].asset.as_ref().expect("output asset");
+        assert_eq!(
+            out_asset.prev_witnesses[0].tx_witness,
+            vec![vec![0xEE; 64]],
+            "V1 output asset witness must survive the vPSBT round trip"
+        );
+    }
+
+    #[test]
     fn test_commitment_version_mapping() {
         use crate::commitment::TapCommitmentVersion;
 
