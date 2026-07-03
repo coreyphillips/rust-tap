@@ -16,7 +16,7 @@
 //! change -> watch for confirmation (via `TapNode::tick`) -> finish
 //! proofs with real chain data -> store + deliver proofs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bitcoin::secp256k1::XOnlyPublicKey;
 
@@ -34,8 +34,8 @@ use tap_onchain::proof::{
     BaseProofParams, OutputProofInfo, ProofSuffixOptions,
 };
 use tap_onchain::send::{
-    execute_transfer_with_version, SelectedInput, SendError,
-    TransferOutput, VirtualSigner,
+    execute_transfer_with_options, sign_passive_transition, SelectedInput,
+    SendError, TransferOptions, TransferOutput, VirtualSigner,
 };
 use tap_persist::asset_store::OwnedAsset;
 use tap_persist::proof_store::ProofLocator;
@@ -50,7 +50,9 @@ use tap_primitives::vm::InputSet;
 use crate::error::TapNodeError;
 use crate::event::TapEvent;
 use crate::node::TapNode;
-use crate::tasks::{AnchorKind, PendingAnchor, TransferAnchor};
+use crate::tasks::{
+    AnchorKind, PassiveAnchor, PendingAnchor, TransferAnchor,
+};
 use crate::types::TransferHandle;
 
 /// Sends an asset to a TAP address.
@@ -97,6 +99,35 @@ where
         });
     }
     let change_amount = total - amount;
+
+    // Step 1b: Collect the passive assets. Any OTHER unspent asset
+    // anchored at one of the selected inputs' outpoints (a sibling from
+    // a multi-asset mint batch, or the change of a prior transfer) would
+    // be silently consumed when its anchor UTXO is spent. Mirroring Go's
+    // passive assets (tapfreighter), we re-anchor each into the change
+    // output instead of dropping it.
+    let selected_ids: HashSet<(OutPoint, AssetId, SerializedKey)> = selected
+        .iter()
+        .map(|a| (a.anchor_outpoint, a.asset_id, a.script_key))
+        .collect();
+    let passive_owned: Vec<OwnedAsset> = {
+        let store = node.asset_store.lock().expect("asset store lock");
+        let mut seen_outpoints = HashSet::new();
+        let mut passives = Vec::new();
+        for input in &selected {
+            if !seen_outpoints.insert(input.anchor_outpoint) {
+                continue;
+            }
+            for owned in store.unspent_at_outpoint(&input.anchor_outpoint) {
+                let identity =
+                    (owned.anchor_outpoint, owned.asset_id, owned.script_key);
+                if !selected_ids.contains(&identity) {
+                    passives.push(owned);
+                }
+            }
+        }
+        passives
+    };
 
     // Step 2: Reconstruct the real genesis from the stored asset. All
     // selected inputs share the asset ID, hence the genesis.
@@ -168,10 +199,75 @@ where
             keys_by_script_key.insert(owned.script_key, desc.clone());
         }
     }
+    // The passive assets are signed with their own stored script key
+    // descriptors, so their keys must be resolvable by the same signer.
+    for owned in &passive_owned {
+        if let Some(desc) = &owned.script_key_desc {
+            keys_by_script_key.insert(owned.script_key, desc.clone());
+        }
+    }
     let signer = NodeVirtualSigner {
         keys: &*node.keys,
         keys_by_script_key,
     };
+
+    // Step 3b: Build and sign a full-value 1-in-1-out re-anchoring
+    // transition for each passive asset (Go's CreatePassiveAssets +
+    // SignPassiveAssets). Each keeps its script key and amount; its
+    // PrevID points at its old anchor outpoint and its witness is signed
+    // by its own key. An asset whose script key descriptor or genesis
+    // fields are unknown cannot be re-anchored, so the send is refused
+    // rather than silently dropping it.
+    let mut passive_work: Vec<PassiveWork> = Vec::with_capacity(
+        passive_owned.len(),
+    );
+    for owned in &passive_owned {
+        if owned.script_key_desc.is_none() {
+            return Err(TapNodeError::Storage(format!(
+                "cannot send from an outpoint carrying passive asset {}: \
+                 its script key descriptor is unknown, so it cannot be \
+                 re-anchored",
+                hex_id(&owned.asset_id)
+            )));
+        }
+        let passive_genesis = genesis_from_owned(owned)?;
+        let prev_id = PrevId {
+            out_point: owned.anchor_outpoint,
+            id: owned.asset_id,
+            script_key: owned.script_key,
+        };
+        let prev_asset = prev_asset_for(node, owned, &passive_genesis)?;
+        let signed = sign_passive_transition(
+            &prev_id,
+            &prev_asset,
+            &passive_genesis,
+            owned.amount,
+            AssetVersion::V0,
+            &ScriptKey::from_pub_key(owned.script_key),
+            &signer,
+        )
+        .map_err(TapNodeError::Send)?;
+
+        let base_file = node
+            .proof_store
+            .lock()
+            .expect("proof store lock")
+            .get_proof(&ProofLocator {
+                outpoint: owned.anchor_outpoint,
+                script_key: owned.script_key,
+            })
+            .ok()
+            .flatten();
+
+        passive_work.push(PassiveWork {
+            owned: owned.clone(),
+            genesis: passive_genesis,
+            signed,
+            base_file,
+        });
+    }
+    let passive_assets: Vec<Asset> =
+        passive_work.iter().map(|p| p.signed.clone()).collect();
 
     // Anchor output internal keys: a fresh key for the change output,
     // and the RECIPIENT's internal key (from the address) for the
@@ -187,15 +283,21 @@ where
 
     // Execute the transfer pipeline. The Taproot Asset commitment
     // version is dictated by the recipient's address version (V1 and
-    // V2 addresses require V2 commitments).
-    let result = execute_transfer_with_version(
+    // V2 addresses require V2 commitments). Passive assets are forced
+    // into a split (a tombstone change output for a full-value send) and
+    // merged into the change output's commitment.
+    let result = execute_transfer_with_options(
         &inputs,
         &outputs,
         &genesis,
         &prev_assets,
         &signer,
         &internal_keys,
-        recipient.commitment_version(),
+        &TransferOptions {
+            commitment_version: recipient.commitment_version(),
+            passive_assets,
+            ..TransferOptions::default()
+        },
     )
     .map_err(TapNodeError::Send)?;
 
@@ -260,12 +362,28 @@ where
         vout: recipient_vout,
     };
 
-    // Step 6: Mark inputs as spent.
+    // Step 6: Mark the spent inputs as spent, scoped to their exact
+    // identity so sibling passive assets at the same anchor outpoint are
+    // not silently flipped. Each passive asset's OLD identity is spent
+    // too (it moves to the change output below).
     {
         let mut store = node.asset_store.lock().expect("asset store lock");
         for input in &selected {
             store
-                .mark_spent(&input.anchor_outpoint)
+                .mark_spent(
+                    &input.anchor_outpoint,
+                    &input.asset_id,
+                    &input.script_key,
+                )
+                .map_err(TapNodeError::Storage)?;
+        }
+        for passive in &passive_work {
+            store
+                .mark_spent(
+                    &passive.owned.anchor_outpoint,
+                    &passive.owned.asset_id,
+                    &passive.owned.script_key,
+                )
                 .map_err(TapNodeError::Storage)?;
         }
     }
@@ -295,11 +413,40 @@ where
             .map_err(TapNodeError::Storage)?;
     }
 
+    // Step 7b: Persist each re-anchored passive asset at the change
+    // outpoint under its unchanged script key, so it stays spendable
+    // (its stored descriptor + genesis fields let follow-up sends sign
+    // it). Its old identity was marked spent above.
+    for work in &passive_work {
+        let mut owned = OwnedAsset::new(
+            work.owned.asset_id,
+            work.owned.amount,
+            change_outpoint,
+            work.owned.script_key,
+            0,
+        );
+        owned.script_key_desc = work.owned.script_key_desc.clone();
+        owned.internal_key = Some(change_internal_desc.clone());
+        owned.genesis_point = Some(work.genesis.first_prev_out);
+        owned.genesis_tag = Some(work.genesis.tag.clone());
+        owned.genesis_meta_hash = Some(work.genesis.meta_hash);
+        owned.genesis_output_index = Some(work.genesis.output_index);
+        owned.genesis_asset_type = Some(work.genesis.asset_type);
+        node.asset_store
+            .lock()
+            .expect("asset store lock")
+            .insert_asset(owned)
+            .map_err(TapNodeError::Storage)?;
+    }
+
     // Step 8: Create the transition proof suffixes now (all commitment
     // data is at hand); the chain data stays a placeholder until the
     // watcher sees the confirmation.
     let prev_out = selected[0].anchor_outpoint;
-    let (recipient_suffix, change_suffix) = if result.prepared.is_split {
+    let (recipient_suffix, change_suffix, passive_suffixes) = if result
+        .prepared
+        .is_split
+    {
         let asset_outputs = [
             OutputProofInfo {
                 asset: &result.prepared.root_asset,
@@ -342,12 +489,59 @@ where
         } else {
             None
         };
-        (recipient_suffix, change_suffix)
+
+        // A proof suffix for each passive asset re-anchored into the
+        // change output. Each is an additional asset in the change
+        // output's commitment, so its inclusion proof (and the STXO and
+        // exclusion proofs) come from the same tree-retaining
+        // commitment the change/recipient proofs use. The change output
+        // is represented by the passive asset itself (the proof target),
+        // the recipient output by the recipient split asset.
+        let mut passive_suffixes =
+            Vec::with_capacity(passive_work.len());
+        for (i, work) in passive_work.iter().enumerate() {
+            let passive_asset = &result.prepared.passive_assets[i];
+            let asset_outputs = [
+                OutputProofInfo {
+                    asset: passive_asset,
+                    anchor_output_index: change_vout,
+                    internal_key: change_internal_desc.pub_key,
+                    commitment: &result.prepared.change_commitment,
+                    tapscript_sibling: None,
+                },
+                OutputProofInfo {
+                    asset: &result.prepared.recipient_assets[0].asset,
+                    anchor_output_index: recipient_vout,
+                    internal_key: recipient.internal_key,
+                    commitment: &result.prepared.output_commitments[0],
+                    tapscript_sibling: None,
+                },
+            ];
+            let suffix = create_proof_suffix_with_options(
+                &anchor_tx,
+                work.owned.anchor_outpoint,
+                &asset_outputs,
+                0,
+                &[],
+                &ProofSuffixOptions::default(),
+            )
+            .map_err(TapNodeError::Storage)?;
+            passive_suffixes.push(PassiveAnchor {
+                outpoint: change_outpoint,
+                script_key: work.owned.script_key,
+                suffix,
+                base_file: work.base_file.clone(),
+            });
+        }
+
+        (recipient_suffix, change_suffix, passive_suffixes)
     } else {
-        // Full-value send: the root asset IS the recipient asset and
-        // there is no change to prove. The duplicate commitment placed
-        // in output 0 by the transfer template prevents exclusion
-        // proofs against it, so only the recipient output is listed.
+        // Full-value send with no passive assets: the root asset IS the
+        // recipient asset and there is no change to prove. The duplicate
+        // commitment placed in output 0 by the transfer template
+        // prevents exclusion proofs against it, so only the recipient
+        // output is listed. (A full-value send that carries passive
+        // assets is forced into the split branch above.)
         let asset_outputs = [OutputProofInfo {
             asset: &result.prepared.root_asset,
             anchor_output_index: recipient_vout,
@@ -364,7 +558,7 @@ where
             &ProofSuffixOptions::default(),
         )
         .map_err(TapNodeError::Storage)?;
-        (recipient_suffix, None)
+        (recipient_suffix, None, Vec::new())
     };
 
     // The (first) input's proof file is the base the new suffixes are
@@ -400,6 +594,7 @@ where
                 change_suffix,
                 base_file,
                 courier_url: recipient.proof_courier_addr.clone(),
+                passive: passive_suffixes,
             }),
         });
 
@@ -501,6 +696,30 @@ where
                     script_key: change_key,
                 },
                 change_file,
+            )
+            .map_err(TapNodeError::Storage)?;
+    }
+
+    // Store each re-anchored passive asset's proof: its own prior
+    // history plus the new suffix, at the change outpoint under its
+    // unchanged script key.
+    for passive in anchor.passive.iter_mut() {
+        update_proof_chain_data(&mut passive.suffix, &base)
+            .map_err(TapNodeError::Storage)?;
+        let mut file = passive
+            .base_file
+            .clone()
+            .unwrap_or_else(proof::file::File::new);
+        file.append_proof(proof::encode::encode_proof(&passive.suffix));
+        node.proof_store
+            .lock()
+            .expect("proof store lock")
+            .insert_proof(
+                ProofLocator {
+                    outpoint: passive.outpoint,
+                    script_key: passive.script_key,
+                },
+                file,
             )
             .map_err(TapNodeError::Storage)?;
     }
@@ -707,4 +926,19 @@ fn x_only_from_serialized(
     XOnlyPublicKey::from_slice(&key.0[1..]).map_err(|e| {
         TapNodeError::Storage(format!("invalid x-only key: {}", e))
     })
+}
+
+/// A passive asset being re-anchored: its old owned record, its
+/// reconstructed genesis, the signed re-anchoring transition, and its
+/// prior proof file (the base the new suffix appends to).
+struct PassiveWork {
+    owned: OwnedAsset,
+    genesis: Genesis,
+    signed: Asset,
+    base_file: Option<proof::file::File>,
+}
+
+/// Short hex of an asset id for error messages.
+fn hex_id(asset_id: &AssetId) -> String {
+    asset_id.0.iter().take(4).map(|b| format!("{:02x}", b)).collect()
 }

@@ -110,9 +110,24 @@ pub trait AssetStore {
     /// script key).
     fn insert_asset(&mut self, asset: OwnedAsset) -> Result<(), String>;
 
-    /// Marks every asset anchored at the outpoint as spent (spending
-    /// an anchor UTXO consumes all assets committed to in it).
-    fn mark_spent(&mut self, outpoint: &OutPoint) -> Result<(), String>;
+    /// Marks the single asset identified by (outpoint, asset ID, script
+    /// key) as spent. Only the exact asset being spent is flipped: a
+    /// sibling asset sharing the anchor UTXO (a multi-asset mint batch,
+    /// or the change of a prior transfer) must be re-anchored into a new
+    /// output rather than silently dropped, so it must never be flipped
+    /// here. Errors if no such asset exists.
+    fn mark_spent(
+        &mut self,
+        outpoint: &OutPoint,
+        asset_id: &AssetId,
+        script_key: &SerializedKey,
+    ) -> Result<(), String>;
+
+    /// Returns all unspent assets anchored at the given outpoint,
+    /// regardless of asset ID or script key. Used to discover the
+    /// "passive" assets that share an anchor with a spent input and must
+    /// be re-anchored (Go's passive-asset set).
+    fn unspent_at_outpoint(&self, outpoint: &OutPoint) -> Vec<OwnedAsset>;
 
     /// Returns all unspent assets for a given asset ID.
     fn get_unspent(&self, asset_id: &AssetId) -> Vec<OwnedAsset>;
@@ -155,19 +170,27 @@ impl AssetStore for MemoryAssetStore {
         Ok(())
     }
 
-    fn mark_spent(&mut self, outpoint: &OutPoint) -> Result<(), String> {
-        let mut found = false;
-        for asset in self.assets.values_mut() {
-            if asset.anchor_outpoint == *outpoint {
+    fn mark_spent(
+        &mut self,
+        outpoint: &OutPoint,
+        asset_id: &AssetId,
+        script_key: &SerializedKey,
+    ) -> Result<(), String> {
+        match self.assets.get_mut(&(*outpoint, *asset_id, *script_key)) {
+            Some(asset) => {
                 asset.spent = true;
-                found = true;
+                Ok(())
             }
+            None => Err("asset not found".into()),
         }
-        if found {
-            Ok(())
-        } else {
-            Err("asset not found".into())
-        }
+    }
+
+    fn unspent_at_outpoint(&self, outpoint: &OutPoint) -> Vec<OwnedAsset> {
+        self.assets
+            .values()
+            .filter(|a| a.anchor_outpoint == *outpoint && !a.spent)
+            .cloned()
+            .collect()
     }
 
     fn get_unspent(&self, asset_id: &AssetId) -> Vec<OwnedAsset> {
@@ -281,10 +304,75 @@ mod tests {
             txid: [0xAA; 32],
             vout: 0,
         };
-        store.mark_spent(&outpoint).unwrap();
+        store
+            .mark_spent(
+                &outpoint,
+                &AssetId([0xAA; 32]),
+                &SerializedKey([0x02; 33]),
+            )
+            .unwrap();
 
         assert_eq!(store.balance(&AssetId([0xAA; 32])), 0);
         assert!(store.get_unspent(&AssetId([0xAA; 32])).is_empty());
+    }
+
+    /// mark_spent must flip only the exact (outpoint, asset id, script
+    /// key) asset, leaving siblings sharing the anchor outpoint unspent
+    /// (the passive-asset preservation invariant).
+    #[test]
+    fn test_mark_spent_scoped_to_identity() {
+        let mut store = MemoryAssetStore::new();
+        let outpoint = OutPoint {
+            txid: [0xAA; 32],
+            vout: 0,
+        };
+
+        // Two sibling assets at the same anchor outpoint, distinct
+        // asset ids and script keys.
+        let mut a = test_asset(0xAA, 100, 0);
+        a.script_key = SerializedKey([0x02; 33]);
+        let mut b = test_asset(0xBB, 200, 0);
+        b.script_key = SerializedKey([0x03; 33]);
+        store.insert_asset(a).unwrap();
+        store.insert_asset(b).unwrap();
+
+        // Spend only asset A.
+        store
+            .mark_spent(
+                &outpoint,
+                &AssetId([0xAA; 32]),
+                &SerializedKey([0x02; 33]),
+            )
+            .unwrap();
+
+        // A is gone; B (the passive sibling) is untouched.
+        assert_eq!(store.balance(&AssetId([0xAA; 32])), 0);
+        assert_eq!(store.balance(&AssetId([0xBB; 32])), 200);
+
+        // unspent_at_outpoint returns only the surviving sibling.
+        let survivors = store.unspent_at_outpoint(&outpoint);
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].asset_id, AssetId([0xBB; 32]));
+    }
+
+    #[test]
+    fn test_mark_spent_wrong_identity_not_found() {
+        let mut store = MemoryAssetStore::new();
+        store.insert_asset(test_asset(0xAA, 100, 0)).unwrap();
+        let outpoint = OutPoint {
+            txid: [0xAA; 32],
+            vout: 0,
+        };
+        // Right outpoint, wrong script key: no such asset.
+        assert!(store
+            .mark_spent(
+                &outpoint,
+                &AssetId([0xAA; 32]),
+                &SerializedKey([0x09; 33]),
+            )
+            .is_err());
+        // The real asset stays unspent.
+        assert_eq!(store.balance(&AssetId([0xAA; 32])), 100);
     }
 
     fn test_burn(id_byte: u8, amount: u64, vout: u32) -> BurnRecord {

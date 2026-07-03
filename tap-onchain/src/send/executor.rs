@@ -58,6 +58,16 @@ pub struct TransferOptions {
     /// the default (false) matches Go, which merges STXO alt leaves
     /// for every regular send.
     pub no_stxo_proofs: bool,
+    /// Fully signed passive assets to re-anchor into the sender's change
+    /// output, mirroring Go's passive assets (`tapfreighter`). Each is a
+    /// full-value 1-in-1-out transition of an asset that shared an anchor
+    /// UTXO with a spent input but was not selected. When non-empty, the
+    /// transfer is forced to a split (a zero-amount tombstone root is
+    /// created for a full-value send) so a sender-owned change output
+    /// exists to carry them, and they are merged into that output's
+    /// commitment before the anchor scripts are computed. Empty for a
+    /// plain transfer.
+    pub passive_assets: Vec<tap_primitives::asset::Asset>,
 }
 
 /// Executes an end-to-end asset transfer.
@@ -141,12 +151,17 @@ pub fn execute_transfer_with_options(
 ) -> Result<TransferResult, SendError> {
     // Step 1: Prepare outputs (allocations + split commitments). This
     // fixes the split commitment root the signatures will commit to.
-    let mut prepared = TransferBuilder::prepare_outputs_with_version(
+    // Passive assets force a split so a sender-owned change/tombstone
+    // output exists to re-anchor them into.
+    let force_split = !options.passive_assets.is_empty();
+    let mut prepared = TransferBuilder::prepare_outputs_forced(
         inputs,
         outputs,
         genesis,
         options.commitment_version,
+        force_split,
     )?;
+    prepared.passive_assets = options.passive_assets.clone();
 
     // Step 2: Sign virtual transactions.
     sign_transfer(&mut prepared, prev_assets, signer)?;

@@ -113,6 +113,34 @@ where
     // Step 1: Freeze the batch.
     planter.freeze_batch()?;
 
+    // Step 1b: Assign each seedling a distinct, wallet-derived BIP-86
+    // script key with a stored descriptor (Go derives a fresh
+    // NewScriptKeyBip86 per asset). Sibling assets in a multi-asset
+    // batch would otherwise share the default batch-key script key,
+    // colliding in the proof store (one proof locator per (outpoint,
+    // script key)) and lacking independently spendable descriptors. The
+    // descriptors are recorded here and attached when the sprouted
+    // assets are persisted.
+    let seedling_names: Vec<String> = {
+        let batch = planter.pending_batch().ok_or(TapNodeError::Mint(
+            tap_onchain::mint::MintError::NoPendingBatch,
+        ))?;
+        batch.seedlings.keys().cloned().collect()
+    };
+    let mut script_key_descs: std::collections::HashMap<
+        SerializedKey,
+        tap_onchain::chain::KeyDescriptor,
+    > = std::collections::HashMap::new();
+    for name in &seedling_names {
+        let desc = node.keys.derive_next_key(TAPROOT_ASSETS_KEY_FAMILY)?;
+        let script_key =
+            tap_primitives::asset::ScriptKey::bip86(desc.pub_key);
+        script_key_descs.insert(script_key.pub_key, desc);
+        planter
+            .set_seedling_script_key(name, script_key)
+            .map_err(TapNodeError::Mint)?;
+    }
+
     let batch = planter.pending_batch().ok_or(TapNodeError::Mint(
         tap_onchain::mint::MintError::NoPendingBatch,
     ))?;
@@ -271,14 +299,12 @@ where
     for asset in &batch.sprouted_assets {
         let asset_id = asset.genesis.id();
 
-        // The script key descriptor is only known when the seedling
-        // did not override the script key: the default is the BIP-86
-        // tweaked batch key, so the raw descriptor is the batch key.
-        let script_key_desc = batch
-            .seedlings
-            .get(&asset.genesis.tag)
-            .filter(|s| s.script_key.is_none())
-            .map(|_| batch.batch_key.clone());
+        // The script key descriptor is the one derived for this asset's
+        // BIP-86 script key in step 1b (raw key behind the tweak). An
+        // asset whose script key was overridden externally has no known
+        // descriptor here.
+        let script_key_desc =
+            script_key_descs.get(&asset.script_key.pub_key).cloned();
 
         let mut owned = OwnedAsset::new(
             asset_id,

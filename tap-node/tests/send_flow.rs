@@ -24,6 +24,68 @@ use tap_onchain::proof::courier::{Courier, CourierLocator, Recipient};
 use tap_primitives::address::{AddressVersion, TapAddress, TapNetwork};
 use tap_primitives::asset::OutPoint;
 use tap_primitives::asset::ScriptKey;
+use tap_primitives::asset::SerializedKey;
+use tap_primitives::proof::{
+    BlockHeader, ChainLookup, DefaultMerkleVerifier, GroupVerifier,
+    HeaderVerifier, NoIgnoreChecker, ProofError, ProofVerificationOptions,
+    VerifierCtx,
+};
+
+// -- Full proof verifier (the oracle), matching the tap-onchain
+// transfer_proof_roundtrip tests: accept headers/groups, real Schnorr
+// witness and commitment verification, chain (PoW/merkle) checks skipped
+// because the fakes anchor in a synthetic block. --
+
+struct AcceptHeaders;
+impl HeaderVerifier for AcceptHeaders {
+    fn verify_header(
+        &self,
+        _header: &BlockHeader,
+        _height: u32,
+    ) -> Result<(), ProofError> {
+        Ok(())
+    }
+}
+
+struct AcceptGroups;
+impl GroupVerifier for AcceptGroups {
+    fn verify_group_key(
+        &self,
+        _group_key: &SerializedKey,
+    ) -> Result<(), ProofError> {
+        Ok(())
+    }
+}
+
+struct MockLookup;
+impl ChainLookup for MockLookup {
+    fn current_height(&self) -> Result<u32, ProofError> {
+        Ok(900_000)
+    }
+}
+
+fn verifier_ctx() -> VerifierCtx<
+    AcceptHeaders,
+    DefaultMerkleVerifier,
+    AcceptGroups,
+    MockLookup,
+    NoIgnoreChecker,
+> {
+    VerifierCtx::new(
+        AcceptHeaders,
+        DefaultMerkleVerifier,
+        AcceptGroups,
+        MockLookup,
+    )
+}
+
+fn verify_opts() -> ProofVerificationOptions {
+    ProofVerificationOptions {
+        challenge_bytes: None,
+        skip_chain_verification: true,
+        skip_time_lock_validation: false,
+    }
+}
 
 /// Mints and confirms an asset, returning the mint result.
 fn mint_confirmed(harness: &Harness, name: &str, amount: u64) -> MintResult {
@@ -226,6 +288,149 @@ fn test_send_spends_change_with_stored_descriptor() {
         .expect("proof stored");
     assert_eq!(file.num_proofs(), 3);
     assert!(file.verify_hash_chain());
+}
+
+#[test]
+fn test_send_reanchors_passive_sibling_asset() {
+    // Mint two assets in ONE batch (both anchored at the same mint
+    // output), send one of them fully, and assert the OTHER asset is not
+    // silently lost: it is re-anchored into the change output, keeps its
+    // descriptor, carries a stored proof that passes the full verifier,
+    // and remains spendable in a second hop.
+    let harness = default_harness();
+    let node = &harness.node;
+
+    node.queue_mint(tap_onchain::mint::Seedling::new_normal(
+        "asset-a".into(),
+        1_000,
+    ))
+    .expect("queue a");
+    node.queue_mint(tap_onchain::mint::Seedling::new_normal(
+        "asset-b".into(),
+        500,
+    ))
+    .expect("queue b");
+    let mint = node.finalize_mint().expect("finalize");
+    harness.chain.confirm_tx(&mint.signed_tx, 812_000);
+    let summary = node.tick().expect("tick");
+    assert_eq!(summary.confirmed_anchors, 1);
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    harness.drain_events();
+
+    assert_eq!(mint.assets.len(), 2);
+    let asset_a = mint
+        .assets
+        .iter()
+        .find(|a| a.name == "asset-a")
+        .expect("asset-a")
+        .asset_id;
+    let asset_b = mint
+        .assets
+        .iter()
+        .find(|a| a.name == "asset-b")
+        .expect("asset-b")
+        .asset_id;
+
+    // Both minted assets share the single mint anchor outpoint.
+    let mint_outpoint = OutPoint {
+        txid: to_internal(mint.txid.expect("mint txid")),
+        vout: mint.tap_output_index,
+    };
+    let minted: Vec<_> = node
+        .list_assets()
+        .expect("list")
+        .into_iter()
+        .filter(|o| o.anchor_outpoint == mint_outpoint)
+        .collect();
+    assert_eq!(minted.len(), 2);
+    assert_eq!(node.get_balance(&asset_a).expect("bal"), 1_000);
+    assert_eq!(node.get_balance(&asset_b).expect("bal"), 500);
+
+    // --- Send ALL of asset A. Asset B shares the anchor UTXO and must
+    // be re-anchored, not dropped. ---
+    let addr_a = recipient_address(asset_a, 1_000);
+    let handle = node.send_asset(asset_a, 1_000, &addr_a).expect("send A");
+    let send_txid = to_internal(handle.txid);
+
+    // Asset A is fully sent; asset B survives with its full amount.
+    assert_eq!(node.get_balance(&asset_a).expect("bal"), 0);
+    assert_eq!(node.get_balance(&asset_b).expect("bal"), 500);
+
+    // Exactly one owned asset remains: asset B, re-anchored at the send's
+    // change output (vout 0, a NEW outpoint). Asset A's zero-change
+    // tombstone is not persisted, and the old mint-outpoint rows for both
+    // A and B are marked spent.
+    let assets = node.list_assets().expect("list");
+    assert_eq!(assets.len(), 1);
+    let reanchored = &assets[0];
+    assert_eq!(reanchored.asset_id, asset_b);
+    assert_eq!(reanchored.amount, 500);
+    assert_eq!(reanchored.anchor_outpoint.txid, send_txid);
+    assert_eq!(reanchored.anchor_outpoint.vout, 0);
+    assert_ne!(reanchored.anchor_outpoint, mint_outpoint);
+    // It kept its script key, descriptor, and genesis fields, so it stays
+    // spendable.
+    assert!(reanchored.script_key_desc.is_some());
+    assert!(reanchored.internal_key.is_some());
+    assert_eq!(reanchored.genesis_tag.as_deref(), Some("asset-b"));
+
+    // Confirm the transfer; proofs are finished and stored.
+    let broadcast = harness.chain.last_broadcast().expect("broadcast");
+    harness.chain.confirm_tx(&broadcast, 812_500);
+    let summary = node.tick().expect("tick");
+    assert_eq!(summary.confirmed_anchors, 1);
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+
+    // Asset A's recipient received a valid (split) transfer proof.
+    let a_recipient_outpoint = OutPoint {
+        txid: send_txid,
+        vout: 1,
+    };
+    let a_file = node
+        .export_proof(&a_recipient_outpoint, &addr_a.script_key)
+        .expect("asset A recipient proof stored");
+    assert_eq!(a_file.num_proofs(), 2);
+    a_file
+        .verify(&verifier_ctx(), &verify_opts())
+        .expect("asset A recipient proof must verify");
+
+    // The re-anchored passive asset B has a stored proof (genesis ->
+    // re-anchor transition) that passes the full verifier.
+    let b_file = node
+        .export_proof(&reanchored.anchor_outpoint, &reanchored.script_key)
+        .expect("passive asset B proof stored");
+    assert_eq!(b_file.num_proofs(), 2);
+    b_file
+        .verify(&verifier_ctx(), &verify_opts())
+        .expect("passive asset B proof must verify");
+
+    // --- Asset B remains SPENDABLE: send part of it in a second hop
+    // (300 of 500, 200 change), proving the re-anchored asset can be
+    // spent again with its stored descriptor and proof history. ---
+    let addr_b = recipient_address(asset_b, 300);
+    let handle_b = node.send_asset(asset_b, 300, &addr_b).expect("send B");
+    assert_eq!(node.get_balance(&asset_b).expect("bal"), 200);
+
+    let broadcast = harness.chain.last_broadcast().expect("broadcast");
+    harness.chain.confirm_tx(&broadcast, 812_600);
+    let summary = node.tick().expect("tick");
+    assert_eq!(summary.confirmed_anchors, 1);
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+
+    // The second-hop recipient proof carries the full provenance:
+    // genesis -> passive re-anchor -> hop 2, and verifies end to end.
+    let b2_outpoint = OutPoint {
+        txid: to_internal(handle_b.txid),
+        vout: 1,
+    };
+    let b2_file = node
+        .export_proof(&b2_outpoint, &addr_b.script_key)
+        .expect("asset B hop-2 proof stored");
+    assert_eq!(b2_file.num_proofs(), 3);
+    assert!(b2_file.verify_hash_chain());
+    b2_file
+        .verify(&verifier_ctx(), &verify_opts())
+        .expect("asset B hop-2 proof must verify");
 }
 
 #[test]

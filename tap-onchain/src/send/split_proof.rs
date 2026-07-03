@@ -56,13 +56,14 @@ pub fn populate_split_proofs(
         script_key: *prepared.root_asset.script_key.serialized(),
         amount: prepared.root_asset.amount,
     };
-    let mut unsigned_root = prepared.root_asset.clone();
-    unsigned_root.split_commitment_root = None;
-    for witness in &mut unsigned_root.prev_witnesses {
-        witness.tx_witness = vec![];
-        witness.split_commitment = None;
-    }
-    let root_leaf = asset_leaf(&unsigned_root);
+    // The root locator leaf is the spend-template copy of the root asset
+    // (single zero-`PrevID`, witnessless witness), matching the leaf
+    // inserted at preparation time in
+    // [`TransferBuilder::prepare_split_outputs`]. This mirrors Go's
+    // `commitment.NewSplitCommitment`, which never re-inserts the
+    // real-witness root asset into the tree.
+    let root_leaf =
+        asset_leaf(&super::transfer::root_spend_template(&prepared.root_asset));
     tree.insert(root_locator.hash(), root_leaf)
         .map_err(|e| SendError::SplitError(e.to_string()))?;
 

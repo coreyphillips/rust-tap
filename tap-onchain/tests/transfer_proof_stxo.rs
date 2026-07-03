@@ -192,6 +192,7 @@ fn run_transfer(no_stxo_proofs: bool) -> Setup {
         &TransferOptions {
             commitment_version: Some(TapCommitmentVersion::V2),
             no_stxo_proofs,
+            ..TransferOptions::default()
         },
     )
     .expect("transfer pipeline");
@@ -632,6 +633,7 @@ fn v1_full_value_send_proofs_verify() {
         &TransferOptions {
             commitment_version: Some(TapCommitmentVersion::V2),
             no_stxo_proofs: false,
+            ..TransferOptions::default()
         },
     )
     .expect("transfer pipeline");

@@ -96,6 +96,27 @@ pub(crate) struct TransferAnchor {
     /// The recipient's proof courier URL, from the destination
     /// address. Delivery is skipped when absent.
     pub courier_url: Option<String>,
+    /// Passive assets re-anchored into the change output: their finished
+    /// proof suffixes (placeholder chain data) and storage locators.
+    /// Stored on confirmation like the change proof.
+    pub passive: Vec<PassiveAnchor>,
+}
+
+/// A passive asset re-anchored into the change output of a transfer,
+/// awaiting the anchor confirmation to finish and store its proof.
+#[derive(Clone)]
+pub(crate) struct PassiveAnchor {
+    /// The change output's anchor outpoint the passive was re-anchored
+    /// into (internal byte order).
+    pub outpoint: OutPoint,
+    /// The passive asset's (unchanged) script key.
+    pub script_key: SerializedKey,
+    /// The transition proof suffix, with placeholder chain data until
+    /// confirmation.
+    pub suffix: proof::Proof,
+    /// The passive asset's prior proof file, used as the base the new
+    /// suffix is appended to. `None` when it had no stored history.
+    pub base_file: Option<proof::File>,
 }
 
 /// The outcome of one [`TapNode::tick`](crate::TapNode::tick).

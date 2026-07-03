@@ -43,11 +43,14 @@ fn test_mint_end_to_end() {
     assert_eq!(minted.name, "flow-token");
     assert_eq!(minted.amount, 1_000);
 
-    // The batch key is the first key the planter derived (index 0);
-    // the default script key is its BIP-86 tweak.
+    // The batch key is the first key the planter derived (index 0).
+    // Each seedling then gets its own wallet-derived BIP-86 script key
+    // (the sole seedling here is index 1), so sibling assets in a batch
+    // have distinct script keys, proof locators, and descriptors.
     let batch_key = FakeKeys::pub_key_for(0);
     assert_eq!(result.batch_key, batch_key);
-    let expected_script_key = ScriptKey::bip86(batch_key).pub_key;
+    let script_raw_key = FakeKeys::pub_key_for(1);
+    let expected_script_key = ScriptKey::bip86(script_raw_key).pub_key;
     assert_eq!(minted.script_key, expected_script_key);
 
     // The transaction was broadcast, and its TAP output committed by
@@ -71,7 +74,7 @@ fn test_mint_end_to_end() {
         Some(result.tap_output_index)
     );
     let script_desc = owned.script_key_desc.as_ref().expect("desc");
-    assert_eq!(script_desc.pub_key, batch_key);
+    assert_eq!(script_desc.pub_key, script_raw_key);
     assert_eq!(node.get_balance(&minted.asset_id).expect("bal"), 1_000);
 
     // The batch was persisted as Broadcast.

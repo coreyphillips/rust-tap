@@ -140,6 +140,28 @@ where
             .add_seedling(seedling)
     }
 
+    /// Sets the script key of a queued seedling by name, letting the
+    /// caller assign a distinct, wallet-derived script key per seedling
+    /// before the batch sprouts (Go derives a fresh `NewScriptKeyBip86`
+    /// per asset). Distinct script keys give sibling assets in a
+    /// multi-asset batch distinct proof locators and independently
+    /// spendable descriptors. Errors if the seedling is unknown.
+    pub fn set_seedling_script_key(
+        &mut self,
+        name: &str,
+        script_key: ScriptKey,
+    ) -> Result<(), MintError> {
+        let batch = self
+            .pending_batch
+            .as_mut()
+            .ok_or(MintError::NoPendingBatch)?;
+        let seedling = batch.seedlings.get_mut(name).ok_or_else(|| {
+            MintError::InvalidSeedling(format!("unknown seedling: {}", name))
+        })?;
+        seedling.script_key = Some(script_key);
+        Ok(())
+    }
+
     /// Freezes the current pending batch, preventing new seedlings.
     pub fn freeze_batch(&mut self) -> Result<(), MintError> {
         let batch = self

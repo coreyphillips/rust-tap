@@ -137,13 +137,24 @@ impl AssetStore for SqliteAssetStore {
         Ok(())
     }
 
-    fn mark_spent(&mut self, outpoint: &OutPoint) -> Result<(), String> {
+    fn mark_spent(
+        &mut self,
+        outpoint: &OutPoint,
+        asset_id: &AssetId,
+        script_key: &SerializedKey,
+    ) -> Result<(), String> {
         let conn = self.db.conn.lock().unwrap();
         let rows = conn
             .execute(
                 "UPDATE owned_assets SET spent = 1 \
-                 WHERE anchor_txid = ?1 AND anchor_vout = ?2",
-                params![&outpoint.txid[..], outpoint.vout],
+                 WHERE anchor_txid = ?1 AND anchor_vout = ?2 \
+                 AND asset_id = ?3 AND script_key = ?4",
+                params![
+                    &outpoint.txid[..],
+                    outpoint.vout,
+                    &asset_id.0[..],
+                    &script_key.0[..],
+                ],
             )
             .map_err(|e| e.to_string())?;
 
@@ -151,6 +162,25 @@ impl AssetStore for SqliteAssetStore {
             return Err("asset not found".into());
         }
         Ok(())
+    }
+
+    fn unspent_at_outpoint(&self, outpoint: &OutPoint) -> Vec<OwnedAsset> {
+        let conn = self.db.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(&format!(
+            "SELECT {} FROM owned_assets \
+             WHERE anchor_txid = ?1 AND anchor_vout = ?2 AND spent = 0",
+            OWNED_ASSET_COLS
+        )) {
+            Ok(stmt) => stmt,
+            Err(_) => return vec![],
+        };
+
+        stmt.query_map(
+            params![&outpoint.txid[..], outpoint.vout],
+            row_to_owned_asset,
+        )
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     }
 
     fn get_unspent(&self, asset_id: &AssetId) -> Vec<OwnedAsset> {
@@ -948,10 +978,51 @@ mod tests {
             txid: [0xAA; 32],
             vout: 0,
         };
-        store.mark_spent(&outpoint).unwrap();
+        store
+            .mark_spent(
+                &outpoint,
+                &AssetId([0xAA; 32]),
+                &SerializedKey([0x02; 33]),
+            )
+            .unwrap();
 
         assert_eq!(store.balance(&AssetId([0xAA; 32])), 0);
         assert!(store.get_unspent(&AssetId([0xAA; 32])).is_empty());
+    }
+
+    /// mark_spent on SQLite flips only the exact identity; a sibling
+    /// asset at the same anchor outpoint stays unspent and is returned
+    /// by unspent_at_outpoint.
+    #[test]
+    fn test_sqlite_mark_spent_scoped_to_identity() {
+        let db = Arc::new(SqliteDb::open_in_memory().unwrap());
+        let mut store = SqliteAssetStore::new(Arc::clone(&db));
+
+        let outpoint = OutPoint {
+            txid: [0xAA; 32],
+            vout: 0,
+        };
+        let mut a = test_asset(0xAA, 100, 0);
+        a.script_key = SerializedKey([0x02; 33]);
+        let mut b = test_asset(0xBB, 200, 0);
+        b.script_key = SerializedKey([0x03; 33]);
+        store.insert_asset(a).unwrap();
+        store.insert_asset(b).unwrap();
+
+        store
+            .mark_spent(
+                &outpoint,
+                &AssetId([0xAA; 32]),
+                &SerializedKey([0x02; 33]),
+            )
+            .unwrap();
+
+        assert_eq!(store.balance(&AssetId([0xAA; 32])), 0);
+        assert_eq!(store.balance(&AssetId([0xBB; 32])), 200);
+
+        let survivors = store.unspent_at_outpoint(&outpoint);
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].asset_id, AssetId([0xBB; 32]));
     }
 
     #[test]
@@ -998,7 +1069,13 @@ mod tests {
             txid: [0xFF; 32],
             vout: 99,
         };
-        assert!(store.mark_spent(&outpoint).is_err());
+        assert!(store
+            .mark_spent(
+                &outpoint,
+                &AssetId([0xAA; 32]),
+                &SerializedKey([0x02; 33]),
+            )
+            .is_err());
     }
 
     fn test_burn(id_byte: u8, amount: u64, vout: u32) -> BurnRecord {
