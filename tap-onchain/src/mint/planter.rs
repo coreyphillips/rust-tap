@@ -21,7 +21,7 @@ use tap_primitives::asset::{
     Asset, Genesis, OutPoint, ScriptKey,
 };
 use tap_primitives::commitment::{
-    AssetCommitment, TapCommitment, TapCommitmentVersion,
+    AssetCommitmentTree, TapCommitmentTree, TapCommitmentVersion,
 };
 
 use super::batch::{BatchState, MintingBatch};
@@ -210,14 +210,16 @@ where
             assets.push(asset);
         }
 
-        // Build the AssetCommitment and TapCommitment.
+        // Build the AssetCommitment and TapCommitment, retaining the
+        // MS-SMT trees so genesis inclusion proofs can be derived
+        // later.
         let asset_refs: Vec<&Asset> = assets.iter().collect();
-        let asset_commitment = AssetCommitment::new(&asset_refs)
+        let asset_commitment = AssetCommitmentTree::new(&asset_refs)
             .map_err(|e| MintError::CommitmentError(e.to_string()))?;
 
-        let tap_commitment = TapCommitment::new(
+        let tap_commitment = TapCommitmentTree::new(
             TapCommitmentVersion::V2,
-            &[&asset_commitment],
+            vec![asset_commitment],
         )
         .map_err(|e| MintError::CommitmentError(e.to_string()))?;
 

@@ -12,10 +12,11 @@
 use std::collections::BTreeMap;
 
 use crate::asset::{self, Asset, Genesis, OutPoint, SerializedKey};
-use crate::commitment::{CommitmentProof, TapscriptPreimage};
+use crate::commitment::{CommitmentProof, TapCommitment, TapscriptPreimage};
 
 use super::meta::MetaReveal;
 use super::tx_merkle::TxMerkleProof;
+use super::ProofError;
 
 /// Version of a transition proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -61,6 +62,14 @@ impl BlockHeader {
     /// Returns the block header as a byte slice.
     pub fn as_bytes(&self) -> &[u8; 80] {
         &self.0
+    }
+
+    /// Computes the block hash (double-SHA256 of the 80-byte header) in
+    /// internal (wire) byte order, matching Go's
+    /// `wire.BlockHeader.BlockHash`.
+    pub fn block_hash(&self) -> [u8; 32] {
+        use bitcoin_hashes::{sha256d, Hash};
+        sha256d::Hash::hash(&self.0).to_byte_array()
     }
 }
 
@@ -112,18 +121,50 @@ pub struct TaprootProof {
     pub unknown_odd_types: BTreeMap<u64, Vec<u8>>,
 }
 
-/// A simplified anchor transaction representation.
-///
-/// Stores the raw serialized transaction bytes. Full parsing requires
-/// a Bitcoin library, but for proof purposes we primarily need the txid
-/// and the ability to pass it through to verification functions.
+/// The parsed on-chain anchor transaction, mirroring Go's
+/// `wire.MsgTx` field on `proof.Proof`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AnchorTx(pub Vec<u8>);
+pub struct AnchorTx(pub bitcoin::Transaction);
 
 impl AnchorTx {
-    /// Returns the raw transaction bytes.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+    /// Parses an anchor transaction from raw consensus-encoded bytes.
+    /// Trailing bytes are rejected, matching Go's `wire.MsgTx.Decode`
+    /// which consumes the record exactly.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProofError> {
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(bytes).map_err(|e| {
+                ProofError::DecodingError(format!(
+                    "invalid anchor transaction: {}",
+                    e
+                ))
+            })?;
+        Ok(AnchorTx(tx))
+    }
+
+    /// Returns the raw consensus-encoded transaction bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bitcoin::consensus::encode::serialize(&self.0)
+    }
+
+    /// Returns the txid (double-SHA256 of the legacy serialization) in
+    /// internal (wire) byte order, matching Go's `MsgTx.TxHash()` raw
+    /// bytes. This is the byte order used by `prev_out.txid` and the tx
+    /// merkle proof.
+    pub fn txid(&self) -> [u8; 32] {
+        *self.0.compute_txid().as_ref()
+    }
+}
+
+impl Default for AnchorTx {
+    /// The zero-value transaction, matching Go's zero `wire.MsgTx`
+    /// (version 0, no inputs, no outputs, lock time 0).
+    fn default() -> Self {
+        AnchorTx(bitcoin::Transaction {
+            version: bitcoin::transaction::Version(0),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        })
     }
 }
 
@@ -177,15 +218,31 @@ pub struct Proof {
     pub unknown_odd_types: BTreeMap<u64, Vec<u8>>,
 }
 
+impl Proof {
+    /// Returns the outpoint that commits to the asset associated with
+    /// this proof, matching Go's `Proof.OutPoint()`.
+    pub fn out_point(&self) -> OutPoint {
+        OutPoint {
+            txid: self.anchor_tx.txid(),
+            vout: self.inclusion_proof.output_index,
+        }
+    }
+
+    /// Returns true if this is a V1 (STXO-aware) proof.
+    pub fn is_version_v1(&self) -> bool {
+        self.version == TransitionVersion::V1
+    }
+}
+
 /// The result of verifying a proof — a snapshot of the asset state at
-/// a specific point in the chain.
+/// a specific point in the chain. Mirrors Go's `proof.AssetSnapshot`.
 #[derive(Clone, Debug)]
 pub struct AssetSnapshot {
     /// The verified asset.
     pub asset: Asset,
     /// The outpoint where the asset is committed.
     pub out_point: OutPoint,
-    /// Block hash of the anchor block.
+    /// Block hash of the anchor block (internal byte order).
     pub anchor_block_hash: [u8; 32],
     /// Block height.
     pub anchor_block_height: u32,
@@ -195,6 +252,12 @@ pub struct AssetSnapshot {
     pub output_index: u32,
     /// The Taproot internal key.
     pub internal_key: SerializedKey,
+    /// The Taproot Asset commitment anchored at the output (Go's
+    /// `ScriptRoot`).
+    pub script_root: Option<TapCommitment>,
+    /// The tapscript sibling preimage hashed together with the
+    /// commitment leaf, if any.
+    pub tapscript_sibling: Option<TapscriptPreimage>,
     /// Whether this asset is the result of a split.
     pub split_asset: bool,
     /// Metadata reveal if this is a genesis asset.

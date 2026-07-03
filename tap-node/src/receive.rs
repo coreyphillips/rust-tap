@@ -15,7 +15,7 @@ use tap_ldk::ldk::LdkChannelOps;
 use tap_ldk::rfq::PriceOracle;
 use tap_onchain::chain::{AssetSigner, ChainBridge, KeyRing, WalletAnchor};
 use tap_persist::proof_store::ProofLocator;
-use tap_primitives::address::TapAddress;
+use tap_primitives::address::{AddressVersion, TapAddress};
 use tap_primitives::asset::{
     AssetId, OutPoint, SerializedKey, TAPROOT_ASSETS_KEY_FAMILY,
 };
@@ -51,7 +51,7 @@ where
     };
 
     let addr = TapAddress {
-        version: 0,
+        version: AddressVersion::V0,
         asset_version: 0,
         asset_id: Some(asset_id),
         script_key: script_key_desc.pub_key,

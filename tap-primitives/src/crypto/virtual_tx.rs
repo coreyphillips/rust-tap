@@ -306,6 +306,54 @@ pub fn input_prev_out(input_asset: &Asset) -> Result<TxOut, VirtualTxError> {
     })
 }
 
+/// Computes the BIP-341 prevout for a grouped asset genesis input.
+///
+/// The previous output's script commits to the tweaked GROUP key (not
+/// the script key), enabling group witness validation. Matches Go's
+/// `asset.InputGenesisAssetPrevOut` (asset/tx.go).
+pub fn input_genesis_prev_out(
+    input_asset: &Asset,
+) -> Result<TxOut, VirtualTxError> {
+    let group_key = input_asset.group_key.as_ref().ok_or_else(|| {
+        VirtualTxError::InvalidKey("genesis input has no group key".into())
+    })?;
+
+    let x_only =
+        XOnlyPublicKey::from_slice(group_key.group_pub_key.schnorr_bytes())
+            .map_err(|e| VirtualTxError::InvalidKey(e.to_string()))?;
+
+    Ok(TxOut {
+        value: Amount::from_sat(input_asset.amount),
+        script_pubkey: compute_taproot_script(&x_only.serialize()),
+    })
+}
+
+/// Computes the BIP-341 key-spend sighash for a grouped asset genesis
+/// virtual transaction, where the prevout commits to the group key.
+pub fn input_group_genesis_key_spend_sighash(
+    base_virtual_tx: &Transaction,
+    new_asset: &Asset,
+    sig_hash_type: TapSighashType,
+) -> Result<[u8; 32], VirtualTxError> {
+    let tx = virtual_tx_with_input(
+        base_virtual_tx,
+        new_asset.lock_time,
+        new_asset.relative_lock_time,
+        0,
+        BtcWitness::new(),
+    );
+
+    let prev_out = input_genesis_prev_out(new_asset)?;
+    let prevouts = [prev_out];
+
+    let mut sighash_cache = SighashCache::new(&tx);
+    let sighash = sighash_cache
+        .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), sig_hash_type)
+        .map_err(|e| VirtualTxError::SighashError(e.to_string()))?;
+
+    Ok(sighash.to_byte_array())
+}
+
 /// Computes the BIP-341 taproot key-spend sighash for a virtual transaction.
 ///
 /// This is the 32-byte message that gets signed with a Schnorr signature.

@@ -18,7 +18,8 @@ use tap_ldk::ldk::LdkChannelOps;
 use tap_ldk::rfq::PriceOracle;
 use tap_onchain::chain::{AssetSigner, ChainBridge, KeyRing, WalletAnchor};
 use tap_onchain::send::{
-    execute_transfer, SelectedInput, SendError, TransferOutput, VirtualSigner,
+    execute_transfer_with_version, SelectedInput, SendError, TransferOutput,
+    VirtualSigner,
 };
 use tap_persist::asset_store::OwnedAsset;
 use tap_primitives::address::TapAddress;
@@ -140,14 +141,17 @@ where
         x_only_from_serialized(&recipient_key_desc.pub_key),
     ];
 
-    // Execute the transfer pipeline.
-    let result = execute_transfer(
+    // Execute the transfer pipeline. The Taproot Asset commitment
+    // version is dictated by the recipient's address version (V1 and
+    // V2 addresses require V2 commitments).
+    let result = execute_transfer_with_version(
         &inputs,
         &outputs,
         &genesis,
         &prev_assets,
         &signer,
         &internal_keys,
+        recipient.commitment_version(),
     )
     .map_err(TapNodeError::Send)?;
 

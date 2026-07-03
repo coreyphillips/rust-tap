@@ -11,12 +11,12 @@
 
 
 use tap_primitives::asset::{
-    Asset, AssetVersion, Genesis, PrevId, ScriptKey,
+    derive_burn_key, Asset, AssetVersion, Genesis, PrevId, ScriptKey,
     ScriptVersion, Witness, NUMS_KEY,
 };
 use tap_primitives::commitment::{
-    asset_leaf, AssetCommitment, SplitAsset, SplitLocator, TapCommitment,
-    TapCommitmentVersion,
+    asset_leaf, AssetCommitmentTree, SplitAsset, SplitLocator,
+    TapCommitmentTree, TapCommitmentVersion,
 };
 use tap_primitives::mssmt;
 
@@ -44,6 +44,8 @@ pub enum SendError {
     SplitError(String),
     /// Invalid state transition.
     InvalidState(String),
+    /// Burn preparation or validation error.
+    BurnError(String),
 }
 
 impl std::fmt::Display for SendError {
@@ -74,6 +76,9 @@ impl std::fmt::Display for SendError {
             }
             SendError::InvalidState(msg) => {
                 write!(f, "invalid state: {}", msg)
+            }
+            SendError::BurnError(msg) => {
+                write!(f, "burn error: {}", msg)
             }
         }
     }
@@ -115,6 +120,10 @@ pub enum SendState {
 
 /// The result of preparing outputs — the assets and commitments ready
 /// for anchoring in a Bitcoin transaction.
+///
+/// The commitments retain their MS-SMT trees ([`TapCommitmentTree`]) so
+/// inclusion and exclusion proofs can be derived after the anchor
+/// transaction is built, without hand-assembling proof parts.
 #[derive(Clone, Debug)]
 pub struct PreparedTransfer {
     /// The root asset for the change/tombstone output.
@@ -122,11 +131,37 @@ pub struct PreparedTransfer {
     /// Recipient outputs (each becomes a split asset).
     pub recipient_assets: Vec<SplitAsset>,
     /// The TAP commitment for the change output.
-    pub change_commitment: TapCommitment,
+    pub change_commitment: TapCommitmentTree,
     /// Per-output TAP commitments for recipient outputs.
-    pub output_commitments: Vec<TapCommitment>,
+    pub output_commitments: Vec<TapCommitmentTree>,
     /// Whether a split was required (partial send).
     pub is_split: bool,
+}
+
+impl PreparedTransfer {
+    /// Rebuilds the change output commitment from the current root
+    /// asset. Must be called after signing: the root asset's leaf
+    /// changes once its witnesses are populated, so the commitment
+    /// created at preparation time no longer matches. For full-value
+    /// sends the single output commitment is refreshed as well.
+    pub fn rebuild_root_commitment(&mut self) -> Result<(), SendError> {
+        let version = self.change_commitment.commitment().version;
+        let ac = AssetCommitmentTree::new(&[&self.root_asset])
+            .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+        let tc = TapCommitmentTree::new(version, vec![ac])
+            .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+
+        if !self.is_split {
+            // Full send: the transfer asset itself is the root asset,
+            // and the single output commitment mirrors the change
+            // commitment.
+            if let Some(first) = self.output_commitments.first_mut() {
+                *first = tc.clone();
+            }
+        }
+        self.change_commitment = tc;
+        Ok(())
+    }
 }
 
 /// Builds asset transfers from inputs and output allocations.
@@ -144,6 +179,52 @@ impl TransferBuilder {
         inputs: &[SelectedInput],
         outputs: &[TransferOutput],
         genesis: &Genesis,
+    ) -> Result<PreparedTransfer, SendError> {
+        Self::prepare_outputs_with_version(inputs, outputs, genesis, None)
+    }
+
+    /// Prepares output assets for a transfer with an explicit commitment
+    /// version.
+    ///
+    /// The commitment version comes from the destination: V1 and V2
+    /// addresses (and V1 virtual packets) require V2 Taproot Asset
+    /// commitments, while `None` derives the version from the asset
+    /// versions like Go's `NewTapCommitment` (see
+    /// `TapAddress::commitment_version` and Go tappsbt
+    /// `CommitmentVersion`).
+    pub fn prepare_outputs_with_version(
+        inputs: &[SelectedInput],
+        outputs: &[TransferOutput],
+        genesis: &Genesis,
+        commitment_version: Option<TapCommitmentVersion>,
+    ) -> Result<PreparedTransfer, SendError> {
+        // Burn keys can only be funded through `prepare_burn`; a normal
+        // transfer must never pay to a key that provably burns the assets.
+        // Mirrors Go, which only derives burn script keys inside FundBurn.
+        for output in outputs {
+            let is_burn = inputs.iter().any(|input| {
+                output.script_key.serialized().schnorr_bytes()
+                    == derive_burn_key(&input.prev_id).schnorr_bytes()
+            });
+            if is_burn {
+                return Err(SendError::BurnError(
+                    "cannot send to a burn key; use prepare_burn instead"
+                        .into(),
+                ));
+            }
+        }
+
+        Self::prepare_outputs_inner(inputs, outputs, genesis, commitment_version)
+    }
+
+    /// Prepares output assets without the burn-key guard. Used by both
+    /// [`Self::prepare_outputs`] and the burn path, which intentionally
+    /// pays to a burn key.
+    pub(crate) fn prepare_outputs_inner(
+        inputs: &[SelectedInput],
+        outputs: &[TransferOutput],
+        genesis: &Genesis,
+        commitment_version: Option<TapCommitmentVersion>,
     ) -> Result<PreparedTransfer, SendError> {
         if inputs.is_empty() {
             return Err(SendError::NoInputs);
@@ -167,10 +248,19 @@ impl TransferBuilder {
 
         if is_split {
             Self::prepare_split_outputs(
-                inputs, outputs, genesis, change_amount,
+                inputs,
+                outputs,
+                genesis,
+                change_amount,
+                commitment_version,
             )
         } else {
-            Self::prepare_full_send(inputs, outputs, genesis)
+            Self::prepare_full_send(
+                inputs,
+                outputs,
+                genesis,
+                commitment_version,
+            )
         }
     }
 
@@ -179,6 +269,7 @@ impl TransferBuilder {
         inputs: &[SelectedInput],
         outputs: &[TransferOutput],
         genesis: &Genesis,
+        commitment_version: Option<TapCommitmentVersion>,
     ) -> Result<PreparedTransfer, SendError> {
         let output = &outputs[0];
 
@@ -205,10 +296,13 @@ impl TransferBuilder {
         };
 
         // Build the output commitment.
-        let ac = AssetCommitment::new(&[&new_asset])
+        let ac = AssetCommitmentTree::new(&[&new_asset])
             .map_err(|e| SendError::CommitmentError(e.to_string()))?;
-        let tc = TapCommitment::new(TapCommitmentVersion::V2, &[&ac])
-            .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+        let tc = TapCommitmentTree::from_asset_commitment_trees(
+            commitment_version,
+            vec![ac],
+        )
+        .map_err(|e| SendError::CommitmentError(e.to_string()))?;
 
         Ok(PreparedTransfer {
             root_asset: new_asset,
@@ -225,6 +319,7 @@ impl TransferBuilder {
         outputs: &[TransferOutput],
         genesis: &Genesis,
         change_amount: u64,
+        commitment_version: Option<TapCommitmentVersion>,
     ) -> Result<PreparedTransfer, SendError> {
         let asset_id = genesis.id();
 
@@ -326,18 +421,23 @@ impl TransferBuilder {
             Some((tree_root.node_hash(), tree_root.node_sum()));
 
         // Build output commitments.
-        let root_ac = AssetCommitment::new(&[&root_asset])
+        let root_ac = AssetCommitmentTree::new(&[&root_asset])
             .map_err(|e| SendError::CommitmentError(e.to_string()))?;
-        let change_tc =
-            TapCommitment::new(TapCommitmentVersion::V2, &[&root_ac])
-                .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+        let change_tc = TapCommitmentTree::from_asset_commitment_trees(
+            commitment_version,
+            vec![root_ac],
+        )
+        .map_err(|e| SendError::CommitmentError(e.to_string()))?;
 
         let mut output_commitments = Vec::new();
         for split in &split_assets {
-            let ac = AssetCommitment::new(&[&split.asset])
+            let ac = AssetCommitmentTree::new(&[&split.asset])
                 .map_err(|e| SendError::CommitmentError(e.to_string()))?;
-            let tc = TapCommitment::new(TapCommitmentVersion::V2, &[&ac])
-                .map_err(|e| SendError::CommitmentError(e.to_string()))?;
+            let tc = TapCommitmentTree::from_asset_commitment_trees(
+                commitment_version,
+                vec![ac],
+            )
+            .map_err(|e| SendError::CommitmentError(e.to_string()))?;
             output_commitments.push(tc);
         }
 
@@ -412,6 +512,44 @@ mod tests {
         assert!(!result.is_split);
         assert_eq!(result.root_asset.amount, 100);
         assert!(result.recipient_assets.is_empty());
+    }
+
+    #[test]
+    fn test_commitment_version_from_destination() {
+        let genesis = test_genesis();
+        let inputs = vec![test_input(100)];
+        let outputs = vec![test_output(100, 0)];
+
+        // An explicit V2 version (V1/V2 addresses, V1 vPackets) makes
+        // every output commitment V2, visible in the tagged leaf format.
+        let v2 = TransferBuilder::prepare_outputs_with_version(
+            &inputs,
+            &outputs,
+            &genesis,
+            Some(TapCommitmentVersion::V2),
+        )
+        .unwrap();
+        for tc in &v2.output_commitments {
+            assert_eq!(tc.commitment().version, TapCommitmentVersion::V2);
+            let leaf = tc.commitment().tap_leaf();
+            // V2 leaves start with the 32-byte tag, not the version byte.
+            assert_ne!(leaf[0], 2u8);
+        }
+
+        // With no explicit version, the version derives from the asset
+        // versions, like Go's NewTapCommitment: V0 assets give a V0
+        // commitment.
+        let derived = TransferBuilder::prepare_outputs_with_version(
+            &inputs,
+            &outputs,
+            &genesis,
+            None,
+        )
+        .unwrap();
+        for tc in &derived.output_commitments {
+            assert_eq!(tc.commitment().version, TapCommitmentVersion::V0);
+            assert_eq!(tc.commitment().tap_leaf()[0], 0u8);
+        }
     }
 
     #[test]

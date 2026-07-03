@@ -88,6 +88,30 @@ impl TapCommitment {
         })
     }
 
+    /// Creates a `TapCommitment` with an optional explicit version.
+    ///
+    /// When `version` is `None`, the commitment version is derived from
+    /// the maximum asset version among the commitments (V0 assets give
+    /// a V0 commitment, V1 assets a V1 commitment), matching Go's
+    /// `NewTapCommitment` (commitment/tap.go:106).
+    pub fn from_asset_commitments(
+        version: Option<TapCommitmentVersion>,
+        commitments: &[&AssetCommitment],
+    ) -> Result<Self, CommitmentError> {
+        let version = match version {
+            Some(v) => v,
+            None => {
+                let max_version = commitments
+                    .iter()
+                    .map(|ac| ac.version.to_u8())
+                    .max()
+                    .unwrap_or(0);
+                TapCommitmentVersion::from_u8(max_version)?
+            }
+        };
+        Self::new(version, commitments)
+    }
+
     /// Creates a `TapCommitment` from a known root (used when
     /// reconstructing from proofs).
     pub fn from_root(
@@ -139,6 +163,36 @@ impl TapCommitment {
         self.tree_root.node_sum()
     }
 
+    /// Returns the tapscript root for this commitment, matching Go's
+    /// `TapCommitment.TapscriptRoot` (commitment/tap.go:457).
+    ///
+    /// If `sibling` is `Some`, the commitment leaf hash is combined
+    /// with the sibling hash into a tap branch (sorted); otherwise the
+    /// commitment leaf hash itself is the tapscript root.
+    pub fn tapscript_root(&self, sibling: Option<&[u8; 32]>) -> [u8; 32] {
+        // The commitment tap leaf always uses the base tapscript leaf
+        // version (0xc0).
+        let leaf_hash =
+            crate::crypto::tapscript::tap_leaf_hash(0xc0, &self.tap_leaf());
+        match sibling {
+            None => leaf_hash,
+            Some(s) => {
+                crate::crypto::tapscript::tap_branch_hash(&leaf_hash, s)
+            }
+        }
+    }
+
+    /// Returns a copy of this commitment with the version downgraded to
+    /// V0, mirroring Go's `TapCommitment.Downgrade` (commitment/tap.go:408)
+    /// for root-only commitments (the only case reachable from
+    /// proof-derived commitments).
+    pub fn downgrade(&self) -> TapCommitment {
+        TapCommitment {
+            version: TapCommitmentVersion::V0,
+            tree_root: self.tree_root.clone(),
+        }
+    }
+
     /// Checks if the given bytes look like a TAP commitment script.
     ///
     /// Checks for the presence of the marker (V0/V1) or tag (V2) at the
@@ -160,6 +214,31 @@ impl TapCommitment {
         }
 
         false
+    }
+}
+
+/// Returns true if both versions are nil, equal, or map to the same
+/// effective commitment version. Mirrors Go's
+/// `IsSimilarTapCommitmentVersion` (commitment/tap.go:280).
+pub fn is_similar_tap_commitment_version(
+    a: Option<&TapCommitmentVersion>,
+    b: Option<&TapCommitmentVersion>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (None, Some(v)) | (Some(v), None) => {
+            matches!(v, TapCommitmentVersion::V0 | TapCommitmentVersion::V1)
+        }
+        (Some(a), Some(b)) => {
+            if *a == TapCommitmentVersion::V2 {
+                return *b == TapCommitmentVersion::V2;
+            }
+            matches!(a, TapCommitmentVersion::V0 | TapCommitmentVersion::V1)
+                && matches!(
+                    b,
+                    TapCommitmentVersion::V0 | TapCommitmentVersion::V1
+                )
+        }
     }
 }
 

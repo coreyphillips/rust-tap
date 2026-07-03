@@ -26,7 +26,7 @@ use tap_onchain::mint::{BatchState, MintingBatch, Seedling};
 use tap_primitives::asset::AssetId;
 use tap_primitives::proof;
 
-use crate::asset_store::{AssetStore, OwnedAsset};
+use crate::asset_store::{AssetStore, BurnRecord, OwnedAsset};
 use crate::batch_store::BatchStore;
 use crate::proof_store::{ProofLocator, ProofStore};
 
@@ -166,6 +166,61 @@ impl AssetStore for SqliteAssetStore<'_> {
         )
         .unwrap_or(0) as u64
     }
+
+    fn insert_burn(&mut self, burn: BurnRecord) -> Result<(), String> {
+        let conn = self.db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO asset_burns \
+             (note, asset_id, group_key, amount, anchor_txid, script_key, \
+              outpoint_txid, outpoint_vout, block_height) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                burn.note.as_deref(),
+                &burn.asset_id.0[..],
+                burn.group_key.as_ref().map(|k| k.0.to_vec()),
+                burn.amount as i64,
+                &burn.anchor_txid[..],
+                &burn.script_key.0[..],
+                &burn.out_point.txid[..],
+                burn.out_point.vout,
+                burn.block_height,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn list_burns(&self, asset_id: Option<&AssetId>) -> Vec<BurnRecord> {
+        let conn = self.db.conn.lock().unwrap();
+
+        let base_query = "SELECT note, asset_id, group_key, amount, \
+             anchor_txid, script_key, outpoint_txid, outpoint_vout, \
+             block_height FROM asset_burns";
+
+        match asset_id {
+            Some(id) => {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "{} WHERE asset_id = ?1",
+                        base_query
+                    ))
+                    .unwrap();
+                stmt.query_map(params![&id.0[..]], |row| {
+                    Ok(row_to_burn_record(row))
+                })
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+            }
+            None => {
+                let mut stmt = conn.prepare(base_query).unwrap();
+                stmt.query_map([], |row| Ok(row_to_burn_record(row)))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect()
+            }
+        }
+    }
 }
 
 fn row_to_owned_asset(row: &rusqlite::Row) -> OwnedAsset {
@@ -190,6 +245,47 @@ fn row_to_owned_asset(row: &rusqlite::Row) -> OwnedAsset {
         anchor_outpoint: OutPoint { txid, vout },
         script_key: SerializedKey(script_key),
         spent: spent != 0,
+        block_height,
+    }
+}
+
+fn row_to_burn_record(row: &rusqlite::Row) -> BurnRecord {
+    let note: Option<String> = row.get(0).unwrap();
+    let asset_id_bytes: Vec<u8> = row.get(1).unwrap();
+    let group_key_bytes: Option<Vec<u8>> = row.get(2).unwrap();
+    let amount: i64 = row.get(3).unwrap();
+    let anchor_txid_bytes: Vec<u8> = row.get(4).unwrap();
+    let script_key_bytes: Vec<u8> = row.get(5).unwrap();
+    let outpoint_txid_bytes: Vec<u8> = row.get(6).unwrap();
+    let outpoint_vout: u32 = row.get(7).unwrap();
+    let block_height: u32 = row.get(8).unwrap();
+
+    let mut asset_id = [0u8; 32];
+    asset_id.copy_from_slice(&asset_id_bytes);
+    let mut anchor_txid = [0u8; 32];
+    anchor_txid.copy_from_slice(&anchor_txid_bytes);
+    let mut script_key = [0u8; 33];
+    script_key.copy_from_slice(&script_key_bytes);
+    let mut outpoint_txid = [0u8; 32];
+    outpoint_txid.copy_from_slice(&outpoint_txid_bytes);
+
+    let group_key = group_key_bytes.map(|bytes| {
+        let mut key = [0u8; 33];
+        key.copy_from_slice(&bytes);
+        SerializedKey(key)
+    });
+
+    BurnRecord {
+        note,
+        asset_id: AssetId(asset_id),
+        group_key,
+        amount: amount as u64,
+        anchor_txid,
+        script_key: SerializedKey(script_key),
+        out_point: OutPoint {
+            txid: outpoint_txid,
+            vout: outpoint_vout,
+        },
         block_height,
     }
 }
@@ -762,6 +858,66 @@ mod tests {
             vout: 99,
         };
         assert!(store.mark_spent(&outpoint).is_err());
+    }
+
+    fn test_burn(id_byte: u8, amount: u64, vout: u32) -> BurnRecord {
+        BurnRecord {
+            note: Some("goodbye".to_string()),
+            asset_id: AssetId([id_byte; 32]),
+            group_key: Some(SerializedKey([0x03; 33])),
+            amount,
+            anchor_txid: [0xDD; 32],
+            script_key: SerializedKey([0x02; 33]),
+            out_point: OutPoint {
+                txid: [0xDD; 32],
+                vout,
+            },
+            block_height: 850_000,
+        }
+    }
+
+    #[test]
+    fn test_sqlite_burn_round_trip() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        let mut store = SqliteAssetStore::new(&db);
+
+        let burn = test_burn(0xAA, 100, 0);
+        store.insert_burn(burn.clone()).unwrap();
+
+        let burns = store.list_burns(None);
+        assert_eq!(burns.len(), 1);
+        assert_eq!(burns[0], burn);
+    }
+
+    #[test]
+    fn test_sqlite_burn_filter_by_asset_id() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        let mut store = SqliteAssetStore::new(&db);
+
+        store.insert_burn(test_burn(0xAA, 100, 0)).unwrap();
+        store.insert_burn(test_burn(0xBB, 200, 1)).unwrap();
+
+        assert_eq!(store.list_burns(None).len(), 2);
+        let filtered = store.list_burns(Some(&AssetId([0xAA; 32])));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].amount, 100);
+        assert!(store
+            .list_burns(Some(&AssetId([0xCC; 32])))
+            .is_empty());
+    }
+
+    #[test]
+    fn test_sqlite_burn_optional_fields() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        let mut store = SqliteAssetStore::new(&db);
+
+        let mut burn = test_burn(0xAA, 100, 0);
+        burn.note = None;
+        burn.group_key = None;
+        store.insert_burn(burn.clone()).unwrap();
+
+        let burns = store.list_burns(None);
+        assert_eq!(burns[0], burn);
     }
 
     // --- BatchStore tests ---

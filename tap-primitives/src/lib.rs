@@ -15,6 +15,7 @@ pub mod encoding;
 pub mod mssmt;
 pub mod proof;
 pub mod vm;
+pub mod vpsbt;
 
 /// Minimal hex encoding utility.
 pub(crate) mod hex {

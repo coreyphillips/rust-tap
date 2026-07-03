@@ -24,9 +24,6 @@ use tap_persist::asset_store::OwnedAsset;
 use tap_primitives::asset::{
     AssetType, ScriptKey, SerializedKey, TAPROOT_ASSETS_KEY_FAMILY,
 };
-use tap_primitives::commitment::{
-    AssetCommitment, TapCommitment, TapCommitmentVersion,
-};
 
 use crate::error::TapNodeError;
 use crate::event::TapEvent;
@@ -143,7 +140,7 @@ where
 
     let dummy_template = create_genesis_template(
         &internal_x_only,
-        dummy_commitment,
+        dummy_commitment.commitment(),
         Amount::from_sat(330),
     )
     .map_err(|e| TapNodeError::Storage(format!("template: {}", e)))?;
@@ -199,7 +196,7 @@ where
     let (real_script, _output_key) =
         tap_onchain::psbt::commitment::create_tap_output_script(
             &internal_x_only,
-            tap_commitment,
+            tap_commitment.commitment(),
             None,
         )
         .map_err(|e| TapNodeError::Storage(format!("tap output: {}", e)))?;
@@ -290,9 +287,16 @@ where
                 prev_out: genesis_point,
                 block_header: tap_primitives::proof::types::BlockHeader([0; 80]),
                 block_height: 0,
-                anchor_tx: tap_primitives::proof::types::AnchorTx(
-                    signed_tx_bytes.clone(),
-                ),
+                anchor_tx:
+                    tap_primitives::proof::types::AnchorTx::from_bytes(
+                        &signed_tx_bytes,
+                    )
+                    .map_err(|e| {
+                        TapNodeError::Storage(format!(
+                            "anchor tx parse: {}",
+                            e
+                        ))
+                    })?,
                 tx_merkle_proof: tap_primitives::proof::tx_merkle::TxMerkleProof {
                     nodes: vec![],
                     bits: vec![],

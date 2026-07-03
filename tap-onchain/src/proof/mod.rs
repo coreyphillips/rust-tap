@@ -16,15 +16,20 @@ pub mod exclusion;
 pub mod http_courier;
 pub mod generate;
 pub mod merkle;
+pub mod suffix;
 pub mod transition;
 
 pub use courier::{
     AnnotatedProof, Courier, CourierError, CourierLocator, MockCourier,
     Recipient, deliver_transfer_proofs,
 };
-pub use exclusion::generate_exclusion_proofs;
+pub use exclusion::{generate_exclusion_proofs, AnchorOutputInfo};
 pub use generate::generate_genesis_proof;
 pub use merkle::build_tx_merkle_proof;
+pub use suffix::{
+    create_proof_suffix, update_proof_chain_data, Bip86Output,
+    OutputProofInfo,
+};
 pub use transition::{
     append_transition, generate_transition_proof, BaseProofParams,
     TransitionProofParams,

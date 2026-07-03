@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use tap_primitives::asset::{Asset, OutPoint, SerializedKey};
-use tap_primitives::commitment::CommitmentProof;
+use tap_primitives::commitment::{CommitmentProof, TapCommitmentTree};
 use tap_primitives::proof::{
     self, AnchorTx, BlockHeader, TaprootProof, TransitionVersion,
 };
@@ -49,7 +49,12 @@ pub struct TransitionProofParams {
     pub prev_out: OutPoint,
     /// The new asset after the state transition.
     pub new_asset: Asset,
+    /// The tree-holding TAP commitment of the anchor output. When set,
+    /// the inclusion proof is derived from it directly and
+    /// `commitment_proof` may be left `None`.
+    pub commitment: Option<TapCommitmentTree>,
     /// The commitment proof linking the asset to the TAP commitment.
+    /// Only needed when `commitment` is not supplied.
     pub commitment_proof: Option<CommitmentProof>,
     /// Exclusion proofs for other P2TR outputs in the anchor tx.
     pub exclusion_proofs: Vec<TaprootProof>,
@@ -72,10 +77,24 @@ pub fn generate_transition_proof(
     )
     .ok_or_else(|| "failed to build tx merkle proof".to_string())?;
 
+    // Derive the commitment proof from the tree-holding commitment
+    // when one was not supplied directly.
+    let commitment_proof = match (params.commitment_proof, &params.commitment)
+    {
+        (Some(proof), _) => Some(proof),
+        (None, Some(commitment)) => Some(
+            super::generate::derive_inclusion_proof(
+                commitment,
+                &params.new_asset,
+            )?,
+        ),
+        (None, None) => None,
+    };
+
     let inclusion_proof = TaprootProof {
         output_index: params.base.output_index,
         internal_key: params.base.internal_key,
-        commitment_proof: params.commitment_proof,
+        commitment_proof,
         tapscript_proof: None,
         unknown_odd_types: BTreeMap::new(),
     };
@@ -85,7 +104,8 @@ pub fn generate_transition_proof(
         prev_out: params.prev_out,
         block_header: BlockHeader(params.base.block_header),
         block_height: params.base.block_height,
-        anchor_tx: AnchorTx(params.base.anchor_tx_bytes),
+        anchor_tx: AnchorTx::from_bytes(&params.base.anchor_tx_bytes)
+            .map_err(|e| e.to_string())?,
         tx_merkle_proof,
         asset: params.new_asset,
         inclusion_proof,
@@ -142,7 +162,7 @@ fn encode_proof(proof: &proof::Proof) -> Vec<u8> {
     stream.push(TlvRecord::varint(3, proof.block_height as u64));
 
     // Type 4: Anchor transaction.
-    stream.push(TlvRecord::bytes(4, &proof.anchor_tx.0));
+    stream.push(TlvRecord::bytes(4, &proof.anchor_tx.to_bytes()));
 
     // Type 5: Tx merkle proof (nodes + direction bits).
     let mut merkle_bytes = Vec::new();
@@ -225,7 +245,16 @@ mod tests {
             base: BaseProofParams {
                 block_header: [0u8; 80],
                 block_height: 800_001,
-                anchor_tx_bytes: vec![0x02, 0x00],
+                // A minimal valid transaction (one default input,
+                // no outputs).
+                anchor_tx_bytes: bitcoin::consensus::encode::serialize(
+                    &bitcoin::Transaction {
+                        version: bitcoin::transaction::Version(2),
+                        lock_time: bitcoin::absolute::LockTime::ZERO,
+                        input: vec![bitcoin::TxIn::default()],
+                        output: vec![],
+                    },
+                ),
                 tx_index: 1,
                 block_tx_hashes: vec![[0xCC; 32], [0xDD; 32]],
                 output_index: 0,
@@ -233,6 +262,7 @@ mod tests {
             },
             prev_out: OutPoint { txid: [0xBB; 32], vout: 0 },
             new_asset,
+            commitment: None,
             commitment_proof: None,
             exclusion_proofs: vec![],
             split_root_proof: None,

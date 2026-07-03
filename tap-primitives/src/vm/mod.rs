@@ -95,6 +95,56 @@ impl std::error::Error for VmError {}
 /// Input assets keyed by their PrevId.
 pub type InputSet = HashMap<PrevId, Asset>;
 
+/// Checks the new asset's previous ID against the previous asset's
+/// genesis, mirroring Go's `matchesPrevGenesis` (vm/vm.go:113): either
+/// the IDs match directly, or (for grouped assets) the group keys and
+/// genesis tags match.
+fn matches_prev_genesis(
+    prev_id: &PrevId,
+    group_key: Option<&crate::asset::GroupKey>,
+    tag: &str,
+    prev_asset: &Asset,
+) -> bool {
+    if prev_id.id == prev_asset.genesis.id() {
+        return true;
+    }
+
+    match (group_key, prev_asset.group_key.as_ref()) {
+        (Some(gk), Some(prev_gk)) => {
+            gk.group_pub_key == prev_gk.group_pub_key
+                && tag == prev_asset.genesis.tag
+        }
+        _ => false,
+    }
+}
+
+/// Ensures a new asset continues to adhere to the static parameters of
+/// its predecessor, mirroring Go's `matchesAssetParams` (vm/vm.go:148).
+fn matches_asset_params(
+    new_asset: &Asset,
+    prev_asset: &Asset,
+    prev_id: &PrevId,
+) -> Result<(), VmError> {
+    if prev_id.script_key != *prev_asset.script_key.serialized() {
+        return Err(VmError::ScriptKeyMismatch);
+    }
+
+    if !matches_prev_genesis(
+        prev_id,
+        new_asset.group_key.as_ref(),
+        &new_asset.genesis.tag,
+        prev_asset,
+    ) {
+        return Err(VmError::IdMismatch);
+    }
+
+    if new_asset.genesis.asset_type != prev_asset.genesis.asset_type {
+        return Err(VmError::TypeMismatch);
+    }
+
+    Ok(())
+}
+
 /// Trait for external witness validation (signature verification).
 ///
 /// The actual script execution requires a Bitcoin script engine (e.g.,
@@ -179,14 +229,14 @@ impl<'a, W: WitnessValidator> Engine<'a, W> {
             return Ok(());
         }
 
-        // Genesis asset in a group: has witness for group membership.
+        // Genesis asset in a group: the group membership witness must
+        // be verified against the tweaked group key (Go vm/vm.go
+        // Execute + validateWitnessV0 with GenesisPrevOutFetcher).
         if self.new_asset.has_genesis_witness_for_group() {
             if !self.split_assets.is_empty() || !self.prev_assets.is_empty() {
                 return Err(VmError::InvalidGenesisStateTransition);
             }
-            // Group witness validation would happen here via
-            // witness_validator.
-            return Ok(());
+            return self.validate_group_genesis_witness();
         }
 
         // Validate each split asset.
@@ -198,7 +248,60 @@ impl<'a, W: WitnessValidator> Engine<'a, W> {
         self.validate_state_transition()
     }
 
-    /// Validates a split output against the split commitment root.
+    /// Validates the group membership witness of a grouped genesis
+    /// asset. The signature commits to the grouped-genesis virtual
+    /// transaction and is validated against the tweaked GROUP key, not
+    /// the script key (Go's validateWitnessV0 with
+    /// `asset.GenesisPrevOutFetcher`).
+    ///
+    /// Script-path group witnesses (custom group tapscript trees) are
+    /// not yet supported.
+    fn validate_group_genesis_witness(&self) -> Result<(), VmError> {
+        let witness = &self.new_asset.prev_witnesses[0];
+        let group_key = self
+            .new_asset
+            .group_key
+            .as_ref()
+            .ok_or(VmError::InvalidGenesisStateTransition)?;
+
+        if crate::crypto::tapscript::is_script_path_witness(
+            &witness.tx_witness,
+        ) {
+            return Err(VmError::WitnessValidationFailed(
+                "script-path group witnesses are not supported".into(),
+            ));
+        }
+
+        // The grouped-genesis virtual tx commits to only the
+        // (witnessless) genesis asset itself.
+        let empty = InputSet::new();
+        let (base_tx, _, _) =
+            crate::crypto::virtual_tx::virtual_tx(self.new_asset, &empty)
+                .map_err(|e| {
+                    VmError::InvalidTransferWitness(e.to_string())
+                })?;
+
+        let sighash =
+            crate::crypto::virtual_tx::input_group_genesis_key_spend_sighash(
+                &base_tx,
+                self.new_asset,
+                bitcoin::sighash::TapSighashType::Default,
+            )
+            .map_err(|e| VmError::WitnessValidationFailed(e.to_string()))?;
+
+        // The validation key is the tweaked group key; hand the
+        // validator a copy of the asset whose script key is the group
+        // key so the signature is checked against it.
+        let mut group_prev = self.new_asset.clone();
+        group_prev.script_key =
+            crate::asset::ScriptKey::from_pub_key(group_key.group_pub_key);
+
+        self.witness_validator
+            .validate_witness(&sighash, witness, &group_prev)
+    }
+
+    /// Validates a split output against the split commitment root,
+    /// mirroring Go's `Engine.validateSplit` (vm/vm.go:243).
     fn validate_split(&self, split_asset: &SplitAsset) -> Result<(), VmError> {
         // Asset type must match.
         if self.new_asset.genesis.asset_type != split_asset.asset.genesis.asset_type {
@@ -206,14 +309,34 @@ impl<'a, W: WitnessValidator> Engine<'a, W> {
         }
 
         // The root asset must have a split commitment root.
-        if self.new_asset.split_commitment_root.is_none() {
+        let Some((root_hash, root_sum)) =
+            self.new_asset.split_commitment_root.as_ref()
+        else {
             return Err(VmError::NoSplitCommitment);
-        }
+        };
 
         // Split assets must have a single witness with a split commitment.
         if !split_asset.asset.has_split_commitment_witness() {
             return Err(VmError::InvalidSplitCommitmentWitness);
         }
+
+        // We use the input of the new (root) asset here, as splits
+        // inherit the prev ID from the root asset.
+        let root_witness = self
+            .new_asset
+            .prev_witnesses
+            .first()
+            .ok_or(VmError::NoInputs)?;
+        let root_prev_id =
+            root_witness.prev_id.as_ref().ok_or(VmError::NoInputs)?;
+
+        // The prevID of the split commitment should be the ID of the
+        // asset generating the split in the transaction.
+        let prev_asset = self
+            .prev_assets
+            .get(root_prev_id)
+            .ok_or(VmError::NoInputs)?;
+        matches_asset_params(&split_asset.asset, prev_asset, root_prev_id)?;
 
         // Zero-amount root must be unspendable.
         if self.new_asset.amount == 0 && !self.new_asset.is_unspendable() {
@@ -240,13 +363,17 @@ impl<'a, W: WitnessValidator> Engine<'a, W> {
             .as_ref()
             .ok_or(VmError::InvalidSplitCommitmentWitness)?;
 
-        // Build the leaf for the split asset (without witness).
-        let split_leaf = crate::commitment::asset_leaf(&split_asset.asset);
+        // Build the leaf for the split asset: the split commitment
+        // itself is stripped, and lock times are inherited from the
+        // root asset (Go vm/vm.go:317-326).
+        let mut split_no_witness = split_asset.asset.clone();
+        split_no_witness.prev_witnesses[0].split_commitment = None;
+        split_no_witness.lock_time = self.new_asset.lock_time;
+        split_no_witness.relative_lock_time =
+            self.new_asset.relative_lock_time;
+        let split_leaf = crate::commitment::asset_leaf(&split_no_witness);
 
         // Verify the merkle proof against the split commitment root.
-        let (root_hash, root_sum) =
-            self.new_asset.split_commitment_root.as_ref().unwrap();
-
         let root_node = mssmt::Node::Computed(mssmt::ComputedNode::new(
             *root_hash, *root_sum,
         ));
@@ -282,37 +409,23 @@ impl<'a, W: WitnessValidator> Engine<'a, W> {
             ));
         }
 
-        // Amount conservation: sum of input amounts must equal the output.
-        let input_sum: u64 = self
-            .new_asset
-            .prev_witnesses
-            .iter()
-            .filter_map(|w| w.prev_id.as_ref())
-            .filter_map(|prev_id| self.prev_assets.get(prev_id))
-            .map(|a| a.amount)
-            .sum();
-
-        // For splits, the output amount is the new asset amount plus all
-        // split amounts. For non-splits, it's just the new asset amount.
-        let output_sum = if self.split_assets.is_empty() {
-            self.new_asset.amount
-        } else {
-            let split_sum: u64 =
-                self.split_assets.iter().map(|s| s.asset.amount).sum();
-            self.new_asset.amount + split_sum
-        };
-
-        if input_sum != output_sum {
-            return Err(VmError::AmountMismatch {
-                expected: input_sum,
-                got: output_sum,
-            });
-        }
-
-        // Build the virtual transaction for sighash computation.
-        let (base_tx, _, _) =
+        // Build the virtual transaction for the non-inflation check and
+        // sighash computation.
+        let (base_tx, _, input_root_sum) =
             crate::crypto::virtual_tx::virtual_tx(self.new_asset, self.prev_assets)
                 .map_err(|e| VmError::InvalidTransferWitness(e.to_string()))?;
+
+        // Enforce that assets aren't being inflated: the input MS-SMT
+        // root sum must match the virtual output value (which is the
+        // split commitment root sum for splits, or the asset amount
+        // otherwise). Mirrors Go's vm/vm.go validateStateTransition.
+        let output_value = base_tx.output[0].value.to_sat();
+        if input_root_sum != output_value {
+            return Err(VmError::AmountMismatch {
+                expected: input_root_sum,
+                got: output_value,
+            });
+        }
 
         // Validate each witness.
         for (idx, witness) in
@@ -328,18 +441,9 @@ impl<'a, W: WitnessValidator> Engine<'a, W> {
                 .get(prev_id)
                 .ok_or(VmError::NoInputs)?;
 
-            // Check static parameters.
-            if prev_asset.script_key.serialized()
-                != &prev_id.script_key
-            {
-                return Err(VmError::ScriptKeyMismatch);
-            }
-
-            if self.new_asset.genesis.asset_type
-                != prev_asset.genesis.asset_type
-            {
-                return Err(VmError::TypeMismatch);
-            }
+            // The parameters of the new and old asset must match
+            // exactly (Go's matchesAssetParams in validateWitnessV0).
+            matches_asset_params(self.new_asset, prev_asset, prev_id)?;
 
             if prev_asset.script_version != ScriptVersion::V0 {
                 return Err(VmError::InvalidScriptVersion);

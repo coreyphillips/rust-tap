@@ -96,10 +96,10 @@ pub fn encode_proof(proof: &Proof) -> Vec<u8> {
         proof.block_header.as_bytes(),
     ));
 
-    // Type 6: AnchorTx (variable length raw tx bytes).
+    // Type 6: AnchorTx (consensus-encoded transaction bytes).
     stream.push(TlvRecord::bytes(
         tlv_types::ANCHOR_TX,
-        proof.anchor_tx.as_bytes(),
+        &proof.anchor_tx.to_bytes(),
     ));
 
     // Type 8: TxMerkleProof.
@@ -502,7 +502,7 @@ mod tests {
             prev_out: OutPoint { txid: [0; 32], vout: 0 },
             block_header: BlockHeader([0; 80]),
             block_height: 100,
-            anchor_tx: AnchorTx(vec![0; 10]),
+            anchor_tx: AnchorTx::default(),
             tx_merkle_proof: TxMerkleProof {
                 nodes: vec![],
                 bits: vec![],
@@ -544,7 +544,7 @@ mod tests {
             prev_out: OutPoint { txid: [0xAA; 32], vout: 1 },
             block_header: BlockHeader([0xBB; 80]),
             block_height: 800_000,
-            anchor_tx: AnchorTx(vec![1, 2, 3]),
+            anchor_tx: AnchorTx::default(),
             tx_merkle_proof: TxMerkleProof {
                 nodes: vec![],
                 bits: vec![],

@@ -23,6 +23,10 @@ pub use keys::{
     serialize_pub_key, tweak_pub_key,
 };
 pub use schnorr::SchnorrWitnessValidator;
+pub use tapscript::{
+    create_tap_output_script, tap_branch_hash, tap_leaf_hash,
+    taproot_output_key,
+};
 pub use virtual_tx::{
     input_key_spend_sighash, virtual_tx, virtual_tx_in, virtual_tx_in_prevout,
     virtual_tx_out, virtual_tx_with_input, VirtualTxError,

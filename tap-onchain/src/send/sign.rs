@@ -37,8 +37,9 @@ pub trait VirtualSigner {
 /// Signs a prepared transfer by computing virtual transaction sighashes
 /// and calling the signer for each input witness.
 ///
-/// This fills in the `tx_witness` field on each witness in the root asset
-/// (and updates the split commitment root if applicable).
+/// This fills in the `tx_witness` field on each witness in the root
+/// asset. The split commitment root is left untouched — it is part of
+/// the message being signed.
 pub fn sign_transfer(
     prepared: &mut PreparedTransfer,
     prev_assets: &InputSet,
@@ -78,52 +79,12 @@ pub fn sign_transfer(
         witness.tx_witness = vec![sig];
     }
 
-    // If this is a split transfer, rebuild the split commitment root
-    // now that witnesses are populated. The root asset's TLV encoding
-    // changes when witnesses are added, affecting the MS-SMT leaf.
-    if prepared.is_split {
-        rebuild_split_root(prepared)?;
-    }
-
-    Ok(())
-}
-
-/// Rebuilds the split commitment root after signing, since the root asset's
-/// encoding changes when witnesses are populated.
-fn rebuild_split_root(prepared: &mut PreparedTransfer) -> Result<(), SendError> {
-    use tap_primitives::commitment::{asset_leaf, SplitLocator};
-    use tap_primitives::mssmt;
-
-    let asset_id = prepared.root_asset.genesis.id();
-    let mut tree = mssmt::FullTree::new(mssmt::DefaultStore::new());
-
-    // Re-insert the root asset (now with witnesses).
-    let root_locator = SplitLocator {
-        output_index: 0,
-        asset_id,
-        script_key: *prepared.root_asset.script_key.serialized(),
-        amount: prepared.root_asset.amount,
-    };
-    let root_leaf = asset_leaf(&prepared.root_asset);
-    tree.insert(root_locator.hash(), root_leaf)
-        .map_err(|e| SendError::SplitError(e.to_string()))?;
-
-    // Re-insert each recipient split.
-    for split in &prepared.recipient_assets {
-        let locator = SplitLocator {
-            output_index: split.output_index,
-            asset_id,
-            script_key: *split.asset.script_key.serialized(),
-            amount: split.asset.amount,
-        };
-        let leaf = asset_leaf(&split.asset);
-        tree.insert(locator.hash(), leaf)
-            .map_err(|e| SendError::SplitError(e.to_string()))?;
-    }
-
-    let tree_root = tree.root().map_err(|e| SendError::SplitError(e.to_string()))?;
-    prepared.root_asset.split_commitment_root =
-        Some((tree_root.node_hash(), tree_root.node_sum()));
+    // Note: the split commitment root is intentionally NOT rebuilt
+    // here. The sighash above commits to the split commitment root via
+    // the virtual transaction output, so changing it after signing
+    // would invalidate the signatures. This mirrors Go, where the split
+    // tree is built once (unsigned leaves) during funding and never
+    // rebuilt (commitment/split.go NewSplitCommitment).
 
     Ok(())
 }
