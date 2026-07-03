@@ -1,0 +1,30 @@
+[package]
+name = "tap-grpc"
+version = "0.1.0"
+edition = "2021"
+description = "gRPC transports for Taproot Assets (tapd universerpc/authmailboxrpc interop)"
+
+[dependencies]
+# tonic 0.13 / prost 0.13 are pinned as a known-good pair for the
+# vendored tapd protos (tonic 0.12 predates the tonic-build protoc
+# fixes we rely on; tonic 0.14 splits codegen into tonic-prost and
+# changes the generated API surface).
+tonic = "0.13"
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+tokio-stream = "0.1"
+bitcoin_hashes = { version = "0.14", default-features = false, features = ["std"] }
+tap-primitives = { path = "../tap-primitives" }
+tap-universe = { path = "../tap-universe", default-features = false }
+tap-onchain = { path = "../tap-onchain", default-features = false }
+
+[build-dependencies]
+tonic-build = "0.13"
+prost-build = "0.13"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+secp256k1 = { version = "0.29", default-features = false, features = ["std", "global-context"] }
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
+tap-primitives = { path = "../tap-primitives", features = ["test-utils"] }

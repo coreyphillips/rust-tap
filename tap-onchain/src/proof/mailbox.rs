@@ -14,8 +14,9 @@
 //!
 //! The module is transport-agnostic: [`MailboxTransport`] is the seam a
 //! gRPC (authmailboxrpc) implementation plugs into. Only an in-memory
-//! [`MockTransport`] is provided here; the gRPC transport is a
-//! follow-up.
+//! [`MockTransport`] is provided here; the tapd-interoperable gRPC
+//! transport lives in the `tap-grpc` crate (`GrpcMailboxTransport`),
+//! keeping this crate free of async dependencies.
 //!
 //! Sender side: [`deliver_send_manifest`] encodes a
 //! [`SendFragment`], ECIES-encrypts it to the receiver key with a fresh
@@ -264,8 +265,8 @@ impl MailboxSigner for SoftMailboxSigner {
 
 /// Transport abstraction over the auth mailbox server RPCs
 /// (`authmailboxrpc.Mailbox`): `SendMessage`, message subscription /
-/// fetching, and `RemoveMessage`. A gRPC implementation is a follow-up;
-/// tests use [`MockTransport`].
+/// fetching, and `RemoveMessage`. The gRPC implementation is
+/// `tap-grpc`'s `GrpcMailboxTransport`; tests use [`MockTransport`].
 pub trait MailboxTransport {
     /// Sends an encrypted message to the mailbox server for the given
     /// receiver (33-byte compressed key), authenticated by the tx

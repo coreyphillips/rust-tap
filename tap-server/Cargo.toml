@@ -12,15 +12,22 @@ serde_json = "1"
 tap-primitives = { path = "../tap-primitives" }
 tap-universe = { path = "../tap-universe", default-features = false, features = ["serde", "serde_json"] }
 tap-persist = { path = "../tap-persist", optional = true, default-features = false, features = ["sqlite"] }
+tap-grpc = { path = "../tap-grpc", optional = true }
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
 http-body-util = "0.1"
 tap-universe = { path = "../tap-universe", features = ["http-client"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [features]
-default = []
+default = ["grpc"]
 sqlite = ["tap-persist"]
+grpc = ["tap-grpc"]
+
+[[test]]
+name = "grpc_loopback"
+required-features = ["grpc"]
 
 [[bin]]
 name = "tap-universe-server"
