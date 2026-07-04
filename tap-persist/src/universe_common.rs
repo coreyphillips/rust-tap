@@ -12,10 +12,9 @@
 //! recomputation, which must match `MemoryUniverseBackend::compute_root`
 //! exactly across all backends.
 
-use bitcoin_hashes::{sha256, Hash, HashEngine};
-
+use tap_primitives::asset::{AssetId, OutPoint, SerializedKey};
 use tap_primitives::mssmt::NodeHash;
-use tap_universe::types::ProofType;
+use tap_universe::types::{LeafKey, ProofType, UniverseLeaf};
 
 pub(crate) fn proof_type_str(pt: &ProofType) -> &'static str {
     match pt {
@@ -38,32 +37,47 @@ pub(crate) fn proof_type_from_str(s: &str) -> ProofType {
 }
 
 /// A universe leaf row as `(outpoint_txid, outpoint_vout, script_key,
-/// asset_id, amount)`, ordered by `(outpoint_txid, outpoint_vout,
-/// script_key)` ascending (the byte-wise ordering both SQLite BLOB and
-/// Postgres BYTEA comparisons produce).
-pub(crate) type UniverseLeafRow = (Vec<u8>, u32, Vec<u8>, Vec<u8>, u64);
+/// asset_id, amount, proof_data)`.
+pub(crate) type UniverseLeafRow =
+    (Vec<u8>, u32, Vec<u8>, Vec<u8>, u64, Vec<u8>);
 
-/// Recomputes the universe root hash and sum from the ordered leaf
-/// rows, matching `MemoryUniverseBackend::compute_root` exactly.
+/// Recomputes the universe root hash and sum from the leaf rows by
+/// building tapd's universe MS-SMT (`tap_universe::smt`), so the root
+/// matches what a real tapd would serve for the same leaves. Must
+/// match `MemoryUniverseBackend::compute_root` exactly across all
+/// backends.
 pub(crate) fn compute_universe_root(
+    proof_type: &ProofType,
     rows: &[UniverseLeafRow],
-) -> (NodeHash, u64) {
-    if rows.is_empty() {
-        return (NodeHash::EMPTY, 0);
+) -> Result<(NodeHash, u64), String> {
+    let mut leaves: Vec<(LeafKey, UniverseLeaf)> =
+        Vec::with_capacity(rows.len());
+    for (txid, vout, script_key, asset_id, amount, proof) in rows {
+        let txid: [u8; 32] = txid
+            .as_slice()
+            .try_into()
+            .map_err(|_| "universe leaf txid must be 32 bytes".to_string())?;
+        let script_key: [u8; 33] = script_key.as_slice().try_into().map_err(
+            |_| "universe leaf script key must be 33 bytes".to_string(),
+        )?;
+        let asset_id: [u8; 32] = asset_id.as_slice().try_into().map_err(
+            |_| "universe leaf asset id must be 32 bytes".to_string(),
+        )?;
+        let key = LeafKey {
+            outpoint: OutPoint { txid, vout: *vout },
+            script_key: SerializedKey(script_key),
+        };
+        let leaf = UniverseLeaf {
+            asset_id: AssetId(asset_id),
+            amount: *amount,
+            proof: proof.clone(),
+            key: key.clone(),
+        };
+        leaves.push((key, leaf));
     }
 
-    let mut sum: u64 = 0;
-    let mut engine = sha256::HashEngine::default();
-
-    for (txid, vout, script_key, asset_id, amount) in rows {
-        engine.input(asset_id);
-        engine.input(&amount.to_be_bytes());
-        engine.input(txid);
-        engine.input(&vout.to_be_bytes());
-        engine.input(script_key);
-        sum = sum.saturating_add(*amount);
-    }
-
-    let hash = sha256::Hash::from_engine(engine);
-    (NodeHash(hash.to_byte_array()), sum)
+    tap_universe::smt::compute_universe_root(
+        proof_type,
+        leaves.iter().map(|(k, l)| (k, l)),
+    )
 }

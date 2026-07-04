@@ -24,6 +24,7 @@
 pub mod http_client;
 pub mod ignore;
 pub mod memory;
+pub mod smt;
 pub mod supply;
 pub mod syncer;
 pub mod traits;

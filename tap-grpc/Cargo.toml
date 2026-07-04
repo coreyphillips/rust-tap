@@ -9,7 +9,20 @@ description = "gRPC transports for Taproot Assets (tapd universerpc/authmailboxr
 # vendored tapd protos (tonic 0.12 predates the tonic-build protoc
 # fixes we rely on; tonic 0.14 splits codegen into tonic-prost and
 # changes the generated API surface).
-tonic = "0.13"
+tonic = { version = "0.13", features = ["tls-ring"] }
+# (The `tls-ring` feature is for the SERVER side: tap-server uses
+# tonic's ServerTlsConfig so tapd's universe-RPC proof courier, which
+# always dials TLS with certificate verification disabled, can
+# deliver proofs to it. The CLIENT side does not use tonic's TLS:)
+# TLS support for dialing a real tapd, whose gRPC listener is always
+# TLS with an lnd-style self-signed certificate. Those certs carry
+# CA:TRUE, which webpki rejects as an end-entity cert, so instead of
+# tonic's stock `tls-ring` path the client pins the exact certificate
+# with a custom rustls verifier over a manual tokio-rustls connector.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-pemfile = "2"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
 prost = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
 tokio-stream = "0.1"

@@ -68,10 +68,12 @@ fn find_root_id(conn: &rusqlite::Connection, id: &UniverseId) -> Option<i64> {
 fn recompute_root(
     conn: &rusqlite::Connection,
     root_id: i64,
+    proof_type: &tap_universe::types::ProofType,
 ) -> Result<(NodeHash, u64), String> {
     let mut stmt = conn
         .prepare(
-            "SELECT outpoint_txid, outpoint_vout, script_key, asset_id, amount \
+            "SELECT outpoint_txid, outpoint_vout, script_key, asset_id, \
+             amount, proof_data \
              FROM universe_leaves WHERE universe_root_id = ?1 \
              ORDER BY outpoint_txid, outpoint_vout, script_key",
         )
@@ -85,13 +87,14 @@ fn recompute_root(
                 row.get::<_, Vec<u8>>(2)?,
                 row.get::<_, Vec<u8>>(3)?,
                 row.get::<_, i64>(4)? as u64,
+                row.get::<_, Vec<u8>>(5)?,
             ))
         })
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
         .collect();
 
-    Ok(compute_universe_root(&rows))
+    compute_universe_root(proof_type, &rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +176,8 @@ impl UniverseBackend for SqliteUniverseBackend {
 
         // Recompute and update root.
         let (root_hash, root_sum) =
-            recompute_root(&tx, root_id).map_err(UniverseError::StoreError)?;
+            recompute_root(&tx, root_id, &id.proof_type)
+                .map_err(UniverseError::StoreError)?;
 
         tx.execute(
             "UPDATE universe_roots SET root_hash = ?1, root_sum = ?2 WHERE id = ?3",

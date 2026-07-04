@@ -25,8 +25,38 @@ use wallet::{create_bdk_wallet_with_path, create_key_ring, EsploraChain, StubLdk
 // Configuration
 // ============================================================================
 
-const ESPLORA_URL: &str = "https://blockstream.info/testnet/api";
-const DATA_DIR: &str = "./tap-wallets";
+const DEFAULT_ESPLORA_URL: &str = "https://blockstream.info/testnet/api";
+const DEFAULT_UNIVERSE_URL: &str =
+    "https://testnet.universe.lightning.finance";
+
+/// Esplora HTTP API base URL (TAP_ESPLORA_URL env override, e.g. a
+/// local regtest electrs at http://127.0.0.1:3002).
+fn esplora_url() -> String {
+    std::env::var("TAP_ESPLORA_URL")
+        .unwrap_or_else(|_| DEFAULT_ESPLORA_URL.into())
+}
+
+/// Universe server to register mint proofs with (TAP_UNIVERSE_URL env
+/// override; set to "none" to skip registration).
+fn universe_url() -> String {
+    std::env::var("TAP_UNIVERSE_URL")
+        .unwrap_or_else(|_| DEFAULT_UNIVERSE_URL.into())
+}
+
+/// Wallet data directory (TAP_DATA_DIR env override).
+fn data_dir() -> String {
+    std::env::var("TAP_DATA_DIR").unwrap_or_else(|_| "./tap-wallets".into())
+}
+
+/// TAP network matching `wallet::bitcoin_network()` (TAP_NETWORK env).
+fn tap_network() -> TapNetwork {
+    match std::env::var("TAP_NETWORK").as_deref() {
+        Ok("regtest") => TapNetwork::Regtest,
+        Ok("signet") => TapNetwork::Signet,
+        Ok("bitcoin") | Ok("mainnet") => TapNetwork::Mainnet,
+        _ => TapNetwork::Testnet,
+    }
+}
 
 // ============================================================================
 // Main
@@ -47,6 +77,7 @@ fn main() {
         eprintln!("  send <asset_id> <amount> <addr> Send an asset");
         eprintln!("  sync                           Sync wallet with chain");
         eprintln!("  deep-sync                      Deep scan (stop gap 200, for imported mnemonics)");
+        eprintln!("  export-proof <asset_id> <file> Export a mint's genesis proof file (TAPF)");
         eprintln!();
         eprintln!("The mnemonic is always required and never stored.");
         std::process::exit(1);
@@ -57,7 +88,7 @@ fn main() {
     // Derive a fingerprint from the mnemonic so each wallet gets its own
     // data directory. Uses first 8 hex chars of SHA256(mnemonic).
     let fingerprint = wallet_fingerprint(mnemonic);
-    let wallet_dir = format!("{}/{}", DATA_DIR, fingerprint);
+    let wallet_dir = format!("{}/{}", data_dir(), fingerprint);
     let state_file = format!("{}/state.json", wallet_dir);
     let bdk_db_path = format!("{}/bdk-wallet.dat", wallet_dir);
     std::fs::create_dir_all(&wallet_dir).expect("Failed to create wallet dir");
@@ -67,9 +98,11 @@ fn main() {
 
     // Set up backends.
     println!("Wallet: {}", wallet_dir);
-    let bdk_wallet = wallet::create_bdk_wallet_with_path(mnemonic, ESPLORA_URL, &bdk_db_path);
+    let esplora = esplora_url();
+    let bdk_wallet =
+        wallet::create_bdk_wallet_with_path(mnemonic, &esplora, &bdk_db_path);
     let key_ring = create_key_ring(mnemonic);
-    let chain = EsploraChain::new(ESPLORA_URL);
+    let chain = EsploraChain::new(&esplora);
 
     // Sync BDK wallet.
     // Use deep scan (stop gap 200) if "deep-sync" command, otherwise normal (20).
@@ -98,9 +131,13 @@ fn main() {
 
     // Build tap-node.
     let config = TapNodeConfig {
-        network: TapNetwork::Testnet,
+        network: tap_network(),
         db_path: Some(PathBuf::from(format!("{}/assets.db", wallet_dir))),
         default_conf_target: 3,
+        // Proof courier URL embedded in receive addresses (e.g.
+        // universerpc://127.0.0.1:8095 for a local tap-server); unset
+        // means addresses carry no courier.
+        courier_url: std::env::var("TAP_COURIER_URL").unwrap_or_default(),
         ..Default::default()
     };
 
@@ -175,6 +212,13 @@ fn run_command<C, W, K, L, P>(
         "deep-sync" => {
             // Already handled during startup sync above.
             cmd_sync(state);
+        }
+        "export-proof" => {
+            if args.len() < 3 {
+                eprintln!("Usage: export-proof <asset_id_hex> <out_file>");
+                return;
+            }
+            cmd_export_proof(node, state, &args[1], &args[2]);
         }
         other => eprintln!("Unknown command: {}", other),
     }
@@ -353,7 +397,7 @@ fn cmd_status(state: &mut WalletState) {
         return;
     }
 
-    let chain = wallet::EsploraChain::new(ESPLORA_URL);
+    let chain = wallet::EsploraChain::new(&esplora_url());
     let mut updated = false;
 
     for mint in &mut state.mints {
@@ -711,12 +755,16 @@ fn build_and_register_proof(
     );
 
     // Register with universe server.
-    let universe_url = "https://testnet.universe.lightning.finance";
+    let universe_url = universe_url();
+    if universe_url == "none" {
+        println!("  Universe registration skipped (TAP_UNIVERSE_URL=none).");
+        return Ok(());
+    }
     print!("  Registering with {}... ", universe_url);
     io::stdout().flush().unwrap();
 
     let client =
-        tap_universe::http_client::HttpUniverseClient::new(universe_url);
+        tap_universe::http_client::HttpUniverseClient::new(&universe_url);
 
     client
         .insert_proof(
@@ -900,6 +948,91 @@ fn cmd_send<C, W, K, L, P>(
             state.save();
         }
         Err(e) => println!("Send failed: {}", e),
+    }
+}
+
+/// Exports the stored genesis proof file for a minted asset (written
+/// by the node's confirmation watcher) to `out_file` in the TAPF
+/// format `tapcli proofs verify` accepts.
+fn cmd_export_proof<C, W, K, L, P>(
+    node: &TapNode<C, W, K, L, P>,
+    state: &WalletState,
+    asset_id_hex: &str,
+    out_file: &str,
+) where
+    C: ChainBridge + Send + Sync + 'static,
+    W: WalletAnchor + Send + Sync + 'static,
+    K: KeyRing + AssetSigner + Send + Sync + 'static,
+    L: LdkChannelOps + Send + Sync + 'static,
+    P: PriceOracle + Send + Sync + 'static,
+{
+    use tap_primitives::asset::{OutPoint, SerializedKey};
+
+    let mint = match state
+        .mints
+        .iter()
+        .find(|m| m.asset_id == asset_id_hex)
+    {
+        Some(m) => m,
+        None => {
+            println!("No mint with asset id {} in this wallet.", asset_id_hex);
+            return;
+        }
+    };
+
+    // Give the node a chance to process a fresh confirmation so the
+    // genesis proof is generated and stored before we export it.
+    if let Err(e) = node.tick() {
+        println!("tick failed: {}", e);
+    }
+
+    let mut txid = match wallet::hex_decode_array::<32>(&mint.txid) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("Bad mint txid: {}", e);
+            return;
+        }
+    };
+    txid.reverse(); // Display hex -> internal byte order.
+
+    let vout = match mint.tap_output_index {
+        Some(v) => v,
+        None => {
+            println!("Mint record lacks tap_output_index; re-mint.");
+            return;
+        }
+    };
+    let script_key = match mint
+        .script_key
+        .as_ref()
+        .ok_or("missing script_key".to_string())
+        .and_then(|s| wallet::hex_decode_array::<33>(s))
+    {
+        Ok(k) => SerializedKey(k),
+        Err(e) => {
+            println!("Bad script key: {}", e);
+            return;
+        }
+    };
+
+    match node.export_proof(&OutPoint { txid, vout }, &script_key) {
+        Ok(file) => {
+            let bytes = file.encode();
+            if let Err(e) = std::fs::write(out_file, &bytes) {
+                println!("Write {} failed: {}", out_file, e);
+                return;
+            }
+            println!(
+                "Exported proof file ({} bytes, {} proof(s)) to {}",
+                bytes.len(),
+                file.num_proofs(),
+                out_file
+            );
+        }
+        Err(e) => println!(
+            "Export failed: {} (is the mint confirmed? run status first)",
+            e
+        ),
     }
 }
 

@@ -21,7 +21,16 @@ use tap_node::*;
 use tap_primitives::asset::AssetId;
 use tap_primitives::crypto::derivation::*;
 
-const BITCOIN_NETWORK: Network = Network::Testnet;
+/// Bitcoin network, selectable via the TAP_NETWORK env var
+/// ("testnet" default, or "regtest" / "signet" / "bitcoin").
+pub fn bitcoin_network() -> Network {
+    match std::env::var("TAP_NETWORK").as_deref() {
+        Ok("regtest") => Network::Regtest,
+        Ok("signet") => Network::Signet,
+        Ok("bitcoin") | Ok("mainnet") => Network::Bitcoin,
+        _ => Network::Testnet,
+    }
+}
 
 // ============================================================================
 // Esplora Chain Backend
@@ -305,7 +314,7 @@ impl BdkAnchorWallet {
         let mnemonic = bip39::Mnemonic::parse_normalized(mnemonic_str)
             .map_err(|e| format!("Invalid mnemonic: {}", e))?;
         let seed = mnemonic.to_seed_normalized("");
-        let xprv = Xpriv::new_master(BITCOIN_NETWORK, &seed)
+        let xprv = Xpriv::new_master(bitcoin_network(), &seed)
             .map_err(|e| format!("Master key: {}", e))?;
 
         if let Some(parent) = Path::new(db_path).parent() {
@@ -319,7 +328,24 @@ impl BdkAnchorWallet {
         .map_err(|e| format!("DB open: {}", e))?;
 
         // Try to load existing wallet, or create a new one.
+        //
+        // The persisted store only contains PUBLIC descriptors: a
+        // plain `Wallet::load()` restores a watch-only wallet whose
+        // signers are empty, so `sign()` silently produces no
+        // signatures (found via tapd regtest interop, where every
+        // mint after the first process exit failed to finalize its
+        // PSBT). Re-attach the private descriptors derived from the
+        // mnemonic and extract the signing keys.
         let wallet = match Wallet::load()
+            .descriptor(
+                KeychainKind::External,
+                Some(Bip86(xprv, KeychainKind::External)),
+            )
+            .descriptor(
+                KeychainKind::Internal,
+                Some(Bip86(xprv, KeychainKind::Internal)),
+            )
+            .extract_keys()
             .load_wallet(&mut db)
             .map_err(|e| format!("DB load: {}", e))?
         {
@@ -329,7 +355,7 @@ impl BdkAnchorWallet {
                     Bip86(xprv, KeychainKind::External),
                     Bip86(xprv, KeychainKind::Internal),
                 )
-                .network(BITCOIN_NETWORK)
+                .network(bitcoin_network())
                 .create_wallet(&mut db)
                 .map_err(|e| format!("Wallet create: {}", e))?
             }
@@ -473,12 +499,12 @@ impl TapKeyRing {
             .map_err(|e| format!("Mnemonic: {}", e))?;
         let seed = mnemonic.to_seed_normalized("");
         let secp = Secp256k1::new();
-        let master = bitcoin::bip32::Xpriv::new_master(BITCOIN_NETWORK, &seed)
+        let master = bitcoin::bip32::Xpriv::new_master(bitcoin_network(), &seed)
             .map_err(|e| format!("Master: {}", e))?;
         Ok(TapKeyRing {
             secp,
             master,
-            coin_type: coin_type_for_network(BITCOIN_NETWORK),
+            coin_type: coin_type_for_network(bitcoin_network()),
             next_index: AtomicU32::new(0),
             keypairs: Mutex::new(Vec::new()),
         })

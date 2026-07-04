@@ -85,9 +85,10 @@ pub mod mailbox;
 pub mod universe_client;
 
 mod blocking;
+mod tls;
 
 pub use mailbox::{sign_remove_challenge, GrpcMailboxTransport};
-pub use universe_client::GrpcUniverseClient;
+pub use universe_client::{ConnectOptions, GrpcUniverseClient};
 
 // Re-export the gRPC stack so dependents (tap-server) use the exact
 // same tonic/prost versions as the generated code.

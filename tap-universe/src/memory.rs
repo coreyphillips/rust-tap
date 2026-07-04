@@ -11,8 +11,6 @@
 
 use std::collections::HashMap;
 
-use bitcoin_hashes::{sha256, Hash, HashEngine};
-
 use tap_primitives::mssmt::NodeHash;
 
 use crate::traits::{FederationDb, UniverseBackend};
@@ -41,39 +39,15 @@ impl MemoryUniverseBackend {
             .collect()
     }
 
-    /// Computes a deterministic root hash from the leaves.
+    /// Computes the universe MS-SMT root over the leaves, matching
+    /// tapd's `BaseLeafKey.UniverseKey` / `Leaf.SmtLeafNode` tree (see
+    /// [`crate::smt`]).
     fn compute_root(
+        proof_type: &ProofType,
         leaves: &HashMap<LeafKey, UniverseLeaf>,
-    ) -> (NodeHash, u64) {
-        if leaves.is_empty() {
-            return (NodeHash::EMPTY, 0);
-        }
-
-        let mut sum: u64 = 0;
-        let mut engine = sha256::HashEngine::default();
-
-        // Sort keys for deterministic hashing.
-        let mut keys: Vec<&LeafKey> = leaves.keys().collect();
-        keys.sort_by(|a, b| {
-            a.outpoint
-                .txid
-                .cmp(&b.outpoint.txid)
-                .then(a.outpoint.vout.cmp(&b.outpoint.vout))
-                .then(a.script_key.0.cmp(&b.script_key.0))
-        });
-
-        for key in keys {
-            let leaf = &leaves[key];
-            engine.input(&leaf.asset_id.0);
-            engine.input(&leaf.amount.to_be_bytes());
-            engine.input(&key.outpoint.txid);
-            engine.input(&key.outpoint.vout.to_be_bytes());
-            engine.input(&key.script_key.0);
-            sum = sum.saturating_add(leaf.amount);
-        }
-
-        let hash = sha256::Hash::from_engine(engine);
-        (NodeHash(hash.to_byte_array()), sum)
+    ) -> Result<(NodeHash, u64), UniverseError> {
+        crate::smt::compute_universe_root(proof_type, leaves.iter())
+            .map_err(UniverseError::StoreError)
     }
 }
 
@@ -87,7 +61,8 @@ impl UniverseBackend for MemoryUniverseBackend {
             .get(id)
             .ok_or_else(|| UniverseError::NotFound(format!("{:?}", id)))?;
 
-        let (root_hash, root_sum) = Self::compute_root(leaves);
+        let (root_hash, root_sum) =
+            Self::compute_root(&id.proof_type, leaves)?;
 
         Ok(UniverseRoot {
             id: id.clone(),

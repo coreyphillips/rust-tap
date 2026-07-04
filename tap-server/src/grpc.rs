@@ -644,3 +644,30 @@ pub async fn serve_grpc(
 ) -> Result<(), tap_grpc::tonic::transport::Error> {
     grpc_router(service).serve(addr).await
 }
+
+/// Binds `addr` and serves the universe gRPC API over TLS until
+/// shutdown. `cert_pem`/`key_pem` are the PEM-encoded server
+/// certificate (chain) and private key.
+///
+/// TLS matters for tapd interop: tapd's universe-RPC proof courier
+/// (proof/courier.go `serverDialOpts`) always dials with TLS
+/// (certificate verification disabled), so a plaintext listener can
+/// never receive couriered proofs from tapd. Any self-signed
+/// certificate works.
+pub async fn serve_grpc_tls(
+    addr: SocketAddr,
+    service: UniverseService,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<(), tap_grpc::tonic::transport::Error> {
+    use tap_grpc::tonic::transport::{Identity, ServerTlsConfig};
+
+    Server::builder()
+        .tls_config(
+            ServerTlsConfig::new()
+                .identity(Identity::from_pem(cert_pem, key_pem)),
+        )?
+        .add_service(GrpcUniverseService::new(service).into_server())
+        .serve(addr)
+        .await
+}

@@ -1,0 +1,14 @@
+[package]
+name = "tap-interop-sync"
+version = "0.1.0"
+edition = "2021"
+description = "Live interop harness: sync an asset's proofs from a real tapd universe over TLS + macaroon gRPC"
+
+[[bin]]
+name = "interop-sync"
+path = "src/main.rs"
+
+[dependencies]
+tap-primitives = { path = "../../tap-primitives" }
+tap-universe = { path = "../../tap-universe" }
+tap-grpc = { path = "../../tap-grpc" }
