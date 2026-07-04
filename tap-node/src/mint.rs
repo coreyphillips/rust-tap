@@ -603,6 +603,62 @@ where
         None => None,
     };
 
+    // Exclusion proofs for the wallet's own P2TR outputs (the BTC
+    // change): full verification (Go's proof.Verify, and our own
+    // `Proof::verify`) requires an exclusion proof for EVERY other
+    // P2TR output of the anchor transaction. The funded PSBT's output
+    // maps carry the untweaked BIP-86 internal key of each
+    // wallet-derived output, which is exactly what a Bip86 tapscript
+    // exclusion proof needs. Outputs without a PSBT internal key (the
+    // TAP commitment output itself, the pre-commitment output) are
+    // skipped; the former gets the inclusion proof, the latter its
+    // dedicated exclusion proof above.
+    //
+    // Found via live tapd interop: `tapcli proofs verify` rejected
+    // rust-tap genesis proofs with "missing exclusion proof for
+    // output" before this was added.
+    let mut wallet_exclusions: Vec<proof::TaprootProof> = Vec::new();
+    if let Some(psbt_bytes) = &batch.genesis_psbt {
+        if let Ok(psbt) = bitcoin::psbt::Psbt::deserialize(psbt_bytes) {
+            let pre_commit_index =
+                pre_commit_exclusion.as_ref().map(|p| p.output_index);
+            for (i, out) in psbt.unsigned_tx.output.iter().enumerate() {
+                let i = i as u32;
+                if i == tap_output_index || Some(i) == pre_commit_index {
+                    continue;
+                }
+                if !out.script_pubkey.is_p2tr() {
+                    continue;
+                }
+                let internal = match psbt
+                    .outputs
+                    .get(i as usize)
+                    .and_then(|o| o.tap_internal_key)
+                {
+                    Some(x_only) => {
+                        let mut key = [0u8; 33];
+                        key[0] = 0x02;
+                        key[1..].copy_from_slice(&x_only.serialize());
+                        SerializedKey(key)
+                    }
+                    None => continue,
+                };
+                wallet_exclusions.push(proof::TaprootProof {
+                    output_index: i,
+                    internal_key: internal,
+                    commitment_proof: None,
+                    tapscript_proof: Some(proof::TapscriptProof {
+                        tap_preimage_1: None,
+                        tap_preimage_2: None,
+                        bip86: true,
+                        unknown_odd_types: std::collections::BTreeMap::new(),
+                    }),
+                    unknown_odd_types: std::collections::BTreeMap::new(),
+                });
+            }
+        }
+    }
+
     for asset in &batch.sprouted_assets {
         let asset_id = asset.genesis.id();
         let meta_reveal = batch
@@ -615,12 +671,6 @@ where
             .find(|(tag, _)| *tag == asset.genesis.tag)
             .map(|(_, reveal)| reveal.clone());
 
-        // NOTE: exclusion proofs for the wallet's BTC change output
-        // are omitted (we do not know its internal key). Go includes
-        // them; universe servers only require the inclusion proof.
-        // The pre-commitment output (P2TR) does get an exclusion
-        // proof, as full proof verification demands one for every
-        // other P2TR output.
         let genesis_proof =
             tap_onchain::proof::generate_genesis_proof(GenesisProofParams {
                 anchor_tx_bytes: anchor_tx_bytes.clone(),
@@ -637,6 +687,7 @@ where
                 exclusion_proofs: pre_commit_exclusion
                     .clone()
                     .into_iter()
+                    .chain(wallet_exclusions.iter().cloned())
                     .collect(),
                 genesis_reveal: asset.genesis.clone(),
                 meta_reveal,

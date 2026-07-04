@@ -94,7 +94,13 @@ where
     };
 
     let addr = TapAddress {
-        version: AddressVersion::V0,
+        // V1, matching Go's default (`address.go
+        // UnmarshalAddressVersion` maps UNSPECIFIED to V1). V1
+        // addresses accept V2 TapCommitments; a V0 address cannot be
+        // paid by a modern tapd at all, since all its coins live in
+        // V2 commitments ("no compatible commitments for max version
+        // 1", found via live tapd interop).
+        version: AddressVersion::V1,
         asset_version: 0,
         asset_id: Some(asset_id),
         script_key: script_key.pub_key,

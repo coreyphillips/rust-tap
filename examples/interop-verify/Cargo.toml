@@ -1,0 +1,13 @@
+[package]
+name = "tap-interop-verify"
+version = "0.1.0"
+edition = "2021"
+description = "Live interop harness: verify a tapd-exported proof file against a real chain via an Esplora API"
+
+[[bin]]
+name = "interop-verify"
+path = "src/main.rs"
+
+[dependencies]
+tap-primitives = { path = "../../tap-primitives" }
+ureq = "2"

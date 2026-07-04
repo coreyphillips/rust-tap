@@ -9,6 +9,8 @@ members = [
     "tap-node",
     "tap-server",
     "examples/quickstart",
+    "examples/interop-verify",
+    "examples/interop-sync",
 ]
 exclude = [
     "tap-primitives/fuzz",

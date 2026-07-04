@@ -77,6 +77,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "TAP_SERVER_GRPC_LISTEN",
         "",
     );
+    // Optional TLS identity for the gRPC listener. Required for tapd
+    // proof-courier interop: tapd's universerpc courier only dials
+    // TLS (self-signed certs are fine, it skips verification).
+    let grpc_tls_cert = config_value(
+        &args,
+        "--grpc-tls-cert",
+        "TAP_SERVER_GRPC_TLS_CERT",
+        "",
+    );
+    let grpc_tls_key = config_value(
+        &args,
+        "--grpc-tls-key",
+        "TAP_SERVER_GRPC_TLS_KEY",
+        "",
+    );
     let grpc_addr: Option<SocketAddr> = if grpc_listen.is_empty() {
         None
     } else {
@@ -116,14 +131,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "grpc")]
         if let Some(grpc_addr) = grpc_addr {
             let grpc_service = service.clone();
+            let tls: Option<(Vec<u8>, Vec<u8>)> = if !grpc_tls_cert
+                .is_empty()
+                && !grpc_tls_key.is_empty()
+            {
+                Some((
+                    std::fs::read(&grpc_tls_cert)?,
+                    std::fs::read(&grpc_tls_key)?,
+                ))
+            } else {
+                None
+            };
             tokio::select! {
                 result = tap_server::serve(addr, service) => {
                     result.map_err(Box::<dyn std::error::Error>::from)
                 }
-                result = tap_server::grpc::serve_grpc(
-                    grpc_addr,
-                    grpc_service,
-                ) => {
+                result = async move {
+                    match tls {
+                        Some((cert, key)) => {
+                            tap_server::grpc::serve_grpc_tls(
+                                grpc_addr,
+                                grpc_service,
+                                &cert,
+                                &key,
+                            )
+                            .await
+                        }
+                        None => {
+                            tap_server::grpc::serve_grpc(
+                                grpc_addr,
+                                grpc_service,
+                            )
+                            .await
+                        }
+                    }
+                } => {
                     result.map_err(Box::<dyn std::error::Error>::from)
                 }
             }

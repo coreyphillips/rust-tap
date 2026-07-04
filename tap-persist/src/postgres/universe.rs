@@ -85,11 +85,13 @@ fn find_root_id(
 fn recompute_root(
     client: &mut impl GenericClient,
     root_id: i64,
+    proof_type: &tap_universe::types::ProofType,
 ) -> Result<(NodeHash, u64), UniverseError> {
     let rows = client
         .query(
             "SELECT outpoint_txid, outpoint_vout, script_key, asset_id, \
-             amount FROM universe_leaves WHERE universe_root_id = $1 \
+             amount, proof_data \
+             FROM universe_leaves WHERE universe_root_id = $1 \
              ORDER BY outpoint_txid, outpoint_vout, script_key",
             &[&root_id],
         )
@@ -102,16 +104,19 @@ fn recompute_root(
         let script_key: Vec<u8> = row.try_get(2).map_err(store_err)?;
         let asset_id: Vec<u8> = row.try_get(3).map_err(store_err)?;
         let amount: i64 = row.try_get(4).map_err(store_err)?;
+        let proof: Vec<u8> = row.try_get(5).map_err(store_err)?;
         leaf_rows.push((
             txid,
             vout as u32,
             script_key,
             asset_id,
             amount as u64,
+            proof,
         ));
     }
 
-    Ok(compute_universe_root(&leaf_rows))
+    compute_universe_root(proof_type, &leaf_rows)
+        .map_err(UniverseError::StoreError)
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +212,8 @@ impl UniverseBackend for PostgresUniverseBackend {
         .map_err(store_err)?;
 
         // Recompute and update root.
-        let (root_hash, root_sum) = recompute_root(&mut tx, root_id)?;
+        let (root_hash, root_sum) =
+            recompute_root(&mut tx, root_id, &id.proof_type)?;
 
         tx.execute(
             "UPDATE universe_roots SET root_hash = $1, root_sum = $2 \

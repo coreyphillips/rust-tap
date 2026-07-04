@@ -28,6 +28,9 @@ use tap_universe::types::{
     UniverseId, UniverseLeaf, UniverseProof, UniverseRoot,
 };
 
+use tonic::metadata::{Ascii, MetadataValue};
+use tonic::service::interceptor::InterceptedService;
+use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Status};
 
@@ -49,12 +52,76 @@ const NO_PROOF_MSG: &str = "no universe proof found";
 /// not exist (`universe.ErrNoUniverseRoot`).
 const NO_ROOT_MSG: &str = "no universe root found";
 
+/// Transport security and authentication options for connecting to a
+/// universe server.
+///
+/// A stock tapd serves its gRPC interface over TLS with a self-signed
+/// certificate (`tls.cert` in its data dir) and authenticates calls
+/// with a macaroon sent in the `macaroon` metadata header (hex
+/// encoded), exactly like lnd. The default options (plaintext, no
+/// macaroon) match rust-tap's own `tap-server` on a loopback
+/// interface.
+#[derive(Clone, Debug, Default)]
+pub struct ConnectOptions {
+    /// PEM contents of the server's TLS certificate (tapd's
+    /// `tls.cert`). The connection trusts exactly this certificate
+    /// (byte-for-byte pinning; see [`crate::tls`] for why standard
+    /// webpki validation cannot accept lnd-style self-signed certs).
+    /// `None` connects in plaintext.
+    pub tls_cert_pem: Option<Vec<u8>>,
+    /// Overrides the TLS server name (SNI) sent in the handshake;
+    /// defaults to the URI host. Certificate pinning does not check
+    /// names, so this is rarely needed.
+    pub tls_domain: Option<String>,
+    /// Hex-encoded macaroon sent as the `macaroon` metadata header on
+    /// every RPC (e.g. the contents of tapd's `admin.macaroon`, hex
+    /// encoded). `None` sends no macaroon; tapd then only accepts
+    /// calls that are macaroon-whitelisted (e.g. public universe
+    /// queries when running with `--universe.public-access`).
+    pub macaroon_hex: Option<String>,
+}
+
+/// A tonic [`Interceptor`] that attaches the `macaroon` metadata
+/// header tapd (and lnd) use for authentication.
+#[derive(Clone)]
+pub struct MacaroonInterceptor {
+    macaroon: Option<MetadataValue<Ascii>>,
+}
+
+impl MacaroonInterceptor {
+    fn new(macaroon_hex: Option<&str>) -> Result<Self, UniverseError> {
+        let macaroon = match macaroon_hex {
+            Some(hex) => Some(hex.parse().map_err(|e| {
+                sync_err("invalid macaroon hex for metadata", e)
+            })?),
+            None => None,
+        };
+        Ok(MacaroonInterceptor { macaroon })
+    }
+}
+
+impl Interceptor for MacaroonInterceptor {
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, Status> {
+        if let Some(macaroon) = &self.macaroon {
+            request.metadata_mut().insert("macaroon", macaroon.clone());
+        }
+        Ok(request)
+    }
+}
+
+/// The transport type of [`GrpcUniverseClient`]: a (possibly TLS)
+/// channel with the macaroon interceptor applied.
+type UniverseChannel = InterceptedService<Channel, MacaroonInterceptor>;
+
 /// Blocking gRPC client for a tapd (or rust-tap `tap-server`)
 /// universe server.
 #[derive(Clone)]
 pub struct GrpcUniverseClient {
     rt: BlockingRuntime,
-    client: UniverseClient<Channel>,
+    client: UniverseClient<UniverseChannel>,
 }
 
 fn sync_err(what: &str, e: impl std::fmt::Display) -> UniverseError {
@@ -62,13 +129,25 @@ fn sync_err(what: &str, e: impl std::fmt::Display) -> UniverseError {
 }
 
 impl GrpcUniverseClient {
-    /// Connects to a universe gRPC server, e.g.
-    /// `http://127.0.0.1:10029`. Creates a private single-worker tokio
-    /// runtime for this client.
+    /// Connects to a universe gRPC server in plaintext without
+    /// authentication, e.g. `http://127.0.0.1:10029` for a loopback
+    /// `tap-server`. Creates a private single-worker tokio runtime for
+    /// this client. For a real tapd (TLS + macaroon), use
+    /// [`GrpcUniverseClient::connect_with_options`].
     pub fn connect(uri: &str) -> Result<Self, UniverseError> {
+        Self::connect_with_options(uri, ConnectOptions::default())
+    }
+
+    /// Connects to a universe gRPC server with explicit transport
+    /// options (TLS trust root, macaroon). Use
+    /// `https://127.0.0.1:10029` style URIs when TLS is configured.
+    pub fn connect_with_options(
+        uri: &str,
+        options: ConnectOptions,
+    ) -> Result<Self, UniverseError> {
         let rt = BlockingRuntime::new_owned()
             .map_err(|e| sync_err("create runtime", e))?;
-        Self::connect_inner(rt, uri)
+        Self::connect_inner(rt, uri, options)
     }
 
     /// Connects using an existing tokio runtime handle instead of
@@ -79,21 +158,52 @@ impl GrpcUniverseClient {
         handle: tokio::runtime::Handle,
         uri: &str,
     ) -> Result<Self, UniverseError> {
-        Self::connect_inner(BlockingRuntime::from_handle(handle), uri)
+        Self::connect_inner(
+            BlockingRuntime::from_handle(handle),
+            uri,
+            ConnectOptions::default(),
+        )
+    }
+
+    /// [`GrpcUniverseClient::connect_with_handle`] with explicit
+    /// transport options.
+    pub fn connect_with_handle_options(
+        handle: tokio::runtime::Handle,
+        uri: &str,
+        options: ConnectOptions,
+    ) -> Result<Self, UniverseError> {
+        Self::connect_inner(BlockingRuntime::from_handle(handle), uri, options)
     }
 
     fn connect_inner(
         rt: BlockingRuntime,
         uri: &str,
+        options: ConnectOptions,
     ) -> Result<Self, UniverseError> {
         let endpoint = Endpoint::from_shared(uri.to_string())
             .map_err(|e| sync_err("invalid universe server uri", e))?;
-        let channel = rt
-            .block_on(endpoint.connect())
-            .map_err(|e| sync_err("connect universe server", e))?;
+
+        // tonic's transport error Display is just "transport error";
+        // include the debug form so TLS failures are diagnosable.
+        let channel = match &options.tls_cert_pem {
+            Some(pem) => {
+                let connector = crate::tls::pinned_tls_connector(
+                    pem,
+                    options.tls_domain.clone(),
+                )
+                .map_err(|e| sync_err("tls config", e))?;
+                rt.block_on(endpoint.connect_with_connector(connector))
+            }
+            None => rt.block_on(endpoint.connect()),
+        }
+        .map_err(|e| {
+            sync_err("connect universe server", format!("{:?}", e))
+        })?;
+        let interceptor =
+            MacaroonInterceptor::new(options.macaroon_hex.as_deref())?;
         Ok(GrpcUniverseClient {
             rt,
-            client: UniverseClient::new(channel),
+            client: UniverseClient::with_interceptor(channel, interceptor),
         })
     }
 
